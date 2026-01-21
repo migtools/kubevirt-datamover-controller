@@ -25,6 +25,8 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	velerov2alpha1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -34,6 +36,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	"github.com/migtools/kubevirt-datamover-controller/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -44,6 +48,8 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(velerov1api.AddToScheme(scheme))
+	utilruntime.Must(velerov2alpha1api.AddToScheme(scheme))
 
 	// +kubebuilder:scaffold:scheme
 }
@@ -171,6 +177,16 @@ func main() {
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
+		os.Exit(1)
+	}
+
+	// Setup DataUpload controller
+	if err = (&controller.DataUploadReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Log:    ctrl.Log.WithName("controllers").WithName("DataUpload"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "DataUpload")
 		os.Exit(1)
 	}
 
