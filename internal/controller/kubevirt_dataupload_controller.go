@@ -200,14 +200,15 @@ func (r *KubeVirtDataUploadReconciler) handleCanceling(ctx context.Context, logg
 }
 
 // updatePhase updates the DataUpload phase and status message
+// Uses Update instead of Status().Patch() to match Velero's approach,
+// which works regardless of whether the CRD has status subresource enabled
 func (r *KubeVirtDataUploadReconciler) updatePhase(ctx context.Context, du *velerov2alpha1.DataUpload, phase velerov2alpha1.DataUploadPhase, message string) error {
 	logger := log.FromContext(ctx)
 
-	original := du.DeepCopy()
 	du.Status.Phase = phase
 	du.Status.Message = message
 
-	if err := r.Status().Patch(ctx, du, client.MergeFrom(original)); err != nil {
+	if err := r.Update(ctx, du); err != nil {
 		logger.Error(err, "Failed to update DataUpload phase",
 			"dataUpload", du.Name,
 			"phase", phase)
