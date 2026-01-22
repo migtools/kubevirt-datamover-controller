@@ -34,8 +34,8 @@ const (
 	DataMoverKubeVirt = "kubevirt"
 )
 
-// DataUploadReconciler reconciles DataUpload objects where Spec.DataMover is "kubevirt"
-type DataUploadReconciler struct {
+// KubeVirtDataUploadReconciler reconciles DataUpload objects where Spec.DataMover is "kubevirt"
+type KubeVirtDataUploadReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	Log    logr.Logger
@@ -48,7 +48,7 @@ type DataUploadReconciler struct {
 // +kubebuilder:rbac:groups=velero.io,resources=datauploads/status,verbs=get;update;patch
 
 // Reconcile handles DataUpload resources where Spec.DataMover is "kubevirt"
-func (r *DataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	// Fetch the DataUpload
@@ -80,7 +80,7 @@ func (r *DataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 }
 
 // SetupWithManager sets up the controller with the Manager
-func (r *DataUploadReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *KubeVirtDataUploadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&velerov2alpha1.DataUpload{}).
 		WithEventFilter(r.filterKubeVirtDataMover()).
@@ -90,7 +90,7 @@ func (r *DataUploadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 // filterKubeVirtDataMover returns a predicate that filters for DataUploads
 // where Spec.DataMover is "kubevirt"
-func (r *DataUploadReconciler) filterKubeVirtDataMover() predicate.Predicate {
+func (r *KubeVirtDataUploadReconciler) filterKubeVirtDataMover() predicate.Predicate {
 	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		du, ok := obj.(*velerov2alpha1.DataUpload)
 		if !ok {

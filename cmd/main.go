@@ -180,13 +180,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Setup DataUpload controller
-	if err = (&controller.DataUploadReconciler{
+	// Setup KubeVirt DataUpload controller
+	if err = (&controller.KubeVirtDataUploadReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-		Log:    ctrl.Log.WithName("controllers").WithName("DataUpload"),
+		Log:    ctrl.Log.WithName("controllers").WithName("KubeVirtDataUpload"),
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "DataUpload")
+		setupLog.Error(err, "unable to create controller", "controller", "KubeVirtDataUpload")
 		os.Exit(1)
 	}
 
