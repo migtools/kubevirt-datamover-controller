@@ -636,11 +636,11 @@ func TestGetVMReference(t *testing.T) {
 }
 
 func TestAnnotationConstants(t *testing.T) {
-	if AnnotationVMName != "kubevirt.io/vm-name" {
-		t.Errorf("expected AnnotationVMName='kubevirt.io/vm-name', got '%s'", AnnotationVMName)
+	if AnnotationVMName != "kubevirt-datamover.io/vm-name" {
+		t.Errorf("expected AnnotationVMName='kubevirt-datamover.io/vm-name', got '%s'", AnnotationVMName)
 	}
-	if AnnotationVMNamespace != "kubevirt.io/vm-namespace" {
-		t.Errorf("expected AnnotationVMNamespace='kubevirt.io/vm-namespace', got '%s'", AnnotationVMNamespace)
+	if AnnotationVMNamespace != "kubevirt-datamover.io/vm-namespace" {
+		t.Errorf("expected AnnotationVMNamespace='kubevirt-datamover.io/vm-namespace', got '%s'", AnnotationVMNamespace)
 	}
 	if LabelDataUploadName != "velero.io/dataupload-name" {
 		t.Errorf("expected LabelDataUploadName='velero.io/dataupload-name', got '%s'", LabelDataUploadName)

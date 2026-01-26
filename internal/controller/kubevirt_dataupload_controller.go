@@ -47,10 +47,10 @@ const (
 	DefaultMaxConcurrentReconciles = 3
 
 	// AnnotationVMName is the annotation key for the VirtualMachine name
-	AnnotationVMName = "kubevirt.io/vm-name"
+	AnnotationVMName = "kubevirt-datamover.io/vm-name"
 
 	// AnnotationVMNamespace is the annotation key for the VirtualMachine namespace
-	AnnotationVMNamespace = "kubevirt.io/vm-namespace"
+	AnnotationVMNamespace = "kubevirt-datamover.io/vm-namespace"
 
 	// LabelDataUploadName is the label key for the DataUpload name
 	LabelDataUploadName = "velero.io/dataupload-name"
