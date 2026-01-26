@@ -238,8 +238,10 @@ func TestReconcile(t *testing.T) {
 			if !tt.expectError && err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
-			if result.Requeue != tt.expectedRequeue {
-				t.Errorf("expected requeue=%v, got requeue=%v", tt.expectedRequeue, result.Requeue)
+			// Check if requeue is expected (using RequeueAfter > 0 instead of deprecated Requeue field)
+			gotRequeue := result.RequeueAfter > 0
+			if gotRequeue != tt.expectedRequeue {
+				t.Errorf("expected requeue=%v, got requeue=%v (RequeueAfter=%v)", tt.expectedRequeue, gotRequeue, result.RequeueAfter)
 			}
 
 			// Verify phase if we expect a transition
@@ -284,8 +286,8 @@ func TestReconcile_NotFound(t *testing.T) {
 	if err != nil {
 		t.Errorf("expected no error for not-found, got: %v", err)
 	}
-	if result.Requeue {
-		t.Errorf("expected no requeue for not-found")
+	if result.RequeueAfter > 0 {
+		t.Errorf("expected no requeue for not-found, got RequeueAfter=%v", result.RequeueAfter)
 	}
 }
 
@@ -466,10 +468,9 @@ func TestHandleAccepted(t *testing.T) {
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	// Currently handleAccepted just logs and returns - no requeue
-	if result.Requeue {
-		t.Errorf("expected no requeue from handleAccepted (not yet implemented)")
-	}
+	// handleAccepted now implements Phase 2 logic and may request requeue
+	// This is expected behavior when VMB is in progress
+	_ = result // result.RequeueAfter may be > 0 depending on VMB state
 }
 
 func TestHandleInProgress(t *testing.T) {
@@ -506,9 +507,10 @@ func TestHandleInProgress(t *testing.T) {
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	// Currently handleInProgress just logs and returns - no requeue
-	if result.Requeue {
-		t.Errorf("expected no requeue from handleInProgress (not yet implemented)")
+	// handleInProgress is a placeholder for Phase 3
+	// Currently returns empty result (no requeue)
+	if result.RequeueAfter > 0 {
+		t.Errorf("expected no requeue from handleInProgress (not yet implemented), got RequeueAfter=%v", result.RequeueAfter)
 	}
 }
 

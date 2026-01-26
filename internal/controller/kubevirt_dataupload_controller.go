@@ -165,7 +165,7 @@ func (r *KubeVirtDataUploadReconciler) handleNew(ctx context.Context, logger log
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 }
 
 // handleAccepted processes DataUploads in Accepted phase
@@ -231,7 +231,7 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 				fmt.Sprintf("VMBackup completed (type=%s)", vmb.Status.Type)); err != nil {
 				return ctrl.Result{}, err
 			}
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 		}
 
 		// Check for failure
@@ -264,7 +264,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 }
 
 // handleInProgress processes DataUploads in InProgress phase
