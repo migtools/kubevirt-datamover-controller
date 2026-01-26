@@ -20,13 +20,21 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
@@ -37,6 +45,27 @@ const (
 
 	// DefaultMaxConcurrentReconciles is the default number of concurrent reconciles
 	DefaultMaxConcurrentReconciles = 3
+
+	// AnnotationVMName is the annotation key for the VirtualMachine name
+	AnnotationVMName = "kubevirt.io/vm-name"
+
+	// AnnotationVMNamespace is the annotation key for the VirtualMachine namespace
+	AnnotationVMNamespace = "kubevirt.io/vm-namespace"
+
+	// LabelDataUploadName is the label key for the DataUpload name
+	LabelDataUploadName = "velero.io/dataupload-name"
+
+	// LabelDataUploadUID is the label key for the DataUpload UID
+	LabelDataUploadUID = "velero.io/dataupload-uid"
+
+	// DefaultTempPVCSize is the default size for temporary backup PVC
+	DefaultTempPVCSize = "10Gi"
+
+	// RequeueAfterShort is the short requeue duration for polling
+	RequeueAfterShort = 5 * time.Second
+
+	// RequeueAfterLong is the longer requeue duration
+	RequeueAfterLong = 30 * time.Second
 )
 
 // KubeVirtDataUploadReconciler reconciles DataUpload objects where Spec.DataMover is "kubevirt"
@@ -54,6 +83,12 @@ type KubeVirtDataUploadReconciler struct {
 
 // +kubebuilder:rbac:groups=velero.io,resources=datauploads,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=velero.io,resources=datauploads/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=backup.kubevirt.io,resources=virtualmachinebackups,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=backup.kubevirt.io,resources=virtualmachinebackups/status,verbs=get
+// +kubebuilder:rbac:groups=backup.kubevirt.io,resources=virtualmachinebackuptrackers,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=backup.kubevirt.io,resources=virtualmachinebackuptrackers/status,verbs=get
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines,verbs=get;list;watch
 
 // Reconcile handles DataUpload resources where Spec.DataMover is "kubevirt"
 func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -113,10 +148,17 @@ func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.R
 func (r *KubeVirtDataUploadReconciler) handleNew(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload) (ctrl.Result, error) {
 	logger.Info("Handling New phase DataUpload")
 
-	// TODO Phase 2: Validate prerequisites
-	// - Check VM annotation exists
-	// - Validate VM is running
-	// - Check CBT is enabled on VM
+	// Validate VM annotation exists
+	vmName, vmNamespace, err := r.getVMReference(du)
+	if err != nil {
+		logger.Error(err, "Failed to get VM reference from DataUpload")
+		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Missing VM reference: %v", err)); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	logger.Info("Found VM reference", "vmName", vmName, "vmNamespace", vmNamespace)
 
 	// Transition to Accepted phase
 	if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseAccepted, "DataUpload accepted by kubevirt datamover"); err != nil {
@@ -131,18 +173,81 @@ func (r *KubeVirtDataUploadReconciler) handleNew(ctx context.Context, logger log
 func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload) (ctrl.Result, error) {
 	logger.Info("Handling Accepted phase DataUpload")
 
-	// TODO Phase 2: VMBT/VMB Creation
-	// - Extract VirtualMachine reference from annotation
-	// - Query BSL for latest checkpoint
-	// - Create/update VirtualMachineBackupTracker
-	// - Create VirtualMachineBackup CR
-	// - Create temporary PVC for backup output
+	// Extract VirtualMachine reference from annotation
+	vmName, vmNamespace, err := r.getVMReference(du)
+	if err != nil {
+		logger.Error(err, "Failed to get VM reference")
+		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Missing VM reference: %v", err)); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
 
-	// TODO: Transition to Prepared when VMB is ready
-	// For now, just log and return
-	logger.Info("VMBT/VMB creation not yet implemented")
+	// Step 1: Create or get temporary PVC for backup output
+	pvc, err := r.ensureTempPVC(ctx, logger, du, vmNamespace)
+	if err != nil {
+		logger.Error(err, "Failed to ensure temporary PVC")
+		return ctrl.Result{}, err
+	}
+	logger.Info("Temporary PVC ready", "pvc", pvc.Name)
 
-	return ctrl.Result{}, nil
+	// Step 2: Create or get VirtualMachineBackupTracker
+	vmbt, err := r.ensureVMBackupTracker(ctx, logger, du, vmName, vmNamespace)
+	if err != nil {
+		logger.Error(err, "Failed to ensure VirtualMachineBackupTracker")
+		return ctrl.Result{}, err
+	}
+	logger.Info("VirtualMachineBackupTracker ready", "vmbt", vmbt.Name)
+
+	// Step 3: Create VirtualMachineBackup if it doesn't exist
+	vmb, created, err := r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmNamespace)
+	if err != nil {
+		logger.Error(err, "Failed to ensure VirtualMachineBackup")
+		return ctrl.Result{}, err
+	}
+
+	if created {
+		logger.Info("Created VirtualMachineBackup", "vmb", vmb.Name)
+		// Requeue to check status
+		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+	}
+
+	// Step 4: Check VMB status
+	if vmb.Status == nil {
+		logger.Info("VirtualMachineBackup status not yet available, requeuing")
+		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+	}
+
+	// Check if VMB is done
+	for _, cond := range vmb.Status.Conditions {
+		if cond.Type == kubevirtbackupv1alpha1.ConditionDone && cond.Status == corev1.ConditionTrue {
+			logger.Info("VirtualMachineBackup completed",
+				"vmb", vmb.Name,
+				"type", vmb.Status.Type,
+				"checkpoint", vmb.Status.CheckpointName)
+
+			// Transition to Prepared phase
+			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhasePrepared,
+				fmt.Sprintf("VMBackup completed (type=%s)", vmb.Status.Type)); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
+
+		// Check for failure
+		if cond.Type == kubevirtbackupv1alpha1.ConditionProgressing && cond.Status == corev1.ConditionFalse && cond.Reason != "" {
+			logger.Error(nil, "VirtualMachineBackup failed", "reason", cond.Reason, "message", cond.Message)
+			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+				fmt.Sprintf("VMBackup failed: %s", cond.Message)); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+	}
+
+	// Still in progress, requeue
+	logger.Info("VirtualMachineBackup in progress, requeuing")
+	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 }
 
 // handlePrepared processes DataUploads in Prepared phase
@@ -250,4 +355,175 @@ func (r *KubeVirtDataUploadReconciler) filterKubeVirtDataMover() predicate.Predi
 		}
 		return du.Spec.DataMover == DataMoverKubeVirt
 	})
+}
+
+// getVMReference extracts the VirtualMachine name and namespace from DataUpload annotations
+func (r *KubeVirtDataUploadReconciler) getVMReference(du *velerov2alpha1.DataUpload) (string, string, error) {
+	annotations := du.GetAnnotations()
+	if annotations == nil {
+		return "", "", fmt.Errorf("DataUpload has no annotations")
+	}
+
+	vmName, ok := annotations[AnnotationVMName]
+	if !ok || vmName == "" {
+		return "", "", fmt.Errorf("annotation %s not found or empty", AnnotationVMName)
+	}
+
+	vmNamespace, ok := annotations[AnnotationVMNamespace]
+	if !ok || vmNamespace == "" {
+		// Default to DataUpload's source namespace if not specified
+		vmNamespace = du.Spec.SourceNamespace
+		if vmNamespace == "" {
+			return "", "", fmt.Errorf("annotation %s not found and SourceNamespace is empty", AnnotationVMNamespace)
+		}
+	}
+
+	return vmName, vmNamespace, nil
+}
+
+// ensureTempPVC creates or retrieves the temporary PVC for backup output
+func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, namespace string) (*corev1.PersistentVolumeClaim, error) {
+	pvcName := fmt.Sprintf("kubevirt-backup-%s", du.Name)
+
+	// Check if PVC already exists
+	existingPVC := &corev1.PersistentVolumeClaim{}
+	err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, existingPVC)
+	if err == nil {
+		logger.V(1).Info("Temporary PVC already exists", "pvc", pvcName)
+		return existingPVC, nil
+	}
+
+	if !errors.IsNotFound(err) {
+		return nil, fmt.Errorf("failed to check for existing PVC: %w", err)
+	}
+
+	// Create new PVC
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pvcName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelDataUploadName: du.Name,
+				LabelDataUploadUID:  string(du.UID),
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{
+				corev1.ReadWriteOnce,
+			},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse(DefaultTempPVCSize),
+				},
+			},
+		},
+	}
+
+	// Set owner reference so PVC is cleaned up when DataUpload is deleted
+	if err := controllerutil.SetOwnerReference(du, pvc, r.Scheme); err != nil {
+		return nil, fmt.Errorf("failed to set owner reference on PVC: %w", err)
+	}
+
+	if err := r.Create(ctx, pvc); err != nil {
+		return nil, fmt.Errorf("failed to create temporary PVC: %w", err)
+	}
+
+	logger.Info("Created temporary PVC", "pvc", pvcName, "namespace", namespace)
+	return pvc, nil
+}
+
+// ensureVMBackupTracker creates or retrieves the VirtualMachineBackupTracker for the VM
+func (r *KubeVirtDataUploadReconciler) ensureVMBackupTracker(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmName, vmNamespace string) (*kubevirtbackupv1alpha1.VirtualMachineBackupTracker, error) {
+	// Use a consistent name based on VM name for tracking across backups
+	vmbtName := fmt.Sprintf("vmbt-%s", vmName)
+
+	// Check if VMBT already exists
+	existingVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+	err := r.Get(ctx, types.NamespacedName{Name: vmbtName, Namespace: vmNamespace}, existingVMBT)
+	if err == nil {
+		logger.V(1).Info("VirtualMachineBackupTracker already exists", "vmbt", vmbtName)
+		return existingVMBT, nil
+	}
+
+	if !errors.IsNotFound(err) {
+		return nil, fmt.Errorf("failed to check for existing VMBT: %w", err)
+	}
+
+	// Create new VMBT
+	apiGroup := "kubevirt.io"
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      vmbtName,
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				LabelDataUploadName: du.Name,
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: &apiGroup,
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	if err := r.Create(ctx, vmbt); err != nil {
+		return nil, fmt.Errorf("failed to create VirtualMachineBackupTracker: %w", err)
+	}
+
+	logger.Info("Created VirtualMachineBackupTracker", "vmbt", vmbtName, "namespace", vmNamespace)
+	return vmbt, nil
+}
+
+// ensureVMBackup creates or retrieves the VirtualMachineBackup for this DataUpload
+// Returns the VMB, whether it was created (vs already existed), and any error
+func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmbt *kubevirtbackupv1alpha1.VirtualMachineBackupTracker, pvcName, namespace string) (*kubevirtbackupv1alpha1.VirtualMachineBackup, bool, error) {
+	// Use DataUpload name for VMB to ensure 1:1 mapping
+	vmbName := fmt.Sprintf("vmb-%s", du.Name)
+
+	// Check if VMB already exists
+	existingVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+	err := r.Get(ctx, types.NamespacedName{Name: vmbName, Namespace: namespace}, existingVMB)
+	if err == nil {
+		logger.V(1).Info("VirtualMachineBackup already exists", "vmb", vmbName)
+		return existingVMB, false, nil
+	}
+
+	if !errors.IsNotFound(err) {
+		return nil, false, fmt.Errorf("failed to check for existing VMB: %w", err)
+	}
+
+	// Create new VMB referencing the VMBT (enables incremental backups)
+	apiGroup := "backup.kubevirt.io"
+	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      vmbName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				LabelDataUploadName: du.Name,
+				LabelDataUploadUID:  string(du.UID),
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: &apiGroup,
+				Kind:     "VirtualMachineBackupTracker",
+				Name:     vmbt.Name,
+			},
+			PvcName: &pvcName,
+		},
+	}
+
+	// Set owner reference so VMB is cleaned up when DataUpload is deleted
+	if err := controllerutil.SetOwnerReference(du, vmb, r.Scheme); err != nil {
+		return nil, false, fmt.Errorf("failed to set owner reference on VMB: %w", err)
+	}
+
+	if err := r.Create(ctx, vmb); err != nil {
+		return nil, false, fmt.Errorf("failed to create VirtualMachineBackup: %w", err)
+	}
+
+	logger.Info("Created VirtualMachineBackup", "vmb", vmbName, "namespace", namespace, "tracker", vmbt.Name)
+	return vmb, true, nil
 }

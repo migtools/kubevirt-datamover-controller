@@ -56,11 +56,15 @@ func TestReconcile(t *testing.T) {
 			expectError:     false,
 		},
 		{
-			name: "new phase transitions to accepted",
+			name: "new phase transitions to accepted with VM annotations",
 			dataUpload: &velerov2alpha1.DataUpload{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-du",
 					Namespace: "openshift-adp",
+					Annotations: map[string]string{
+						AnnotationVMName:      "test-vm",
+						AnnotationVMNamespace: "default",
+					},
 				},
 				Spec: velerov2alpha1.DataUploadSpec{
 					DataMover: DataMoverKubeVirt,
@@ -74,11 +78,15 @@ func TestReconcile(t *testing.T) {
 			expectError:     false,
 		},
 		{
-			name: "empty phase transitions to accepted",
+			name: "empty phase transitions to accepted with VM annotations",
 			dataUpload: &velerov2alpha1.DataUpload{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-du",
 					Namespace: "openshift-adp",
+					Annotations: map[string]string{
+						AnnotationVMName:      "test-vm",
+						AnnotationVMNamespace: "default",
+					},
 				},
 				Spec: velerov2alpha1.DataUploadSpec{
 					DataMover: DataMoverKubeVirt,
@@ -89,6 +97,24 @@ func TestReconcile(t *testing.T) {
 			},
 			expectedRequeue: true,
 			expectedPhase:   velerov2alpha1.DataUploadPhaseAccepted,
+			expectError:     false,
+		},
+		{
+			name: "new phase fails without VM annotations",
+			dataUpload: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					DataMover: DataMoverKubeVirt,
+				},
+				Status: velerov2alpha1.DataUploadStatus{
+					Phase: velerov2alpha1.DataUploadPhaseNew,
+				},
+			},
+			expectedRequeue: false,
+			expectedPhase:   velerov2alpha1.DataUploadPhaseFailed,
 			expectError:     false,
 		},
 		{
@@ -495,5 +521,132 @@ func TestDefaultMaxConcurrentReconciles(t *testing.T) {
 func TestDataMoverKubeVirtConstant(t *testing.T) {
 	if DataMoverKubeVirt != "kubevirt" {
 		t.Errorf("expected DataMoverKubeVirt='kubevirt', got '%s'", DataMoverKubeVirt)
+	}
+}
+
+func TestGetVMReference(t *testing.T) {
+	r := &KubeVirtDataUploadReconciler{}
+
+	tests := []struct {
+		name              string
+		dataUpload        *velerov2alpha1.DataUpload
+		expectedVMName    string
+		expectedNamespace string
+		expectError       bool
+	}{
+		{
+			name: "valid annotations",
+			dataUpload: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					Annotations: map[string]string{
+						AnnotationVMName:      "my-vm",
+						AnnotationVMNamespace: "my-namespace",
+					},
+				},
+			},
+			expectedVMName:    "my-vm",
+			expectedNamespace: "my-namespace",
+			expectError:       false,
+		},
+		{
+			name: "missing namespace annotation uses source namespace",
+			dataUpload: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					Annotations: map[string]string{
+						AnnotationVMName: "my-vm",
+					},
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					SourceNamespace: "source-ns",
+				},
+			},
+			expectedVMName:    "my-vm",
+			expectedNamespace: "source-ns",
+			expectError:       false,
+		},
+		{
+			name: "no annotations",
+			dataUpload: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+				},
+			},
+			expectedVMName:    "",
+			expectedNamespace: "",
+			expectError:       true,
+		},
+		{
+			name: "missing vm name annotation",
+			dataUpload: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					Annotations: map[string]string{
+						AnnotationVMNamespace: "my-namespace",
+					},
+				},
+			},
+			expectedVMName:    "",
+			expectedNamespace: "",
+			expectError:       true,
+		},
+		{
+			name: "empty vm name annotation",
+			dataUpload: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					Annotations: map[string]string{
+						AnnotationVMName:      "",
+						AnnotationVMNamespace: "my-namespace",
+					},
+				},
+			},
+			expectedVMName:    "",
+			expectedNamespace: "",
+			expectError:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vmName, vmNamespace, err := r.getVMReference(tt.dataUpload)
+
+			if tt.expectError && err == nil {
+				t.Errorf("expected error but got none")
+			}
+			if !tt.expectError && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if vmName != tt.expectedVMName {
+				t.Errorf("expected vmName=%s, got vmName=%s", tt.expectedVMName, vmName)
+			}
+			if vmNamespace != tt.expectedNamespace {
+				t.Errorf("expected vmNamespace=%s, got vmNamespace=%s", tt.expectedNamespace, vmNamespace)
+			}
+		})
+	}
+}
+
+func TestAnnotationConstants(t *testing.T) {
+	if AnnotationVMName != "kubevirt.io/vm-name" {
+		t.Errorf("expected AnnotationVMName='kubevirt.io/vm-name', got '%s'", AnnotationVMName)
+	}
+	if AnnotationVMNamespace != "kubevirt.io/vm-namespace" {
+		t.Errorf("expected AnnotationVMNamespace='kubevirt.io/vm-namespace', got '%s'", AnnotationVMNamespace)
+	}
+	if LabelDataUploadName != "velero.io/dataupload-name" {
+		t.Errorf("expected LabelDataUploadName='velero.io/dataupload-name', got '%s'", LabelDataUploadName)
+	}
+	if LabelDataUploadUID != "velero.io/dataupload-uid" {
+		t.Errorf("expected LabelDataUploadUID='velero.io/dataupload-uid', got '%s'", LabelDataUploadUID)
+	}
+	if DefaultTempPVCSize != "10Gi" {
+		t.Errorf("expected DefaultTempPVCSize='10Gi', got '%s'", DefaultTempPVCSize)
 	}
 }
