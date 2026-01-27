@@ -22,9 +22,12 @@ import (
 
 	"github.com/go-logr/logr"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -471,6 +474,232 @@ func TestHandleAccepted(t *testing.T) {
 	// handleAccepted now implements Phase 2 logic and may request requeue
 	// This is expected behavior when VMB is in progress
 	_ = result // result.RequeueAfter may be > 0 depending on VMB state
+}
+
+func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	tests := []struct {
+		name          string
+		vmbConditions []kubevirtbackupv1alpha1.Condition
+		expectedPhase velerov2alpha1.DataUploadPhase
+		expectRequeue bool
+	}{
+		{
+			name: "VMB Done True transitions to Prepared",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionFalse,
+					Reason: "Completed VirtualMachineBackup",
+				},
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionDone,
+					Status: corev1.ConditionTrue,
+					Reason: "Completed VirtualMachineBackup",
+				},
+			},
+			expectedPhase: velerov2alpha1.DataUploadPhasePrepared,
+			expectRequeue: true,
+		},
+		{
+			name: "VMB Done False transitions to Failed",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:    kubevirtbackupv1alpha1.ConditionDone,
+					Status:  corev1.ConditionFalse,
+					Reason:  "BackupFailed",
+					Message: "VM backup failed due to an error",
+				},
+			},
+			expectedPhase: velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue: false,
+		},
+		{
+			name: "VMB only Progressing True requeues",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionTrue,
+					Reason: "Backup in progress",
+				},
+			},
+			expectedPhase: velerov2alpha1.DataUploadPhaseAccepted, // unchanged
+			expectRequeue: true,
+		},
+		{
+			name: "VMB Progressing False without Done requeues",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionInitializing,
+					Status: corev1.ConditionFalse,
+				},
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionFalse,
+					Reason: "PVC being attached to VM",
+				},
+			},
+			expectedPhase: velerov2alpha1.DataUploadPhaseAccepted, // unchanged - wait for Done
+			expectRequeue: true,
+		},
+		{
+			name:          "VMB no conditions requeues",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{},
+			expectedPhase: velerov2alpha1.DataUploadPhaseAccepted, // unchanged
+			expectRequeue: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vmName := "test-vm"
+			vmNamespace := "test-ns"
+			duName := "test-du"
+
+			// Create DataUpload
+			du := &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      duName,
+					Namespace: vmNamespace,
+					UID:       types.UID("test-uid"),
+					Annotations: map[string]string{
+						AnnotationVMName:      vmName,
+						AnnotationVMNamespace: vmNamespace,
+					},
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					DataMover:       DataMoverKubeVirt,
+					SourceNamespace: vmNamespace,
+				},
+				Status: velerov2alpha1.DataUploadStatus{
+					Phase: velerov2alpha1.DataUploadPhaseAccepted,
+				},
+			}
+
+			// Create temporary PVC (needed for handleAccepted to proceed)
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "kubevirt-backup-" + duName,
+					Namespace: vmNamespace,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "velero.io/v2alpha1",
+							Kind:       "DataUpload",
+							Name:       duName,
+							UID:        du.UID,
+						},
+					},
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("1Gi"),
+						},
+					},
+				},
+				Status: corev1.PersistentVolumeClaimStatus{
+					Phase: corev1.ClaimBound,
+				},
+			}
+
+			// Create VMBT
+			vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "vmbt-" + vmName,
+					Namespace: vmNamespace,
+				},
+				Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+					Source: corev1.TypedLocalObjectReference{
+						APIGroup: strPtr("kubevirt.io"),
+						Kind:     "VirtualMachine",
+						Name:     vmName,
+					},
+				},
+			}
+
+			// Create VMB with specified conditions
+			checkpointName := "vmb-" + duName + "-checkpoint"
+			vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "vmb-" + duName,
+					Namespace: vmNamespace,
+					Labels: map[string]string{
+						LabelDataUploadName: duName,
+						LabelDataUploadUID:  string(du.UID),
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: "velero.io/v2alpha1",
+							Kind:       "DataUpload",
+							Name:       duName,
+							UID:        du.UID,
+						},
+					},
+				},
+				Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
+					Source: corev1.TypedLocalObjectReference{
+						APIGroup: strPtr("backup.kubevirt.io"),
+						Kind:     "VirtualMachineBackupTracker",
+						Name:     vmbt.Name,
+					},
+					PvcName: strPtr(pvc.Name),
+				},
+				Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+					Type:           kubevirtbackupv1alpha1.Full,
+					CheckpointName: &checkpointName,
+					Conditions:     tt.vmbConditions,
+				},
+			}
+
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(du, pvc, vmbt, vmb).
+				Build()
+
+			r := &KubeVirtDataUploadReconciler{
+				Client:        fakeClient,
+				Scheme:        scheme,
+				Log:           logr.Discard(),
+				OADPNamespace: vmNamespace,
+			}
+
+			result, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+
+			if tt.expectRequeue && result.RequeueAfter == 0 {
+				t.Errorf("expected requeue, got no requeue")
+			}
+			if !tt.expectRequeue && result.RequeueAfter > 0 {
+				t.Errorf("expected no requeue, got RequeueAfter=%v", result.RequeueAfter)
+			}
+
+			// Fetch updated DataUpload to check phase
+			var updatedDU velerov2alpha1.DataUpload
+			if err := fakeClient.Get(context.Background(), types.NamespacedName{
+				Name:      duName,
+				Namespace: vmNamespace,
+			}, &updatedDU); err != nil {
+				t.Fatalf("failed to get updated DataUpload: %v", err)
+			}
+
+			if updatedDU.Status.Phase != tt.expectedPhase {
+				t.Errorf("expected phase=%s, got phase=%s", tt.expectedPhase, updatedDU.Status.Phase)
+			}
+		})
+	}
+}
+
+// strPtr returns a pointer to the given string
+func strPtr(s string) *string {
+	return &s
 }
 
 func TestHandleInProgress(t *testing.T) {
