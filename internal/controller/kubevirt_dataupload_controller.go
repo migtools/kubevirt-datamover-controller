@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -40,23 +41,8 @@ import (
 )
 
 const (
-	// DataMoverKubeVirt is the datamover value that indicates this controller should handle the DataUpload
-	DataMoverKubeVirt = "kubevirt"
-
 	// DefaultMaxConcurrentReconciles is the default number of concurrent reconciles
 	DefaultMaxConcurrentReconciles = 3
-
-	// AnnotationVMName is the annotation key for the VirtualMachine name
-	AnnotationVMName = "kubevirt-datamover.io/vm-name"
-
-	// AnnotationVMNamespace is the annotation key for the VirtualMachine namespace
-	AnnotationVMNamespace = "kubevirt-datamover.io/vm-namespace"
-
-	// LabelDataUploadName is the label key for the DataUpload name
-	LabelDataUploadName = "velero.io/dataupload-name"
-
-	// LabelDataUploadUID is the label key for the DataUpload UID
-	LabelDataUploadUID = "velero.io/dataupload-uid"
 
 	// DefaultTempPVCSize is the default size for temporary backup PVC
 	DefaultTempPVCSize = "10Gi"
@@ -102,7 +88,7 @@ func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	// Skip if DataMover is not "kubevirt"
-	if dataUpload.Spec.DataMover != DataMoverKubeVirt {
+	if dataUpload.Spec.DataMover != common.DataMoverKubeVirt {
 		logger.V(1).Info("Skipping DataUpload - DataMover is not kubevirt",
 			"dataUpload", req.NamespacedName,
 			"dataMover", dataUpload.Spec.DataMover)
@@ -352,7 +338,7 @@ func (r *KubeVirtDataUploadReconciler) filterKubeVirtDataMover() predicate.Predi
 		if !ok {
 			return false
 		}
-		return du.Spec.DataMover == DataMoverKubeVirt
+		return du.Spec.DataMover == common.DataMoverKubeVirt
 	})
 }
 
@@ -363,17 +349,17 @@ func (r *KubeVirtDataUploadReconciler) getVMReference(du *velerov2alpha1.DataUpl
 		return "", "", fmt.Errorf("DataUpload has no annotations")
 	}
 
-	vmName, ok := annotations[AnnotationVMName]
+	vmName, ok := annotations[common.AnnotationVMName]
 	if !ok || vmName == "" {
-		return "", "", fmt.Errorf("annotation %s not found or empty", AnnotationVMName)
+		return "", "", fmt.Errorf("annotation %s not found or empty", common.AnnotationVMName)
 	}
 
-	vmNamespace, ok := annotations[AnnotationVMNamespace]
+	vmNamespace, ok := annotations[common.AnnotationVMNamespace]
 	if !ok || vmNamespace == "" {
 		// Default to DataUpload's source namespace if not specified
 		vmNamespace = du.Spec.SourceNamespace
 		if vmNamespace == "" {
-			return "", "", fmt.Errorf("annotation %s not found and SourceNamespace is empty", AnnotationVMNamespace)
+			return "", "", fmt.Errorf("annotation %s not found and SourceNamespace is empty", common.AnnotationVMNamespace)
 		}
 	}
 
@@ -402,8 +388,8 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 			Name:      pvcName,
 			Namespace: namespace,
 			Labels: map[string]string{
-				LabelDataUploadName: du.Name,
-				LabelDataUploadUID:  string(du.UID),
+				common.LabelDataUploadName: du.Name,
+				common.LabelDataUploadUID:  string(du.UID),
 			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
@@ -455,7 +441,7 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackupTracker(ctx context.Context
 			Name:      vmbtName,
 			Namespace: vmNamespace,
 			Labels: map[string]string{
-				LabelDataUploadName: du.Name,
+				common.LabelDataUploadName: du.Name,
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
@@ -500,8 +486,8 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logge
 			Name:      vmbName,
 			Namespace: namespace,
 			Labels: map[string]string{
-				LabelDataUploadName: du.Name,
-				LabelDataUploadUID:  string(du.UID),
+				common.LabelDataUploadName: du.Name,
+				common.LabelDataUploadUID:  string(du.UID),
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{

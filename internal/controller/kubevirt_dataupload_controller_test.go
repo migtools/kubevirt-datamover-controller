@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -65,12 +66,12 @@ func TestReconcile(t *testing.T) {
 					Name:      "test-du",
 					Namespace: "openshift-adp",
 					Annotations: map[string]string{
-						AnnotationVMName:      "test-vm",
-						AnnotationVMNamespace: "default",
+						common.AnnotationVMName:      "test-vm",
+						common.AnnotationVMNamespace: "default",
 					},
 				},
 				Spec: velerov2alpha1.DataUploadSpec{
-					DataMover: DataMoverKubeVirt,
+					DataMover: common.DataMoverKubeVirt,
 				},
 				Status: velerov2alpha1.DataUploadStatus{
 					Phase: velerov2alpha1.DataUploadPhaseNew,
@@ -87,12 +88,12 @@ func TestReconcile(t *testing.T) {
 					Name:      "test-du",
 					Namespace: "openshift-adp",
 					Annotations: map[string]string{
-						AnnotationVMName:      "test-vm",
-						AnnotationVMNamespace: "default",
+						common.AnnotationVMName:      "test-vm",
+						common.AnnotationVMNamespace: "default",
 					},
 				},
 				Spec: velerov2alpha1.DataUploadSpec{
-					DataMover: DataMoverKubeVirt,
+					DataMover: common.DataMoverKubeVirt,
 				},
 				Status: velerov2alpha1.DataUploadStatus{
 					Phase: "",
@@ -110,7 +111,7 @@ func TestReconcile(t *testing.T) {
 					Namespace: "openshift-adp",
 				},
 				Spec: velerov2alpha1.DataUploadSpec{
-					DataMover: DataMoverKubeVirt,
+					DataMover: common.DataMoverKubeVirt,
 				},
 				Status: velerov2alpha1.DataUploadStatus{
 					Phase: velerov2alpha1.DataUploadPhaseNew,
@@ -128,7 +129,7 @@ func TestReconcile(t *testing.T) {
 					Namespace: "openshift-adp",
 				},
 				Spec: velerov2alpha1.DataUploadSpec{
-					DataMover: DataMoverKubeVirt,
+					DataMover: common.DataMoverKubeVirt,
 				},
 				Status: velerov2alpha1.DataUploadStatus{
 					Phase: velerov2alpha1.DataUploadPhaseCompleted,
@@ -146,7 +147,7 @@ func TestReconcile(t *testing.T) {
 					Namespace: "openshift-adp",
 				},
 				Spec: velerov2alpha1.DataUploadSpec{
-					DataMover: DataMoverKubeVirt,
+					DataMover: common.DataMoverKubeVirt,
 				},
 				Status: velerov2alpha1.DataUploadStatus{
 					Phase: velerov2alpha1.DataUploadPhaseFailed,
@@ -164,7 +165,7 @@ func TestReconcile(t *testing.T) {
 					Namespace: "openshift-adp",
 				},
 				Spec: velerov2alpha1.DataUploadSpec{
-					DataMover: DataMoverKubeVirt,
+					DataMover: common.DataMoverKubeVirt,
 				},
 				Status: velerov2alpha1.DataUploadStatus{
 					Phase: velerov2alpha1.DataUploadPhaseCanceled,
@@ -182,7 +183,7 @@ func TestReconcile(t *testing.T) {
 					Namespace: "openshift-adp",
 				},
 				Spec: velerov2alpha1.DataUploadSpec{
-					DataMover: DataMoverKubeVirt,
+					DataMover: common.DataMoverKubeVirt,
 				},
 				Status: velerov2alpha1.DataUploadStatus{
 					Phase: velerov2alpha1.DataUploadPhaseCanceling,
@@ -200,7 +201,7 @@ func TestReconcile(t *testing.T) {
 					Namespace: "openshift-adp",
 				},
 				Spec: velerov2alpha1.DataUploadSpec{
-					DataMover: DataMoverKubeVirt,
+					DataMover: common.DataMoverKubeVirt,
 				},
 				Status: velerov2alpha1.DataUploadStatus{
 					Phase: velerov2alpha1.DataUploadPhasePrepared,
@@ -248,7 +249,7 @@ func TestReconcile(t *testing.T) {
 			}
 
 			// Verify phase if we expect a transition
-			if tt.expectedPhase != "" && tt.dataUpload.Spec.DataMover == DataMoverKubeVirt {
+			if tt.expectedPhase != "" && tt.dataUpload.Spec.DataMover == common.DataMoverKubeVirt {
 				updatedDU := &velerov2alpha1.DataUpload{}
 				err := fakeClient.Get(context.Background(), req.NamespacedName, updatedDU)
 				if err != nil {
@@ -302,7 +303,7 @@ func TestFilterKubeVirtDataMover(t *testing.T) {
 	}{
 		{
 			name:      "kubevirt datamover matches",
-			dataMover: DataMoverKubeVirt,
+			dataMover: common.DataMoverKubeVirt,
 			expected:  true,
 		},
 		{
@@ -325,7 +326,7 @@ func TestFilterKubeVirtDataMover(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Test the filter logic directly - this is what the predicate checks
-			matches := tt.dataMover == DataMoverKubeVirt
+			matches := tt.dataMover == common.DataMoverKubeVirt
 			if matches != tt.expected {
 				t.Errorf("expected match=%v, got match=%v for datamover=%s",
 					tt.expected, matches, tt.dataMover)
@@ -390,7 +391,7 @@ func TestUpdatePhase(t *testing.T) {
 					Namespace: "openshift-adp",
 				},
 				Spec: velerov2alpha1.DataUploadSpec{
-					DataMover: DataMoverKubeVirt,
+					DataMover: common.DataMoverKubeVirt,
 				},
 				Status: velerov2alpha1.DataUploadStatus{
 					Phase: tt.initialPhase,
@@ -447,7 +448,7 @@ func TestHandleAccepted(t *testing.T) {
 			Namespace: "openshift-adp",
 		},
 		Spec: velerov2alpha1.DataUploadSpec{
-			DataMover: DataMoverKubeVirt,
+			DataMover: common.DataMoverKubeVirt,
 		},
 		Status: velerov2alpha1.DataUploadStatus{
 			Phase: velerov2alpha1.DataUploadPhaseAccepted,
@@ -567,12 +568,12 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 					Namespace: vmNamespace,
 					UID:       types.UID("test-uid"),
 					Annotations: map[string]string{
-						AnnotationVMName:      vmName,
-						AnnotationVMNamespace: vmNamespace,
+						common.AnnotationVMName:      vmName,
+						common.AnnotationVMNamespace: vmNamespace,
 					},
 				},
 				Spec: velerov2alpha1.DataUploadSpec{
-					DataMover:       DataMoverKubeVirt,
+					DataMover:       common.DataMoverKubeVirt,
 					SourceNamespace: vmNamespace,
 				},
 				Status: velerov2alpha1.DataUploadStatus{
@@ -629,8 +630,8 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 					Name:      "vmb-" + duName,
 					Namespace: vmNamespace,
 					Labels: map[string]string{
-						LabelDataUploadName: duName,
-						LabelDataUploadUID:  string(du.UID),
+						common.LabelDataUploadName: duName,
+						common.LabelDataUploadUID:  string(du.UID),
 					},
 					OwnerReferences: []metav1.OwnerReference{
 						{
@@ -712,7 +713,7 @@ func TestHandleInProgress(t *testing.T) {
 			Namespace: "openshift-adp",
 		},
 		Spec: velerov2alpha1.DataUploadSpec{
-			DataMover: DataMoverKubeVirt,
+			DataMover: common.DataMoverKubeVirt,
 		},
 		Status: velerov2alpha1.DataUploadStatus{
 			Phase: velerov2alpha1.DataUploadPhaseInProgress,
@@ -750,8 +751,8 @@ func TestDefaultMaxConcurrentReconciles(t *testing.T) {
 }
 
 func TestDataMoverKubeVirtConstant(t *testing.T) {
-	if DataMoverKubeVirt != "kubevirt" {
-		t.Errorf("expected DataMoverKubeVirt='kubevirt', got '%s'", DataMoverKubeVirt)
+	if common.DataMoverKubeVirt != "kubevirt" {
+		t.Errorf("expected common.DataMoverKubeVirt='kubevirt', got '%s'", common.DataMoverKubeVirt)
 	}
 }
 
@@ -772,8 +773,8 @@ func TestGetVMReference(t *testing.T) {
 					Name:      "test-du",
 					Namespace: "openshift-adp",
 					Annotations: map[string]string{
-						AnnotationVMName:      "my-vm",
-						AnnotationVMNamespace: "my-namespace",
+						common.AnnotationVMName:      "my-vm",
+						common.AnnotationVMNamespace: "my-namespace",
 					},
 				},
 			},
@@ -788,7 +789,7 @@ func TestGetVMReference(t *testing.T) {
 					Name:      "test-du",
 					Namespace: "openshift-adp",
 					Annotations: map[string]string{
-						AnnotationVMName: "my-vm",
+						common.AnnotationVMName: "my-vm",
 					},
 				},
 				Spec: velerov2alpha1.DataUploadSpec{
@@ -818,7 +819,7 @@ func TestGetVMReference(t *testing.T) {
 					Name:      "test-du",
 					Namespace: "openshift-adp",
 					Annotations: map[string]string{
-						AnnotationVMNamespace: "my-namespace",
+						common.AnnotationVMNamespace: "my-namespace",
 					},
 				},
 			},
@@ -833,8 +834,8 @@ func TestGetVMReference(t *testing.T) {
 					Name:      "test-du",
 					Namespace: "openshift-adp",
 					Annotations: map[string]string{
-						AnnotationVMName:      "",
-						AnnotationVMNamespace: "my-namespace",
+						common.AnnotationVMName:      "",
+						common.AnnotationVMNamespace: "my-namespace",
 					},
 				},
 			},
@@ -865,17 +866,17 @@ func TestGetVMReference(t *testing.T) {
 }
 
 func TestAnnotationConstants(t *testing.T) {
-	if AnnotationVMName != "kubevirt-datamover.io/vm-name" {
-		t.Errorf("expected AnnotationVMName='kubevirt-datamover.io/vm-name', got '%s'", AnnotationVMName)
+	if common.AnnotationVMName != "kubevirt-datamover.io/vm-name" {
+		t.Errorf("expected common.AnnotationVMName='kubevirt-datamover.io/vm-name', got '%s'", common.AnnotationVMName)
 	}
-	if AnnotationVMNamespace != "kubevirt-datamover.io/vm-namespace" {
-		t.Errorf("expected AnnotationVMNamespace='kubevirt-datamover.io/vm-namespace', got '%s'", AnnotationVMNamespace)
+	if common.AnnotationVMNamespace != "kubevirt-datamover.io/vm-namespace" {
+		t.Errorf("expected common.AnnotationVMNamespace='kubevirt-datamover.io/vm-namespace', got '%s'", common.AnnotationVMNamespace)
 	}
-	if LabelDataUploadName != "velero.io/dataupload-name" {
-		t.Errorf("expected LabelDataUploadName='velero.io/dataupload-name', got '%s'", LabelDataUploadName)
+	if common.LabelDataUploadName != "velero.io/dataupload-name" {
+		t.Errorf("expected common.LabelDataUploadName='velero.io/dataupload-name', got '%s'", common.LabelDataUploadName)
 	}
-	if LabelDataUploadUID != "velero.io/dataupload-uid" {
-		t.Errorf("expected LabelDataUploadUID='velero.io/dataupload-uid', got '%s'", LabelDataUploadUID)
+	if common.LabelDataUploadUID != "velero.io/dataupload-uid" {
+		t.Errorf("expected common.LabelDataUploadUID='velero.io/dataupload-uid', got '%s'", common.LabelDataUploadUID)
 	}
 	if DefaultTempPVCSize != "10Gi" {
 		t.Errorf("expected DefaultTempPVCSize='10Gi', got '%s'", DefaultTempPVCSize)
