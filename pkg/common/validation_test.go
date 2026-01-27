@@ -28,16 +28,16 @@ import (
 
 func TestGetVMReference(t *testing.T) {
 	tests := []struct {
-		name           string
-		dataUpload     *velerov2alpha1api.DataUpload
-		expectedRef    *VMReference
-		expectError    bool
-		errorContains  string
+		name          string
+		dataUpload    *velerov2alpha1api.DataUpload
+		expectedRef   *VMReference
+		expectError   bool
+		errorContains string
 	}{
 		{
-			name:        "nil DataUpload",
-			dataUpload:  nil,
-			expectError: true,
+			name:          "nil DataUpload",
+			dataUpload:    nil,
+			expectError:   true,
 			errorContains: "DataUpload is nil",
 		},
 		{
@@ -55,8 +55,8 @@ func TestGetVMReference(t *testing.T) {
 			name: "missing vm-name annotation",
 			dataUpload: &velerov2alpha1api.DataUpload{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:        "test-du",
-					Namespace:   "velero",
+					Name:      "test-du",
+					Namespace: "velero",
 					Annotations: map[string]string{
 						"some-other-annotation": "value",
 					},
@@ -69,8 +69,8 @@ func TestGetVMReference(t *testing.T) {
 			name: "empty vm-name annotation",
 			dataUpload: &velerov2alpha1api.DataUpload{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:        "test-du",
-					Namespace:   "velero",
+					Name:      "test-du",
+					Namespace: "velero",
 					Annotations: map[string]string{
 						AnnotationVMName: "",
 					},
@@ -83,8 +83,8 @@ func TestGetVMReference(t *testing.T) {
 			name: "vm-name set, namespace defaults to source",
 			dataUpload: &velerov2alpha1api.DataUpload{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:        "test-du",
-					Namespace:   "velero",
+					Name:      "test-du",
+					Namespace: "velero",
 					Annotations: map[string]string{
 						AnnotationVMName: "my-vm",
 					},
@@ -103,8 +103,8 @@ func TestGetVMReference(t *testing.T) {
 			name: "both vm-name and vm-namespace set",
 			dataUpload: &velerov2alpha1api.DataUpload{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:        "test-du",
-					Namespace:   "velero",
+					Name:      "test-du",
+					Namespace: "velero",
 					Annotations: map[string]string{
 						AnnotationVMName:      "my-vm",
 						AnnotationVMNamespace: "explicit-namespace",
