@@ -218,24 +218,23 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 	}
 
-	// Check if VMB is done
+	// Simple logic: check the Done condition only
 	for _, cond := range vmb.Status.Conditions {
-		if cond.Type == kubevirtbackupv1alpha1.ConditionDone && cond.Status == corev1.ConditionTrue {
-			logger.Info("VirtualMachineBackup completed",
-				"vmb", vmb.Name,
-				"type", vmb.Status.Type,
-				"checkpoint", vmb.Status.CheckpointName)
+		if cond.Type == kubevirtbackupv1alpha1.ConditionDone {
+			if cond.Status == corev1.ConditionTrue {
+				// Success
+				logger.Info("VirtualMachineBackup completed",
+					"vmb", vmb.Name,
+					"type", vmb.Status.Type,
+					"checkpoint", vmb.Status.CheckpointName)
 
-			// Transition to Prepared phase
-			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhasePrepared,
-				fmt.Sprintf("VMBackup completed (type=%s)", vmb.Status.Type)); err != nil {
-				return ctrl.Result{}, err
+				if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhasePrepared,
+					fmt.Sprintf("VMBackup completed (type=%s)", vmb.Status.Type)); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 			}
-			return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
-		}
-
-		// Check for failure
-		if cond.Type == kubevirtbackupv1alpha1.ConditionProgressing && cond.Status == corev1.ConditionFalse && cond.Reason != "" {
+			// Done: False means explicit failure
 			logger.Error(nil, "VirtualMachineBackup failed", "reason", cond.Reason, "message", cond.Message)
 			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
 				fmt.Sprintf("VMBackup failed: %s", cond.Message)); err != nil {
@@ -245,7 +244,7 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		}
 	}
 
-	// Still in progress, requeue
+	// No Done condition yet - still in progress
 	logger.Info("VirtualMachineBackup in progress, requeuing")
 	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 }
