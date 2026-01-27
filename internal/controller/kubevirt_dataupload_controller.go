@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
+	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -134,8 +135,8 @@ func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.R
 func (r *KubeVirtDataUploadReconciler) handleNew(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload) (ctrl.Result, error) {
 	logger.Info("Handling New phase DataUpload")
 
-	// Validate VM annotation exists
-	vmName, vmNamespace, err := r.getVMReference(du)
+	// Step 1: Validate VM annotation exists
+	vmRef, err := common.GetVMReference(du)
 	if err != nil {
 		logger.Error(err, "Failed to get VM reference from DataUpload")
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Missing VM reference: %v", err)); err != nil {
@@ -144,7 +145,32 @@ func (r *KubeVirtDataUploadReconciler) handleNew(ctx context.Context, logger log
 		return ctrl.Result{}, nil
 	}
 
-	logger.Info("Found VM reference", "vmName", vmName, "vmNamespace", vmNamespace)
+	logger.Info("Found VM reference", "vmName", vmRef.Name, "vmNamespace", vmRef.Namespace)
+
+	// Step 2: Fetch the VirtualMachine and validate prerequisites
+	vm := &kubevirtcorev1.VirtualMachine{}
+	if err := r.Get(ctx, types.NamespacedName{Name: vmRef.Name, Namespace: vmRef.Namespace}, vm); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Error(err, "VirtualMachine not found")
+			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+				fmt.Sprintf("VirtualMachine %s/%s not found", vmRef.Namespace, vmRef.Name)); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("failed to get VirtualMachine: %w", err)
+	}
+
+	// Step 3: Validate VM is running and CBT is enabled
+	if err := common.ValidateVMForBackup(vm); err != nil {
+		logger.Error(err, "VM validation failed")
+		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, err.Error()); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	logger.Info("VM validation passed", "vmName", vmRef.Name, "vmNamespace", vmRef.Namespace)
 
 	// Transition to Accepted phase
 	if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseAccepted, "DataUpload accepted by kubevirt datamover"); err != nil {
@@ -160,7 +186,7 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	logger.Info("Handling Accepted phase DataUpload")
 
 	// Extract VirtualMachine reference from annotation
-	vmName, vmNamespace, err := r.getVMReference(du)
+	vmRef, err := common.GetVMReference(du)
 	if err != nil {
 		logger.Error(err, "Failed to get VM reference")
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Missing VM reference: %v", err)); err != nil {
@@ -170,7 +196,7 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	}
 
 	// Step 1: Create or get temporary PVC for backup output
-	pvc, err := r.ensureTempPVC(ctx, logger, du, vmNamespace)
+	pvc, err := r.ensureTempPVC(ctx, logger, du, vmRef.Namespace)
 	if err != nil {
 		logger.Error(err, "Failed to ensure temporary PVC")
 		return ctrl.Result{}, err
@@ -178,7 +204,7 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	logger.Info("Temporary PVC ready", "pvc", pvc.Name)
 
 	// Step 2: Create or get VirtualMachineBackupTracker
-	vmbt, err := r.ensureVMBackupTracker(ctx, logger, du, vmName, vmNamespace)
+	vmbt, err := r.ensureVMBackupTracker(ctx, logger, du, vmRef.Name, vmRef.Namespace)
 	if err != nil {
 		logger.Error(err, "Failed to ensure VirtualMachineBackupTracker")
 		return ctrl.Result{}, err
@@ -186,7 +212,7 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	logger.Info("VirtualMachineBackupTracker ready", "vmbt", vmbt.Name)
 
 	// Step 3: Create VirtualMachineBackup if it doesn't exist
-	vmb, created, err := r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmNamespace)
+	vmb, created, err := r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmRef.Namespace)
 	if err != nil {
 		logger.Error(err, "Failed to ensure VirtualMachineBackup")
 		return ctrl.Result{}, err
@@ -340,30 +366,6 @@ func (r *KubeVirtDataUploadReconciler) filterKubeVirtDataMover() predicate.Predi
 		}
 		return du.Spec.DataMover == common.DataMoverKubeVirt
 	})
-}
-
-// getVMReference extracts the VirtualMachine name and namespace from DataUpload annotations
-func (r *KubeVirtDataUploadReconciler) getVMReference(du *velerov2alpha1.DataUpload) (string, string, error) {
-	annotations := du.GetAnnotations()
-	if annotations == nil {
-		return "", "", fmt.Errorf("DataUpload has no annotations")
-	}
-
-	vmName, ok := annotations[common.AnnotationVMName]
-	if !ok || vmName == "" {
-		return "", "", fmt.Errorf("annotation %s not found or empty", common.AnnotationVMName)
-	}
-
-	vmNamespace, ok := annotations[common.AnnotationVMNamespace]
-	if !ok || vmNamespace == "" {
-		// Default to DataUpload's source namespace if not specified
-		vmNamespace = du.Spec.SourceNamespace
-		if vmNamespace == "" {
-			return "", "", fmt.Errorf("annotation %s not found and SourceNamespace is empty", common.AnnotationVMNamespace)
-		}
-	}
-
-	return vmName, vmNamespace, nil
 }
 
 // ensureTempPVC creates or retrieves the temporary PVC for backup output

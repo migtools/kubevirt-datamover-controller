@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
+	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -36,10 +37,28 @@ import (
 func TestReconcile(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtcorev1.AddToScheme(scheme)
+
+	// Helper function to create a valid VM with CBT enabled and running
+	validVM := func(name, namespace string) *kubevirtcorev1.VirtualMachine {
+		return &kubevirtcorev1.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+			},
+			Status: kubevirtcorev1.VirtualMachineStatus{
+				PrintableStatus: kubevirtcorev1.VirtualMachineStatusRunning,
+				ChangedBlockTracking: &kubevirtcorev1.ChangedBlockTrackingStatus{
+					State: kubevirtcorev1.ChangedBlockTrackingEnabled,
+				},
+			},
+		}
+	}
 
 	tests := []struct {
 		name            string
 		dataUpload      *velerov2alpha1.DataUpload
+		vm              *kubevirtcorev1.VirtualMachine // optional: VM to create in fake client
 		expectedRequeue bool
 		expectedPhase   velerov2alpha1.DataUploadPhase
 		expectError     bool
@@ -77,6 +96,7 @@ func TestReconcile(t *testing.T) {
 					Phase: velerov2alpha1.DataUploadPhaseNew,
 				},
 			},
+			vm:              validVM("test-vm", "default"),
 			expectedRequeue: true,
 			expectedPhase:   velerov2alpha1.DataUploadPhaseAccepted,
 			expectError:     false,
@@ -99,6 +119,7 @@ func TestReconcile(t *testing.T) {
 					Phase: "",
 				},
 			},
+			vm:              validVM("test-vm", "default"),
 			expectedRequeue: true,
 			expectedPhase:   velerov2alpha1.DataUploadPhaseAccepted,
 			expectError:     false,
@@ -215,10 +236,16 @@ func TestReconcile(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fakeClient := fake.NewClientBuilder().
+			builder := fake.NewClientBuilder().
 				WithScheme(scheme).
-				WithObjects(tt.dataUpload).
-				Build()
+				WithObjects(tt.dataUpload)
+
+			// Add VM to fake client if provided
+			if tt.vm != nil {
+				builder = builder.WithObjects(tt.vm)
+			}
+
+			fakeClient := builder.Build()
 
 			r := &KubeVirtDataUploadReconciler{
 				Client:        fakeClient,
@@ -757,8 +784,7 @@ func TestDataMoverKubeVirtConstant(t *testing.T) {
 }
 
 func TestGetVMReference(t *testing.T) {
-	r := &KubeVirtDataUploadReconciler{}
-
+	// Tests the common.GetVMReference function used by the controller
 	tests := []struct {
 		name              string
 		dataUpload        *velerov2alpha1.DataUpload
@@ -847,7 +873,7 @@ func TestGetVMReference(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			vmName, vmNamespace, err := r.getVMReference(tt.dataUpload)
+			vmRef, err := common.GetVMReference(tt.dataUpload)
 
 			if tt.expectError && err == nil {
 				t.Errorf("expected error but got none")
@@ -855,6 +881,13 @@ func TestGetVMReference(t *testing.T) {
 			if !tt.expectError && err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
+
+			var vmName, vmNamespace string
+			if vmRef != nil {
+				vmName = vmRef.Name
+				vmNamespace = vmRef.Namespace
+			}
+
 			if vmName != tt.expectedVMName {
 				t.Errorf("expected vmName=%s, got vmName=%s", tt.expectedVMName, vmName)
 			}
