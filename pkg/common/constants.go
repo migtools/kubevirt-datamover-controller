@@ -51,6 +51,13 @@ const (
 	DataMoverKubeVirt = "kubevirt"
 )
 
+// SnapshotType constants for DataUpload
+const (
+	// SnapshotTypeCSI is the snapshot type for CSI-based backups.
+	// The kubevirt datamover uses CSI snapshots as the underlying mechanism.
+	SnapshotTypeCSI = "CSI"
+)
+
 // DataUpload Phase Transitions (for documentation):
 //
 // The kubevirt-datamover-controller handles the following phase transitions:

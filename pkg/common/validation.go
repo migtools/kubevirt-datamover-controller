@@ -116,3 +116,37 @@ func ValidateVMForBackup(vm *kubevirtcorev1.VirtualMachine) error {
 
 	return nil
 }
+
+// GetVolumesForVm returns a list of PVC names associated with the VirtualMachine.
+// It extracts PVC names from:
+// - PersistentVolumeClaim volume sources
+// - DataVolume volume sources (which create PVCs with the same name)
+// - MemoryDump volume sources
+func GetVolumesForVm(vm *kubevirtcorev1.VirtualMachine) []string {
+	var pvcNames []string
+
+	if vm == nil {
+		return pvcNames
+	}
+
+	if vm.Spec.Template == nil || vm.Spec.Template.Spec.Volumes == nil {
+		return pvcNames
+	}
+
+	for _, volume := range vm.Spec.Template.Spec.Volumes {
+		// Check for PersistentVolumeClaim source
+		if volume.PersistentVolumeClaim != nil {
+			pvcNames = append(pvcNames, volume.PersistentVolumeClaim.ClaimName)
+		}
+		// Check for DataVolume source (which creates a PVC with the same name)
+		if volume.DataVolume != nil {
+			pvcNames = append(pvcNames, volume.DataVolume.Name)
+		}
+		// Check for memory dump volume
+		if volume.MemoryDump != nil {
+			pvcNames = append(pvcNames, volume.MemoryDump.ClaimName)
+		}
+	}
+
+	return pvcNames
+}

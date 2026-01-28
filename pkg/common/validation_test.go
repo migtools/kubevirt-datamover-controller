@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	velerov2alpha1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
 )
@@ -420,6 +421,284 @@ func TestValidateVMForBackup(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
+		})
+	}
+}
+
+func TestGetVolumesForVm(t *testing.T) {
+	tests := []struct {
+		name     string
+		vm       *kubevirtcorev1.VirtualMachine
+		expected []string
+	}{
+		{
+			name:     "nil VM",
+			vm:       nil,
+			expected: []string{},
+		},
+		{
+			name: "VM with nil Template",
+			vm: &kubevirtcorev1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-vm",
+					Namespace: "default",
+				},
+				Spec: kubevirtcorev1.VirtualMachineSpec{
+					Template: nil,
+				},
+			},
+			expected: []string{},
+		},
+		{
+			name: "VM with nil Volumes",
+			vm: &kubevirtcorev1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-vm",
+					Namespace: "default",
+				},
+				Spec: kubevirtcorev1.VirtualMachineSpec{
+					Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+						Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+							Volumes: nil,
+						},
+					},
+				},
+			},
+			expected: []string{},
+		},
+		{
+			name: "VM with empty Volumes",
+			vm: &kubevirtcorev1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-vm",
+					Namespace: "default",
+				},
+				Spec: kubevirtcorev1.VirtualMachineSpec{
+					Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+						Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+							Volumes: []kubevirtcorev1.Volume{},
+						},
+					},
+				},
+			},
+			expected: []string{},
+		},
+		{
+			name: "VM with PVC volume",
+			vm: &kubevirtcorev1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-vm",
+					Namespace: "default",
+				},
+				Spec: kubevirtcorev1.VirtualMachineSpec{
+					Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+						Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+							Volumes: []kubevirtcorev1.Volume{
+								{
+									Name: "disk0",
+									VolumeSource: kubevirtcorev1.VolumeSource{
+										PersistentVolumeClaim: &kubevirtcorev1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+												ClaimName: "pvc-1",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []string{"pvc-1"},
+		},
+		{
+			name: "VM with DataVolume",
+			vm: &kubevirtcorev1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-vm",
+					Namespace: "default",
+				},
+				Spec: kubevirtcorev1.VirtualMachineSpec{
+					Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+						Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+							Volumes: []kubevirtcorev1.Volume{
+								{
+									Name: "disk0",
+									VolumeSource: kubevirtcorev1.VolumeSource{
+										DataVolume: &kubevirtcorev1.DataVolumeSource{
+											Name: "dv-1",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []string{"dv-1"},
+		},
+		{
+			name: "VM with MemoryDump volume",
+			vm: &kubevirtcorev1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-vm",
+					Namespace: "default",
+				},
+				Spec: kubevirtcorev1.VirtualMachineSpec{
+					Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+						Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+							Volumes: []kubevirtcorev1.Volume{
+								{
+									Name: "memory-dump",
+									VolumeSource: kubevirtcorev1.VolumeSource{
+										MemoryDump: &kubevirtcorev1.MemoryDumpVolumeSource{
+											PersistentVolumeClaimVolumeSource: kubevirtcorev1.PersistentVolumeClaimVolumeSource{
+												PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+													ClaimName: "memory-dump-pvc",
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []string{"memory-dump-pvc"},
+		},
+		{
+			name: "VM with multiple volumes",
+			vm: &kubevirtcorev1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-vm",
+					Namespace: "default",
+				},
+				Spec: kubevirtcorev1.VirtualMachineSpec{
+					Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+						Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+							Volumes: []kubevirtcorev1.Volume{
+								{
+									Name: "disk0",
+									VolumeSource: kubevirtcorev1.VolumeSource{
+										PersistentVolumeClaim: &kubevirtcorev1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+												ClaimName: "pvc-1",
+											},
+										},
+									},
+								},
+								{
+									Name: "disk1",
+									VolumeSource: kubevirtcorev1.VolumeSource{
+										DataVolume: &kubevirtcorev1.DataVolumeSource{
+											Name: "dv-1",
+										},
+									},
+								},
+								{
+									Name: "disk2",
+									VolumeSource: kubevirtcorev1.VolumeSource{
+										PersistentVolumeClaim: &kubevirtcorev1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+												ClaimName: "pvc-2",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []string{"pvc-1", "dv-1", "pvc-2"},
+		},
+		{
+			name: "VM with non-PVC volumes only",
+			vm: &kubevirtcorev1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-vm",
+					Namespace: "default",
+				},
+				Spec: kubevirtcorev1.VirtualMachineSpec{
+					Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+						Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+							Volumes: []kubevirtcorev1.Volume{
+								{
+									Name: "cloudinit",
+									VolumeSource: kubevirtcorev1.VolumeSource{
+										CloudInitNoCloud: &kubevirtcorev1.CloudInitNoCloudSource{
+											UserData: "test",
+										},
+									},
+								},
+								{
+									Name: "containerDisk",
+									VolumeSource: kubevirtcorev1.VolumeSource{
+										ContainerDisk: &kubevirtcorev1.ContainerDiskSource{
+											Image: "test-image",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []string{},
+		},
+		{
+			name: "VM with mixed PVC and non-PVC volumes",
+			vm: &kubevirtcorev1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-vm",
+					Namespace: "default",
+				},
+				Spec: kubevirtcorev1.VirtualMachineSpec{
+					Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+						Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+							Volumes: []kubevirtcorev1.Volume{
+								{
+									Name: "disk0",
+									VolumeSource: kubevirtcorev1.VolumeSource{
+										PersistentVolumeClaim: &kubevirtcorev1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+												ClaimName: "pvc-1",
+											},
+										},
+									},
+								},
+								{
+									Name: "cloudinit",
+									VolumeSource: kubevirtcorev1.VolumeSource{
+										CloudInitNoCloud: &kubevirtcorev1.CloudInitNoCloudSource{
+											UserData: "test",
+										},
+									},
+								},
+								{
+									Name: "disk1",
+									VolumeSource: kubevirtcorev1.VolumeSource{
+										DataVolume: &kubevirtcorev1.DataVolumeSource{
+											Name: "dv-1",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []string{"pvc-1", "dv-1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := GetVolumesForVm(tt.vm)
+
+			// Use ElementsMatch to handle nil vs empty slice and ordering differences
+			assert.ElementsMatch(t, tt.expected, result)
 		})
 	}
 }
