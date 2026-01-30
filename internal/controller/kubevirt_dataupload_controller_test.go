@@ -214,24 +214,9 @@ func TestReconcile(t *testing.T) {
 			expectedPhase:   velerov2alpha1.DataUploadPhaseCanceled,
 			expectError:     false,
 		},
-		{
-			name: "prepared phase transitions to inprogress",
-			dataUpload: &velerov2alpha1.DataUpload{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-du",
-					Namespace: "openshift-adp",
-				},
-				Spec: velerov2alpha1.DataUploadSpec{
-					DataMover: common.DataMoverKubeVirt,
-				},
-				Status: velerov2alpha1.DataUploadStatus{
-					Phase: velerov2alpha1.DataUploadPhasePrepared,
-				},
-			},
-			expectedRequeue: true,
-			expectedPhase:   velerov2alpha1.DataUploadPhaseInProgress,
-			expectError:     false,
-		},
+		// Note: "prepared phase transitions to inprogress" test moved to TestHandlePrepared
+		// because it requires additional fixtures (PVC, VM annotations) that the table-driven
+		// test doesn't easily support
 	}
 
 	for _, tt := range tests {
@@ -730,17 +715,266 @@ func strPtr(s string) *string {
 	return &s
 }
 
-func TestHandleInProgress(t *testing.T) {
+func TestHandlePrepared(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmNamespace := "test-ns"
+	duName := "test-du"
 
 	du := &velerov2alpha1.DataUpload{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-du",
-			Namespace: "openshift-adp",
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      "test-vm",
+				common.AnnotationVMNamespace: vmNamespace,
+			},
 		},
 		Spec: velerov2alpha1.DataUploadSpec{
-			DataMover: common.DataMoverKubeVirt,
+			DataMover:       common.DataMoverKubeVirt,
+			SourceNamespace: vmNamespace,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhasePrepared,
+		},
+	}
+
+	// Create temporary PVC (required for handlePrepared)
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("10Gi"),
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pvc).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	result, err := r.handlePrepared(context.Background(), logr.Discard(), du)
+
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	// Should requeue after creating pod
+	if result.RequeueAfter == 0 {
+		t.Errorf("expected requeue, got no requeue")
+	}
+
+	// Verify phase transitioned to InProgress
+	var updatedDU velerov2alpha1.DataUpload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      duName,
+		Namespace: vmNamespace,
+	}, &updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseInProgress {
+		t.Errorf("expected phase=InProgress, got phase=%s", updatedDU.Status.Phase)
+	}
+
+	// Verify pod was created
+	var pod corev1.Pod
+	podName := common.DatamoverPodPrefix + duName
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      podName,
+		Namespace: vmNamespace,
+	}, &pod); err != nil {
+		t.Fatalf("failed to get datamover pod: %v", err)
+	}
+
+	// Verify pod has correct labels
+	if pod.Labels[common.LabelDataUploadName] != duName {
+		t.Errorf("expected pod label %s=%s, got %s", common.LabelDataUploadName, duName, pod.Labels[common.LabelDataUploadName])
+	}
+	if pod.Labels[common.LabelDatamoverPod] != common.LabelDatamoverPodValue {
+		t.Errorf("expected pod label %s=%s, got %s", common.LabelDatamoverPod, common.LabelDatamoverPodValue, pod.Labels[common.LabelDatamoverPod])
+	}
+}
+
+func TestHandleInProgress(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmNamespace := "test-ns"
+	duName := "test-du"
+
+	tests := []struct {
+		name          string
+		podPhase      corev1.PodPhase
+		expectedPhase velerov2alpha1.DataUploadPhase
+		expectRequeue bool
+	}{
+		{
+			name:          "pod running requeues",
+			podPhase:      corev1.PodRunning,
+			expectedPhase: velerov2alpha1.DataUploadPhaseInProgress,
+			expectRequeue: true,
+		},
+		{
+			name:          "pod pending requeues",
+			podPhase:      corev1.PodPending,
+			expectedPhase: velerov2alpha1.DataUploadPhaseInProgress,
+			expectRequeue: true,
+		},
+		{
+			name:          "pod succeeded transitions to completed",
+			podPhase:      corev1.PodSucceeded,
+			expectedPhase: velerov2alpha1.DataUploadPhaseCompleted,
+			expectRequeue: false,
+		},
+		{
+			name:          "pod failed transitions to failed",
+			podPhase:      corev1.PodFailed,
+			expectedPhase: velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			du := &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      duName,
+					Namespace: vmNamespace,
+					UID:       types.UID("test-uid"),
+					Annotations: map[string]string{
+						common.AnnotationVMName:      "test-vm",
+						common.AnnotationVMNamespace: vmNamespace,
+					},
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					DataMover:       common.DataMoverKubeVirt,
+					SourceNamespace: vmNamespace,
+				},
+				Status: velerov2alpha1.DataUploadStatus{
+					Phase: velerov2alpha1.DataUploadPhaseInProgress,
+				},
+			}
+
+			// Create datamover pod with specified phase
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      common.DatamoverPodPrefix + duName,
+					Namespace: vmNamespace,
+					Labels: map[string]string{
+						common.LabelDataUploadName: duName,
+						common.LabelDatamoverPod:   common.LabelDatamoverPodValue,
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  common.DatamoverContainerName,
+							Image: "busybox:latest",
+						},
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: tt.podPhase,
+				},
+			}
+
+			// Create temp PVC for cleanup testing
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "kubevirt-backup-" + duName,
+					Namespace: vmNamespace,
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("10Gi"),
+						},
+					},
+				},
+			}
+
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(du, pod, pvc).
+				Build()
+
+			r := &KubeVirtDataUploadReconciler{
+				Client:        fakeClient,
+				Scheme:        scheme,
+				Log:           logr.Discard(),
+				OADPNamespace: vmNamespace,
+			}
+
+			result, err := r.handleInProgress(context.Background(), logr.Discard(), du)
+
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+
+			if tt.expectRequeue && result.RequeueAfter == 0 {
+				t.Errorf("expected requeue, got no requeue")
+			}
+			if !tt.expectRequeue && result.RequeueAfter > 0 {
+				t.Errorf("expected no requeue, got RequeueAfter=%v", result.RequeueAfter)
+			}
+
+			// Verify phase
+			var updatedDU velerov2alpha1.DataUpload
+			if err := fakeClient.Get(context.Background(), types.NamespacedName{
+				Name:      duName,
+				Namespace: vmNamespace,
+			}, &updatedDU); err != nil {
+				t.Fatalf("failed to get updated DataUpload: %v", err)
+			}
+
+			if updatedDU.Status.Phase != tt.expectedPhase {
+				t.Errorf("expected phase=%s, got phase=%s", tt.expectedPhase, updatedDU.Status.Phase)
+			}
+		})
+	}
+}
+
+func TestHandleInProgress_NoPod(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmNamespace := "test-ns"
+	duName := "test-du"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      "test-vm",
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:       common.DataMoverKubeVirt,
+			SourceNamespace: vmNamespace,
 		},
 		Status: velerov2alpha1.DataUploadStatus{
 			Phase: velerov2alpha1.DataUploadPhaseInProgress,
@@ -756,7 +990,7 @@ func TestHandleInProgress(t *testing.T) {
 		Client:        fakeClient,
 		Scheme:        scheme,
 		Log:           logr.Discard(),
-		OADPNamespace: "openshift-adp",
+		OADPNamespace: vmNamespace,
 	}
 
 	result, err := r.handleInProgress(context.Background(), logr.Discard(), du)
@@ -764,10 +998,23 @@ func TestHandleInProgress(t *testing.T) {
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	// handleInProgress is a placeholder for Phase 3
-	// Currently returns empty result (no requeue)
+
+	// Should not requeue when pod not found (transitions to Failed)
 	if result.RequeueAfter > 0 {
-		t.Errorf("expected no requeue from handleInProgress (not yet implemented), got RequeueAfter=%v", result.RequeueAfter)
+		t.Errorf("expected no requeue when pod not found, got RequeueAfter=%v", result.RequeueAfter)
+	}
+
+	// Verify phase transitioned to Failed
+	var updatedDU velerov2alpha1.DataUpload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      duName,
+		Namespace: vmNamespace,
+	}, &updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseFailed {
+		t.Errorf("expected phase=Failed when pod not found, got phase=%s", updatedDU.Status.Phase)
 	}
 }
 

@@ -87,3 +87,24 @@ const (
 //
 //   InProgress -> Canceling -> Canceled:
 //     - Cancellation support (handles user-initiated cancel requests)
+
+// Datamover Pod constants
+const (
+	// DatamoverPodPrefix is the prefix for datamover pod names
+	DatamoverPodPrefix = "kubevirt-datamover-"
+
+	// LabelDatamoverPod is the label key to identify datamover pods
+	LabelDatamoverPod = "kubevirt-datamover.io/datamover-pod"
+
+	// LabelDatamoverPodValue is the label value for datamover pods
+	LabelDatamoverPodValue = "true"
+
+	// DatamoverContainerName is the name of the datamover container
+	DatamoverContainerName = "datamover"
+
+	// DatamoverPVCMountPath is the mount path for the temporary PVC in the datamover pod
+	DatamoverPVCMountPath = "/backup"
+
+	// DatamoverBSLSecretMountPath is the mount path for BSL credentials
+	DatamoverBSLSecretMountPath = "/credentials"
+)

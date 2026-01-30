@@ -76,6 +76,9 @@ type KubeVirtDataUploadReconciler struct {
 // +kubebuilder:rbac:groups=backup.kubevirt.io,resources=virtualmachinebackuptrackers/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile handles DataUpload resources where Spec.DataMover is "kubevirt"
 func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -266,12 +269,46 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload) (ctrl.Result, error) {
 	logger.Info("Handling Prepared phase DataUpload")
 
-	// TODO Phase 3: Launch datamover pod
-	// - Create pod with temp PVC mount and BSL credentials
-	// - Pod uploads qcow2 files to object storage
+	// Extract VM reference to get the namespace
+	vmRef, err := common.GetVMReference(du)
+	if err != nil {
+		logger.Error(err, "Failed to get VM reference")
+		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Missing VM reference: %v", err)); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Get the temp PVC name
+	tempPVCName := fmt.Sprintf("kubevirt-backup-%s", du.Name)
+
+	// Verify temp PVC exists
+	tempPVC := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, types.NamespacedName{Name: tempPVCName, Namespace: vmRef.Namespace}, tempPVC); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Error(err, "Temporary PVC not found, cannot launch datamover pod")
+			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, "Temporary PVC not found"); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("failed to get temporary PVC: %w", err)
+	}
+
+	// Create or get the datamover pod
+	pod, created, err := r.ensureDatamoverPod(ctx, logger, du, tempPVCName, vmRef.Namespace)
+	if err != nil {
+		logger.Error(err, "Failed to ensure datamover pod")
+		return ctrl.Result{}, err
+	}
+
+	if created {
+		logger.Info("Created datamover pod", "pod", pod.Name)
+	}
 
 	// Transition to InProgress
-	if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseInProgress, "Datamover pod launched"); err != nil {
+	if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseInProgress,
+		fmt.Sprintf("Datamover pod %s launched", pod.Name)); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -283,18 +320,87 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload) (ctrl.Result, error) {
 	logger.Info("Handling InProgress phase DataUpload")
 
-	// TODO Phase 3: Monitor datamover pod
-	// - Check pod status
-	// - On success: update index.json, create manifests, transition to Completed
-	// - On failure: transition to Failed
+	// Extract VM reference to get the namespace
+	vmRef, err := common.GetVMReference(du)
+	if err != nil {
+		logger.Error(err, "Failed to get VM reference")
+		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Missing VM reference: %v", err)); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
 
-	// TODO Phase 5: Cleanup
-	// - Delete temporary PVC
-	// - Optionally delete VMB
+	// Get the datamover pod
+	podName := common.DatamoverPodPrefix + du.Name
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: vmRef.Namespace}, pod); err != nil {
+		if errors.IsNotFound(err) {
+			// Pod doesn't exist - this shouldn't happen normally
+			logger.Error(err, "Datamover pod not found")
+			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, "Datamover pod not found"); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("failed to get datamover pod: %w", err)
+	}
 
-	logger.Info("Datamover pod monitoring not yet implemented")
+	// Check pod phase
+	switch pod.Status.Phase {
+	case corev1.PodSucceeded:
+		logger.Info("Datamover pod completed successfully", "pod", podName)
 
-	return ctrl.Result{}, nil
+		// TODO Phase 3: Extract results from pod
+		// - Read any output/logs from the pod
+		// - Update index.json in BSL with checkpoint information
+		// - Create manifests in BSL
+
+		// Perform cleanup
+		if err := r.cleanupResources(ctx, logger, du, vmRef.Namespace); err != nil {
+			logger.Error(err, "Failed to cleanup resources, but marking as completed")
+			// Don't fail the DataUpload if cleanup fails - the backup data is safe
+		}
+
+		// Transition to Completed
+		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseCompleted, "Backup completed successfully"); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+
+	case corev1.PodFailed:
+		logger.Error(nil, "Datamover pod failed", "pod", podName)
+
+		// Extract failure reason from pod status
+		failureMessage := "Datamover pod failed"
+		for _, containerStatus := range pod.Status.ContainerStatuses {
+			if containerStatus.Name == common.DatamoverContainerName && containerStatus.State.Terminated != nil {
+				failureMessage = fmt.Sprintf("Datamover pod failed: %s (exit code %d)",
+					containerStatus.State.Terminated.Reason,
+					containerStatus.State.Terminated.ExitCode)
+				break
+			}
+		}
+
+		// Perform cleanup on failure
+		if err := r.cleanupResources(ctx, logger, du, vmRef.Namespace); err != nil {
+			logger.Error(err, "Failed to cleanup resources after pod failure")
+		}
+
+		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, failureMessage); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+
+	case corev1.PodPending, corev1.PodRunning:
+		// Pod still in progress - requeue
+		logger.Info("Datamover pod still running", "pod", podName, "phase", pod.Status.Phase)
+		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+
+	default:
+		// Unknown phase
+		logger.Info("Datamover pod in unknown phase", "pod", podName, "phase", pod.Status.Phase)
+		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+	}
 }
 
 // handleCanceling processes DataUploads in Canceling phase
@@ -302,11 +408,29 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 func (r *KubeVirtDataUploadReconciler) handleCanceling(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload) (ctrl.Result, error) {
 	logger.Info("Handling Canceling phase DataUpload")
 
-	// TODO: Cancel in-progress operations
-	// - Delete datamover pod if running
-	// - Delete VMB if exists
-	// - Delete temporary PVC
-	// - Transition to Canceled
+	// Get VM reference to determine namespace for cleanup
+	vmRef, err := common.GetVMReference(du)
+	if err != nil {
+		// If we can't get VM reference, still try to cancel
+		logger.Error(err, "Failed to get VM reference for cleanup, proceeding with cancel")
+	} else {
+		// Perform cleanup
+		if err := r.cleanupResources(ctx, logger, du, vmRef.Namespace); err != nil {
+			logger.Error(err, "Failed to cleanup resources during cancellation")
+			// Continue with cancellation even if cleanup fails
+		}
+
+		// Also delete VMB during cancellation
+		vmbName := fmt.Sprintf("vmb-%s", du.Name)
+		vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+		if err := r.Get(ctx, types.NamespacedName{Name: vmbName, Namespace: vmRef.Namespace}, vmb); err == nil {
+			if err := r.Delete(ctx, vmb); err != nil && !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to delete VMB during cancellation", "vmb", vmbName)
+			} else {
+				logger.Info("Deleted VMB during cancellation", "vmb", vmbName)
+			}
+		}
+	}
 
 	if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseCanceled, "DataUpload canceled"); err != nil {
 		return ctrl.Result{}, err
@@ -513,4 +637,196 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logge
 
 	logger.Info("Created VirtualMachineBackup", "vmb", vmbName, "namespace", namespace, "tracker", vmbt.Name)
 	return vmb, true, nil
+}
+
+// ensureDatamoverPod creates or retrieves the datamover pod for this DataUpload
+// Returns the pod, whether it was created (vs already existed), and any error
+func (r *KubeVirtDataUploadReconciler) ensureDatamoverPod(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, pvcName, namespace string) (*corev1.Pod, bool, error) {
+	podName := common.DatamoverPodPrefix + du.Name
+
+	// Check if pod already exists
+	existingPod := &corev1.Pod{}
+	err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: namespace}, existingPod)
+	if err == nil {
+		logger.V(1).Info("Datamover pod already exists", "pod", podName)
+		return existingPod, false, nil
+	}
+
+	if !errors.IsNotFound(err) {
+		return nil, false, fmt.Errorf("failed to check for existing pod: %w", err)
+	}
+
+	// TODO Phase 3: Get BSL credentials
+	// - Fetch BackupStorageLocation from du.Spec.BackupStorageLocation
+	// - Get the associated Secret with cloud credentials
+	// - Mount the secret in the pod
+
+	// TODO Phase 3: Use actual datamover image
+	// - Replace busybox with the actual datamover image
+	// - The datamover image should:
+	//   1. Read qcow2 files from /backup
+	//   2. Upload them to BSL using credentials from /credentials
+	//   3. Update checkpoint index.json in BSL
+
+	// TODO Phase 4: Pass checkpoint information
+	// - Query BSL for existing checkpoints before this
+	// - Pass checkpoint info via environment variables or configmap
+
+	// Create datamover pod
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				common.LabelDataUploadName: du.Name,
+				common.LabelDataUploadUID:  string(du.UID),
+				common.LabelDatamoverPod:   common.LabelDatamoverPodValue,
+			},
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers: []corev1.Container{
+				{
+					Name: common.DatamoverContainerName,
+					// TODO Phase 3: Replace with actual datamover image
+					// Image: "quay.io/konveyor/kubevirt-datamover:latest",
+					Image: "busybox:latest",
+					// TODO Phase 3: Replace with actual datamover command
+					// Command: []string{"/datamover"},
+					// Args: []string{
+					//     "--backup-path", common.DatamoverPVCMountPath,
+					//     "--bsl-credentials", common.DatamoverBSLSecretMountPath,
+					//     "--target-path", fmt.Sprintf("/kubevirt-datamover/checkpoints/%s/%s", vmNamespace, vmName),
+					// },
+					Command: []string{"sh", "-c"},
+					Args: []string{
+						// Placeholder: simulate backup work and success
+						// TODO Phase 3: Replace with actual datamover logic
+						"echo 'Starting datamover (placeholder)' && " +
+							"echo 'Listing backup files:' && " +
+							"ls -la " + common.DatamoverPVCMountPath + " && " +
+							"echo 'Simulating backup upload...' && " +
+							"sleep 5 && " +
+							"echo 'Backup upload completed successfully'",
+					},
+					VolumeMounts: []corev1.VolumeMount{
+						{
+							Name:      "backup-data",
+							MountPath: common.DatamoverPVCMountPath,
+							ReadOnly:  true,
+						},
+						// TODO Phase 3: Add BSL credentials volume mount
+						// {
+						//     Name:      "bsl-credentials",
+						//     MountPath: common.DatamoverBSLSecretMountPath,
+						//     ReadOnly:  true,
+						// },
+					},
+					// TODO Phase 3: Add environment variables for BSL configuration
+					// Env: []corev1.EnvVar{
+					//     {Name: "BSL_BUCKET", Value: bslBucket},
+					//     {Name: "BSL_REGION", Value: bslRegion},
+					//     {Name: "BSL_PREFIX", Value: bslPrefix},
+					//     {Name: "VM_NAMESPACE", Value: vmNamespace},
+					//     {Name: "VM_NAME", Value: vmName},
+					//     {Name: "DATAUPLOAD_NAME", Value: du.Name},
+					// },
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("100m"),
+							corev1.ResourceMemory: resource.MustParse("128Mi"),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("1"),
+							corev1.ResourceMemory: resource.MustParse("512Mi"),
+						},
+					},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "backup-data",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvcName,
+							ReadOnly:  true,
+						},
+					},
+				},
+				// TODO Phase 3: Add BSL credentials secret volume
+				// {
+				//     Name: "bsl-credentials",
+				//     VolumeSource: corev1.VolumeSource{
+				//         Secret: &corev1.SecretVolumeSource{
+				//             SecretName: bslSecretName,
+				//         },
+				//     },
+				// },
+			},
+		},
+	}
+
+	// Set owner reference so pod is cleaned up when DataUpload is deleted
+	if err := controllerutil.SetOwnerReference(du, pod, r.Scheme); err != nil {
+		return nil, false, fmt.Errorf("failed to set owner reference on pod: %w", err)
+	}
+
+	if err := r.Create(ctx, pod); err != nil {
+		return nil, false, fmt.Errorf("failed to create datamover pod: %w", err)
+	}
+
+	logger.Info("Created datamover pod", "pod", podName, "namespace", namespace)
+	return pod, true, nil
+}
+
+// cleanupResources cleans up resources created for the DataUpload
+func (r *KubeVirtDataUploadReconciler) cleanupResources(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, namespace string) error {
+	var errs []error
+
+	// Delete datamover pod (if it exists)
+	podName := common.DatamoverPodPrefix + du.Name
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: namespace}, pod); err == nil {
+		if err := r.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
+			logger.Error(err, "Failed to delete datamover pod", "pod", podName)
+			errs = append(errs, fmt.Errorf("failed to delete pod %s: %w", podName, err))
+		} else {
+			logger.Info("Deleted datamover pod", "pod", podName)
+		}
+	}
+
+	// Delete temporary PVC
+	// Note: The PVC has an owner reference to the DataUpload, so it will be
+	// garbage collected automatically. However, we delete it explicitly to
+	// free up storage sooner.
+	pvcName := fmt.Sprintf("kubevirt-backup-%s", du.Name)
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, pvc); err == nil {
+		if err := r.Delete(ctx, pvc); err != nil && !errors.IsNotFound(err) {
+			logger.Error(err, "Failed to delete temporary PVC", "pvc", pvcName)
+			errs = append(errs, fmt.Errorf("failed to delete PVC %s: %w", pvcName, err))
+		} else {
+			logger.Info("Deleted temporary PVC", "pvc", pvcName)
+		}
+	}
+
+	// TODO Phase 5: Optionally delete VMB (configurable)
+	// VMB deletion is optional because:
+	// 1. Owner reference will handle cleanup when DataUpload is deleted
+	// 2. Keeping VMB allows debugging and auditing
+	// 3. VMB may be needed for restore operations
+	//
+	// vmbName := fmt.Sprintf("vmb-%s", du.Name)
+	// vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+	// if err := r.Get(ctx, types.NamespacedName{Name: vmbName, Namespace: namespace}, vmb); err == nil {
+	//     if err := r.Delete(ctx, vmb); err != nil && !errors.IsNotFound(err) {
+	//         logger.Error(err, "Failed to delete VMB", "vmb", vmbName)
+	//         errs = append(errs, fmt.Errorf("failed to delete VMB %s: %w", vmbName, err))
+	//     }
+	// }
+
+	if len(errs) > 0 {
+		return fmt.Errorf("cleanup errors: %v", errs)
+	}
+	return nil
 }
