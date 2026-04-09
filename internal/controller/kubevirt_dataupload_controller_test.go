@@ -824,6 +824,28 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 			requireQuiesce: true,
 		},
 		{
+			// Defensive: if a future KubeVirt release routes the freeze-
+			// failure warning through the Message field instead of Reason,
+			// we should still detect it when require-quiesce is set.
+			name: "VMB Done True with freeze-failure in Message transitions to Failed when require-quiesce is set",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionFalse,
+					Reason: "Completed VirtualMachineBackup",
+				},
+				{
+					Type:    kubevirtbackupv1alpha1.ConditionDone,
+					Status:  corev1.ConditionTrue,
+					Reason:  "CompletedWithWarning",
+					Message: "Completed VirtualMachineBackup, warning: Failed freezing guest filesystem: virError(Code=86, Domain=10, Message='Guest agent is not responding')",
+				},
+			},
+			expectedPhase:  velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue:  false,
+			requireQuiesce: true,
+		},
+		{
 			// Clean completion + require-quiesce: no freeze failure in the
 			// Reason, so the DataUpload should still succeed.
 			name: "VMB Done True clean transitions to Prepared when require-quiesce is set",
