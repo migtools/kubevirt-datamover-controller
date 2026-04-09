@@ -612,13 +612,22 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 		// was not met even though KubeVirt reports the backup as Done=True.
 		// In that case we fail the DataUpload rather than silently completing
 		// as crash-consistent. Fixes #14.
-		if du.Annotations[common.AnnotationRequireQuiesce] == "true" &&
-			strings.Contains(doneCond.Reason, common.FreezeFailureMarker) {
+		// In KubeVirt v1.8.0 the freeze-failure text is propagated via
+		// virt-launcher's BackupMsg → resolveCompletion → SyncInfo.reason →
+		// newDoneCondition, which only populates the condition's Reason field.
+		// We also check Message defensively in case a future KubeVirt release
+		// routes the same warning through the Message field instead.
+		requireQuiesce := du.Annotations[common.AnnotationRequireQuiesce] == "true"
+		freezeFailed := strings.Contains(doneCond.Reason, common.FreezeFailureMarker) ||
+			strings.Contains(doneCond.Message, common.FreezeFailureMarker)
+		if requireQuiesce && freezeFailed {
 			logger.Error(nil, "VirtualMachineBackup completed but guest filesystem freeze failed and require-quiesce was requested",
 				"vmb", vmb.Name,
-				"reason", doneCond.Reason)
+				"reason", doneCond.Reason,
+				"message", doneCond.Message)
+			detail := strings.TrimSpace(doneCond.Reason + " " + doneCond.Message)
 			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
-				fmt.Sprintf("Application-consistent backup failed: %s", doneCond.Reason)); err != nil {
+				fmt.Sprintf("Application-consistent backup failed: %s", detail)); err != nil {
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{}, nil
