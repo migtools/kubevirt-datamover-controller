@@ -641,11 +641,12 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 
 	tests := []struct {
-		name          string
-		vmbConditions []kubevirtbackupv1alpha1.Condition
-		expectedPhase velerov2alpha1.DataUploadPhase
-		expectRequeue bool
-		skipVMBT      bool // when true, do not create the VMBT (simulates deleted VMBT)
+		name           string
+		vmbConditions  []kubevirtbackupv1alpha1.Condition
+		expectedPhase  velerov2alpha1.DataUploadPhase
+		expectRequeue  bool
+		skipVMBT       bool // when true, do not create the VMBT (simulates deleted VMBT)
+		requireQuiesce bool // when true, set the require-quiesce annotation on the DU
 	}{
 		{
 			name: "VMB Done True transitions to Prepared",
@@ -781,6 +782,67 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 			expectedPhase: velerov2alpha1.DataUploadPhaseAccepted, // unchanged
 			expectRequeue: true,
 		},
+		{
+			// Freeze failure warning is harmless by default — KubeVirt completed
+			// the backup as crash-consistent and the user did not require
+			// application-consistency. See #14.
+			name: "VMB Done True with freeze-failure warning transitions to Prepared when require-quiesce is not set",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionFalse,
+					Reason: "Completed VirtualMachineBackup, warning: Failed freezing guest filesystem: virError(Code=86, Domain=10, Message='Guest agent is not responding: QEMU guest agent is not connected')",
+				},
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionDone,
+					Status: corev1.ConditionTrue,
+					Reason: "Completed VirtualMachineBackup, warning: Failed freezing guest filesystem: virError(Code=86, Domain=10, Message='Guest agent is not responding: QEMU guest agent is not connected')",
+				},
+			},
+			expectedPhase: velerov2alpha1.DataUploadPhasePrepared,
+			expectRequeue: true,
+		},
+		{
+			// User explicitly required application-consistency but the freeze
+			// failed — the backup is crash-consistent, which violates the
+			// user's request, so the DataUpload must fail. See #14.
+			name: "VMB Done True with freeze-failure transitions to Failed when require-quiesce is set",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionFalse,
+					Reason: "Completed VirtualMachineBackup, warning: Failed freezing guest filesystem: virError(Code=86, Domain=10, Message='Guest agent is not responding: QEMU guest agent is not connected')",
+				},
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionDone,
+					Status: corev1.ConditionTrue,
+					Reason: "Completed VirtualMachineBackup, warning: Failed freezing guest filesystem: virError(Code=86, Domain=10, Message='Guest agent is not responding: QEMU guest agent is not connected')",
+				},
+			},
+			expectedPhase:  velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue:  false,
+			requireQuiesce: true,
+		},
+		{
+			// Clean completion + require-quiesce: no freeze failure in the
+			// Reason, so the DataUpload should still succeed.
+			name: "VMB Done True clean transitions to Prepared when require-quiesce is set",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionFalse,
+					Reason: "Completed VirtualMachineBackup",
+				},
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionDone,
+					Status: corev1.ConditionTrue,
+					Reason: "Completed VirtualMachineBackup",
+				},
+			},
+			expectedPhase:  velerov2alpha1.DataUploadPhasePrepared,
+			expectRequeue:  true,
+			requireQuiesce: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -790,15 +852,19 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 			duName := "test-du"
 
 			// Create DataUpload
+			duAnnotations := map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			}
+			if tt.requireQuiesce {
+				duAnnotations[common.AnnotationRequireQuiesce] = "true"
+			}
 			du := &velerov2alpha1.DataUpload{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      duName,
-					Namespace: vmNamespace,
-					UID:       types.UID("test-uid"),
-					Annotations: map[string]string{
-						common.AnnotationVMName:      vmName,
-						common.AnnotationVMNamespace: vmNamespace,
-					},
+					Name:        duName,
+					Namespace:   vmNamespace,
+					UID:         types.UID("test-uid"),
+					Annotations: duAnnotations,
 				},
 				Spec: velerov2alpha1.DataUploadSpec{
 					DataMover:       common.DataMoverKubeVirt,
@@ -5003,6 +5069,189 @@ func TestHandleAccepted_NoForceFullBackupByDefault(t *testing.T) {
 
 	if createdVMB.Spec.ForceFullBackup {
 		t.Error("expected VMB.Spec.ForceFullBackup to be false when annotation is not set")
+	}
+}
+
+// TestHandleAccepted_SkipQuiesceByDefault verifies that, absent the
+// require-quiesce annotation, the VMB is created with SkipQuiesce=true.
+// This matches the crash-consistent default agreed in #14 and avoids noisy
+// freeze warnings on VMs without the QEMU guest agent installed.
+func TestHandleAccepted_SkipQuiesceByDefault(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-default-quiesce"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:       vmName,
+				common.AnnotationVMNamespace:  vmNamespace,
+				common.AnnotationBSLValidated: "true",
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:       common.DataMoverKubeVirt,
+			SourceNamespace: vmNamespace,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pvc, vmbt).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	if _, err := r.handleAccepted(context.Background(), logr.Discard(), du); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
+	if err := fakeClient.List(context.Background(), vmbList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		t.Fatalf("failed to list created VMBs: %v", err)
+	}
+	if len(vmbList.Items) != 1 {
+		t.Fatalf("expected 1 VMB, got %d", len(vmbList.Items))
+	}
+	if !vmbList.Items[0].Spec.SkipQuiesce {
+		t.Error("expected VMB.Spec.SkipQuiesce=true by default (crash-consistent)")
+	}
+}
+
+// TestHandleAccepted_RequireQuiesceAnnotation verifies that when the user
+// sets the require-quiesce annotation on the DataUpload, the VMB is created
+// with SkipQuiesce=false so KubeVirt attempts the guest-agent-mediated
+// filesystem freeze for an application-consistent backup.
+func TestHandleAccepted_RequireQuiesceAnnotation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-require-quiesce"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:         vmName,
+				common.AnnotationVMNamespace:    vmNamespace,
+				common.AnnotationBSLValidated:   "true",
+				common.AnnotationRequireQuiesce: "true",
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:       common.DataMoverKubeVirt,
+			SourceNamespace: vmNamespace,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pvc, vmbt).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	if _, err := r.handleAccepted(context.Background(), logr.Discard(), du); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
+	if err := fakeClient.List(context.Background(), vmbList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		t.Fatalf("failed to list created VMBs: %v", err)
+	}
+	if len(vmbList.Items) != 1 {
+		t.Fatalf("expected 1 VMB, got %d", len(vmbList.Items))
+	}
+	if vmbList.Items[0].Spec.SkipQuiesce {
+		t.Error("expected VMB.Spec.SkipQuiesce=false when require-quiesce annotation is set")
 	}
 }
 

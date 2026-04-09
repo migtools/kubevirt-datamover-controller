@@ -47,6 +47,42 @@ const (
 	// AnnotationDataUploadName is the annotation key for the DataUpload name.
 	// Used on VMB, VMBT, and PVC resources to track ownership.
 	AnnotationDataUploadName = "velero.io/dataupload-name"
+
+	// AnnotationRequireQuiesce, when set to "true" on a DataUpload, requires
+	// that the VirtualMachineBackup produce an application-consistent
+	// (quiesced) backup via the QEMU guest agent. If the guest filesystem
+	// freeze fails, the DataUpload is marked Failed rather than silently
+	// completing as crash-consistent.
+	//
+	// Default behavior (annotation absent or not "true") is crash-consistent:
+	// the VMB is created with SkipQuiesce=true so KubeVirt does not attempt
+	// the guest-agent-dependent freeze, avoiding noisy warnings on VMs
+	// without the guest agent installed. This matches user expectations for
+	// mixed fleets and fixes #14.
+	//
+	// This annotation is sourced from the Velero Backup CR
+	// (same key, oadp.openshift.io/require-quiesce) and propagated onto
+	// the DataUpload by the OADP plugin.
+	AnnotationRequireQuiesce = "oadp.openshift.io/require-quiesce"
+)
+
+// VirtualMachineBackup status matching
+const (
+	// FreezeFailureMarker is the substring used to detect a failed guest
+	// filesystem freeze in a VirtualMachineBackup's Done condition Reason.
+	//
+	// When the QEMU guest agent is not connected but SkipQuiesce=false was
+	// requested, KubeVirt completes the backup (Done=True) but reports a
+	// warning in the Done condition's Reason of the form:
+	//
+	//     Completed VirtualMachineBackup, warning: Failed freezing guest
+	//     filesystem: virError(...Guest agent is not responding...)
+	//
+	// The backup data is still written, but it is crash-consistent rather
+	// than application-consistent. The controller checks for this marker
+	// only when AnnotationRequireQuiesce is set; otherwise the warning is
+	// harmless and the DataUpload is allowed to proceed.
+	FreezeFailureMarker = "Failed freezing guest filesystem"
 )
 
 // Label keys for resources created by the controller.
