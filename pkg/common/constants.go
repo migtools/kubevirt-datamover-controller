@@ -48,22 +48,22 @@ const (
 	// Used on VMB, VMBT, and PVC resources to track ownership.
 	AnnotationDataUploadName = "velero.io/dataupload-name"
 
-	// AnnotationRequireQuiesce, when set to "true" on a DataUpload, requires
-	// that the VirtualMachineBackup produce an application-consistent
-	// (quiesced) backup via the QEMU guest agent. If the guest filesystem
-	// freeze fails, the DataUpload is marked Failed rather than silently
-	// completing as crash-consistent.
+	// AnnotationSkipQuiesce, when set to "true" on a DataUpload, skips
+	// guest filesystem quiescing and produces a crash-consistent backup
+	// instead of an application-consistent one. This is useful for VMs
+	// without the QEMU guest agent installed or where quiescing is known
+	// to fail.
 	//
-	// Default behavior (annotation absent or not "true") is crash-consistent:
-	// the VMB is created with SkipQuiesce=true so KubeVirt does not attempt
-	// the guest-agent-dependent freeze, avoiding noisy warnings on VMs
-	// without the guest agent installed. This matches user expectations for
-	// mixed fleets and fixes #14.
+	// Default behavior (annotation absent or not "true") is
+	// application-consistent: the VMB is created with SkipQuiesce=false
+	// so KubeVirt attempts the guest-agent-dependent freeze. This follows
+	// KubeVirt's own default for VirtualMachineBackup.Spec.SkipQuiesce.
+	// If the freeze fails, the DataUpload is marked Failed so the user
+	// gets a clear signal rather than a silent fallback to crash-consistent.
 	//
-	// This annotation is sourced from the Velero Backup CR
-	// (same key, oadp.openshift.io/require-quiesce) and propagated onto
-	// the DataUpload by the OADP plugin.
-	AnnotationRequireQuiesce = "oadp.openshift.io/require-quiesce"
+	// This annotation is propagated onto the DataUpload by the OADP plugin
+	// from the Velero Backup CR or the source VM. Fixes #14.
+	AnnotationSkipQuiesce = "kubevirt-datamover.io/skip-quiesce"
 )
 
 // VirtualMachineBackup status matching
@@ -71,17 +71,17 @@ const (
 	// FreezeFailureMarker is the substring used to detect a failed guest
 	// filesystem freeze in a VirtualMachineBackup's Done condition Reason.
 	//
-	// When the QEMU guest agent is not connected but SkipQuiesce=false was
-	// requested, KubeVirt completes the backup (Done=True) but reports a
-	// warning in the Done condition's Reason of the form:
+	// When the QEMU guest agent is not connected and SkipQuiesce=false
+	// (the default), KubeVirt completes the backup (Done=True) but reports
+	// a warning in the Done condition's Reason of the form:
 	//
 	//     Completed VirtualMachineBackup, warning: Failed freezing guest
 	//     filesystem: virError(...Guest agent is not responding...)
 	//
 	// The backup data is still written, but it is crash-consistent rather
-	// than application-consistent. The controller checks for this marker
-	// only when AnnotationRequireQuiesce is set; otherwise the warning is
-	// harmless and the DataUpload is allowed to proceed.
+	// than application-consistent. The controller fails the DataUpload
+	// when this marker is detected (unless AnnotationSkipQuiesce is set,
+	// in which case quiescing was not requested and the warning is moot).
 	FreezeFailureMarker = "Failed freezing guest filesystem"
 )
 

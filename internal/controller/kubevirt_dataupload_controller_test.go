@@ -646,7 +646,7 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 		expectedPhase  velerov2alpha1.DataUploadPhase
 		expectRequeue  bool
 		skipVMBT       bool // when true, do not create the VMBT (simulates deleted VMBT)
-		requireQuiesce bool // when true, set the require-quiesce annotation on the DU
+		skipQuiesce bool // when true, set the skip-quiesce annotation on the DU
 	}{
 		{
 			name: "VMB Done True transitions to Prepared",
@@ -783,10 +783,29 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 			expectRequeue: true,
 		},
 		{
-			// Freeze failure warning is harmless by default — KubeVirt completed
-			// the backup as crash-consistent and the user did not require
-			// application-consistency. See #14.
-			name: "VMB Done True with freeze-failure warning transitions to Prepared when require-quiesce is not set",
+			// By default quiescing is enabled, so a freeze failure means the
+			// application-consistent guarantee was not met → DataUpload must
+			// fail. See #14.
+			name: "VMB Done True with freeze-failure transitions to Failed by default",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionFalse,
+					Reason: "Completed VirtualMachineBackup, warning: Failed freezing guest filesystem: virError(Code=86, Domain=10, Message='Guest agent is not responding: QEMU guest agent is not connected')",
+				},
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionDone,
+					Status: corev1.ConditionTrue,
+					Reason: "Completed VirtualMachineBackup, warning: Failed freezing guest filesystem: virError(Code=86, Domain=10, Message='Guest agent is not responding: QEMU guest agent is not connected')",
+				},
+			},
+			expectedPhase: velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue: false,
+		},
+		{
+			// When skip-quiesce is set, the user opted out of quiescing, so
+			// freeze warnings are harmless — allow the backup to proceed.
+			name: "VMB Done True with freeze-failure transitions to Prepared when skip-quiesce is set",
 			vmbConditions: []kubevirtbackupv1alpha1.Condition{
 				{
 					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
@@ -801,33 +820,13 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 			},
 			expectedPhase: velerov2alpha1.DataUploadPhasePrepared,
 			expectRequeue: true,
-		},
-		{
-			// User explicitly required application-consistency but the freeze
-			// failed — the backup is crash-consistent, which violates the
-			// user's request, so the DataUpload must fail. See #14.
-			name: "VMB Done True with freeze-failure transitions to Failed when require-quiesce is set",
-			vmbConditions: []kubevirtbackupv1alpha1.Condition{
-				{
-					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
-					Status: corev1.ConditionFalse,
-					Reason: "Completed VirtualMachineBackup, warning: Failed freezing guest filesystem: virError(Code=86, Domain=10, Message='Guest agent is not responding: QEMU guest agent is not connected')",
-				},
-				{
-					Type:   kubevirtbackupv1alpha1.ConditionDone,
-					Status: corev1.ConditionTrue,
-					Reason: "Completed VirtualMachineBackup, warning: Failed freezing guest filesystem: virError(Code=86, Domain=10, Message='Guest agent is not responding: QEMU guest agent is not connected')",
-				},
-			},
-			expectedPhase:  velerov2alpha1.DataUploadPhaseFailed,
-			expectRequeue:  false,
-			requireQuiesce: true,
+			skipQuiesce:   true,
 		},
 		{
 			// Defensive: if a future KubeVirt release routes the freeze-
 			// failure warning through the Message field instead of Reason,
-			// we should still detect it when require-quiesce is set.
-			name: "VMB Done True with freeze-failure in Message transitions to Failed when require-quiesce is set",
+			// we should still detect it (default quiesce ON → fail).
+			name: "VMB Done True with freeze-failure in Message transitions to Failed by default",
 			vmbConditions: []kubevirtbackupv1alpha1.Condition{
 				{
 					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
@@ -841,14 +840,13 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 					Message: "Completed VirtualMachineBackup, warning: Failed freezing guest filesystem: virError(Code=86, Domain=10, Message='Guest agent is not responding')",
 				},
 			},
-			expectedPhase:  velerov2alpha1.DataUploadPhaseFailed,
-			expectRequeue:  false,
-			requireQuiesce: true,
+			expectedPhase: velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue: false,
 		},
 		{
-			// Clean completion + require-quiesce: no freeze failure in the
-			// Reason, so the DataUpload should still succeed.
-			name: "VMB Done True clean transitions to Prepared when require-quiesce is set",
+			// Clean completion (no freeze failure) should succeed regardless
+			// of quiesce setting.
+			name: "VMB Done True clean transitions to Prepared",
 			vmbConditions: []kubevirtbackupv1alpha1.Condition{
 				{
 					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
@@ -861,9 +859,8 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 					Reason: "Completed VirtualMachineBackup",
 				},
 			},
-			expectedPhase:  velerov2alpha1.DataUploadPhasePrepared,
-			expectRequeue:  true,
-			requireQuiesce: true,
+			expectedPhase: velerov2alpha1.DataUploadPhasePrepared,
+			expectRequeue: true,
 		},
 	}
 
@@ -878,8 +875,8 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 				common.AnnotationVMName:      vmName,
 				common.AnnotationVMNamespace: vmNamespace,
 			}
-			if tt.requireQuiesce {
-				duAnnotations[common.AnnotationRequireQuiesce] = "true"
+			if tt.skipQuiesce {
+				duAnnotations[common.AnnotationSkipQuiesce] = "true"
 			}
 			du := &velerov2alpha1.DataUpload{
 				ObjectMeta: metav1.ObjectMeta{
@@ -5094,11 +5091,11 @@ func TestHandleAccepted_NoForceFullBackupByDefault(t *testing.T) {
 	}
 }
 
-// TestHandleAccepted_SkipQuiesceByDefault verifies that, absent the
-// require-quiesce annotation, the VMB is created with SkipQuiesce=true.
-// This matches the crash-consistent default agreed in #14 and avoids noisy
-// freeze warnings on VMs without the QEMU guest agent installed.
-func TestHandleAccepted_SkipQuiesceByDefault(t *testing.T) {
+// TestHandleAccepted_QuiesceByDefault verifies that, absent the
+// skip-quiesce annotation, the VMB is created with SkipQuiesce=false.
+// This matches KubeVirt's own default for VirtualMachineBackup.Spec.SkipQuiesce
+// and produces application-consistent backups. See #14.
+func TestHandleAccepted_QuiesceByDefault(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
 	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
@@ -5180,16 +5177,16 @@ func TestHandleAccepted_SkipQuiesceByDefault(t *testing.T) {
 	if len(vmbList.Items) != 1 {
 		t.Fatalf("expected 1 VMB, got %d", len(vmbList.Items))
 	}
-	if !vmbList.Items[0].Spec.SkipQuiesce {
-		t.Error("expected VMB.Spec.SkipQuiesce=true by default (crash-consistent)")
+	if vmbList.Items[0].Spec.SkipQuiesce {
+		t.Error("expected VMB.Spec.SkipQuiesce=false by default (application-consistent)")
 	}
 }
 
-// TestHandleAccepted_RequireQuiesceAnnotation verifies that when the user
-// sets the require-quiesce annotation on the DataUpload, the VMB is created
-// with SkipQuiesce=false so KubeVirt attempts the guest-agent-mediated
-// filesystem freeze for an application-consistent backup.
-func TestHandleAccepted_RequireQuiesceAnnotation(t *testing.T) {
+// TestHandleAccepted_SkipQuiesceAnnotation verifies that when the user
+// sets the skip-quiesce annotation on the DataUpload, the VMB is created
+// with SkipQuiesce=true so KubeVirt skips the guest-agent-mediated
+// filesystem freeze and produces a crash-consistent backup.
+func TestHandleAccepted_SkipQuiesceAnnotation(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
 	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
@@ -5197,7 +5194,7 @@ func TestHandleAccepted_RequireQuiesceAnnotation(t *testing.T) {
 
 	vmName := "test-vm"
 	vmNamespace := "test-ns"
-	duName := "test-du-require-quiesce"
+	duName := "test-du-skip-quiesce"
 
 	du := &velerov2alpha1.DataUpload{
 		ObjectMeta: metav1.ObjectMeta{
@@ -5205,10 +5202,10 @@ func TestHandleAccepted_RequireQuiesceAnnotation(t *testing.T) {
 			Namespace: vmNamespace,
 			UID:       types.UID("test-uid"),
 			Annotations: map[string]string{
-				common.AnnotationVMName:         vmName,
-				common.AnnotationVMNamespace:    vmNamespace,
-				common.AnnotationBSLValidated:   "true",
-				common.AnnotationRequireQuiesce: "true",
+				common.AnnotationVMName:       vmName,
+				common.AnnotationVMNamespace:  vmNamespace,
+				common.AnnotationBSLValidated: "true",
+				common.AnnotationSkipQuiesce:  "true",
 			},
 		},
 		Spec: velerov2alpha1.DataUploadSpec{
@@ -5272,8 +5269,8 @@ func TestHandleAccepted_RequireQuiesceAnnotation(t *testing.T) {
 	if len(vmbList.Items) != 1 {
 		t.Fatalf("expected 1 VMB, got %d", len(vmbList.Items))
 	}
-	if vmbList.Items[0].Spec.SkipQuiesce {
-		t.Error("expected VMB.Spec.SkipQuiesce=false when require-quiesce annotation is set")
+	if !vmbList.Items[0].Spec.SkipQuiesce {
+		t.Error("expected VMB.Spec.SkipQuiesce=true when skip-quiesce annotation is set")
 	}
 }
 

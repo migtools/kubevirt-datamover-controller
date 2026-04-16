@@ -339,13 +339,12 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		}
 
 		// Step 4: Create VirtualMachineBackup
-		// Default is crash-consistent (SkipQuiesce=true). Users opt in to
-		// application-consistent (quiesced) backup via AnnotationRequireQuiesce
-		// on the Velero Backup / DataUpload. See pkg/common constants for
-		// rationale. Fixes #14.
-		requireQuiesce := du.Annotations[common.AnnotationRequireQuiesce] == "true"
+		// Default is application-consistent (SkipQuiesce=false), matching
+		// KubeVirt's own default. Users opt out via AnnotationSkipQuiesce
+		// on the DataUpload (propagated from Backup or VM). Fixes #14.
+		skipQuiesce := du.Annotations[common.AnnotationSkipQuiesce] == "true"
 		var created bool
-		vmb, created, err = r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmRef.Namespace, forceFullBackup, requireQuiesce)
+		vmb, created, err = r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmRef.Namespace, forceFullBackup, skipQuiesce)
 		if err != nil {
 			// Check if the error is due to another VMB being in progress for the same VM.
 			// KubeVirt's admission webhook only allows one active (non-terminal) VMB per VM.
@@ -420,21 +419,22 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 	}
 
 	if doneCond != nil && doneCond.Status == corev1.ConditionTrue {
-		// When the user required an application-consistent (quiesced) backup
-		// via AnnotationRequireQuiesce, a freeze failure means the guarantee
-		// was not met even though KubeVirt reports the backup as Done=True.
-		// In that case we fail the DataUpload rather than silently completing
-		// as crash-consistent. Fixes #14.
+		// By default quiescing is enabled (SkipQuiesce=false), so a freeze
+		// failure means the application-consistent guarantee was not met even
+		// though KubeVirt reports the backup as Done=True. Fail the DataUpload
+		// so the user gets a clear signal. When AnnotationSkipQuiesce is set,
+		// the user explicitly opted out of quiescing, so freeze warnings are
+		// moot and we allow the backup to proceed. Fixes #14.
+		//
 		// In KubeVirt v1.8.0 the freeze-failure text is propagated via
 		// virt-launcher's BackupMsg → resolveCompletion → SyncInfo.reason →
 		// newDoneCondition, which only populates the condition's Reason field.
-		// We also check Message defensively in case a future KubeVirt release
-		// routes the same warning through the Message field instead.
-		requireQuiesce := du.Annotations[common.AnnotationRequireQuiesce] == "true"
+		// We also check Message defensively for forward compatibility.
+		skipQuiesce := du.Annotations[common.AnnotationSkipQuiesce] == "true"
 		freezeFailed := strings.Contains(doneCond.Reason, common.FreezeFailureMarker) ||
 			strings.Contains(doneCond.Message, common.FreezeFailureMarker)
-		if requireQuiesce && freezeFailed {
-			logger.Error(nil, "VirtualMachineBackup completed but guest filesystem freeze failed and require-quiesce was requested",
+		if !skipQuiesce && freezeFailed {
+			logger.Error(nil, "VirtualMachineBackup completed but guest filesystem freeze failed",
 				"vmb", vmb.Name,
 				"reason", doneCond.Reason,
 				"message", doneCond.Message)
@@ -1222,14 +1222,15 @@ func (r *KubeVirtDataUploadReconciler) lookupLatestVMBTFromBSL(ctx context.Conte
 // Returns the VMB, whether it was created (vs already existed), and any error.
 // When forceFullBackup is true, the VMB is created with ForceFullBackup=true in its spec,
 // which tells KubeVirt to perform a full backup regardless of any existing checkpoint.
-// When requireQuiesce is true, the VMB is created with SkipQuiesce=false (the KubeVirt
-// default) so the QEMU guest agent is asked to freeze the filesystem, producing an
-// application-consistent backup. Otherwise SkipQuiesce=true is set and the backup is
-// crash-consistent. See common.AnnotationRequireQuiesce for rationale.
+// When skipQuiesce is true, the VMB is created with SkipQuiesce=true so the
+// QEMU guest agent is not asked to freeze the filesystem, producing a
+// crash-consistent backup. Otherwise SkipQuiesce=false (the KubeVirt default)
+// is used, requesting an application-consistent backup.
+// See common.AnnotationSkipQuiesce for rationale.
 // Note: We don't set an owner reference because VMB is in VM namespace
 // while DataUpload is in OADP namespace (cross-namespace owner refs not allowed).
 // VMB and VMBT are archived to S3 and deleted by the datamover pod after upload.
-func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmbt *kubevirtbackupv1alpha1.VirtualMachineBackupTracker, pvcName, namespace string, forceFullBackup, requireQuiesce bool) (*kubevirtbackupv1alpha1.VirtualMachineBackup, bool, error) {
+func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmbt *kubevirtbackupv1alpha1.VirtualMachineBackupTracker, pvcName, namespace string, forceFullBackup, skipQuiesce bool) (*kubevirtbackupv1alpha1.VirtualMachineBackup, bool, error) {
 	// Find existing VMB for this DataUpload
 	existingVMB, err := r.findVMBForDataUpload(ctx, du, namespace)
 	if err != nil {
@@ -1261,7 +1262,7 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logge
 			},
 			PvcName:         &pvcName,
 			ForceFullBackup: forceFullBackup,
-			SkipQuiesce:     !requireQuiesce,
+			SkipQuiesce:     skipQuiesce,
 		},
 	}
 
@@ -1271,8 +1272,8 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logge
 	if forceFullBackup {
 		logger.Info("Creating VirtualMachineBackup with ForceFullBackup=true", "vmb", vmb.Name)
 	}
-	if requireQuiesce {
-		logger.Info("Creating VirtualMachineBackup with SkipQuiesce=false (application-consistent)", "vmb", vmb.Name)
+	if skipQuiesce {
+		logger.Info("Creating VirtualMachineBackup with SkipQuiesce=true (crash-consistent)", "vmb", vmb.Name)
 	}
 
 	logger.Info("Created VirtualMachineBackup", "generateName", vmb.GenerateName, "namespace", namespace, "tracker", vmbt.Name)
