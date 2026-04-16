@@ -641,12 +641,12 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 
 	tests := []struct {
-		name           string
-		vmbConditions  []kubevirtbackupv1alpha1.Condition
-		expectedPhase  velerov2alpha1.DataUploadPhase
-		expectRequeue  bool
-		skipVMBT       bool // when true, do not create the VMBT (simulates deleted VMBT)
-		skipQuiesce bool // when true, set the skip-quiesce annotation on the DU
+		name          string
+		vmbConditions []kubevirtbackupv1alpha1.Condition
+		expectedPhase velerov2alpha1.DataUploadPhase
+		expectRequeue bool
+		skipVMBT      bool // when true, do not create the VMBT (simulates deleted VMBT)
+		skipQuiesce   bool // when true, set the skip-quiesce annotation on the DU
 	}{
 		{
 			name: "VMB Done True transitions to Prepared",
