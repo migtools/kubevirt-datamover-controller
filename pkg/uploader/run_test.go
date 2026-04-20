@@ -555,7 +555,20 @@ func TestUpdateVMIndex(t *testing.T) {
 				tt.setupStore(store)
 			}
 
-			err := updateVMIndex(context.Background(), store, tt.config, tt.files, tt.archived, logr.Discard())
+			var objects []client.Object
+			for _, f := range tt.files {
+				if f.DiskName != "" {
+					objects = append(objects, &corev1.PersistentVolumeClaim{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      f.DiskName,
+							Namespace: tt.config.VMNamespace,
+						},
+					})
+				}
+			}
+			fakeClient := fake.NewClientBuilder().WithObjects(objects...).Build()
+
+			err := updateVMIndex(context.Background(), store, fakeClient, tt.config, tt.files, tt.archived, logr.Discard())
 
 			if tt.expectError {
 				if err == nil {
@@ -1097,7 +1110,20 @@ func TestUpdateVMIndex_ReferencedByPropagation(t *testing.T) {
 				}
 			}
 
-			err := updateVMIndex(context.Background(), store, tt.config, tt.files, tt.archived, logr.Discard())
+			var objects []client.Object
+			for _, f := range tt.files {
+				if f.DiskName != "" {
+					objects = append(objects, &corev1.PersistentVolumeClaim{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      f.DiskName,
+							Namespace: tt.config.VMNamespace,
+						},
+					})
+				}
+			}
+			fakeClient := fake.NewClientBuilder().WithObjects(objects...).Build()
+
+			err := updateVMIndex(context.Background(), store, fakeClient, tt.config, tt.files, tt.archived, logr.Discard())
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -1188,7 +1214,20 @@ func TestUpdateVMIndex_DedupIncrementalPreservesParent(t *testing.T) {
 			ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-2-disk1.qcow2"},
 	}
 
-	err := updateVMIndex(context.Background(), store, config, files, &archivedPaths{}, logr.Discard())
+	var objects []client.Object
+	for _, f := range files {
+		if f.DiskName != "" {
+			objects = append(objects, &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      f.DiskName,
+					Namespace: config.VMNamespace,
+				},
+			})
+		}
+	}
+	fakeClient := fake.NewClientBuilder().WithObjects(objects...).Build()
+
+	err := updateVMIndex(context.Background(), store, fakeClient, config, files, &archivedPaths{}, logr.Discard())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
