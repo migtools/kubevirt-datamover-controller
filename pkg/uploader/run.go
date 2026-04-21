@@ -38,6 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
+	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	restcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 )
@@ -311,15 +312,23 @@ func updateVMIndex(
 	}
 
 	// Create new checkpoint entry
+	vm := &kubevirtcorev1.VirtualMachine{}
+	_ = k8sClient.Get(ctx, types.NamespacedName{Name: config.VMName, Namespace: config.VMNamespace}, vm)
+	volumeMap := common.GetVolumeMapForVm(vm)
+
 	// Extract PVC/disk names from uploaded files
 	var pvcNames []string
 	var pvcSizes []resource.Quantity
 	for _, f := range files {
 		if f.DiskName != "" {
-			pvcNames = append(pvcNames, f.DiskName)
+			pvcName := volumeMap[f.DiskName]
+			if pvcName == "" {
+				pvcName = f.DiskName
+			}
+			pvcNames = append(pvcNames, pvcName)
 			pvc := &corev1.PersistentVolumeClaim{}
-			if err := k8sClient.Get(ctx, types.NamespacedName{Name: f.DiskName, Namespace: config.VMNamespace}, pvc); err != nil {
-				return fmt.Errorf("failed to get PVC %s: %w", f.DiskName, err)
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: config.VMNamespace}, pvc); err != nil {
+				return fmt.Errorf("failed to get PVC %s: %w", pvcName, err)
 			}
 			if storage, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; ok {
 				pvcSizes = append(pvcSizes, storage)
