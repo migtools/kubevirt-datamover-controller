@@ -117,6 +117,19 @@ func ValidateVMForBackup(vm *kubevirtcorev1.VirtualMachine) error {
 	return nil
 }
 
+func getPvcNameFromVolume(volume kubevirtcorev1.Volume) string {
+	if volume.PersistentVolumeClaim != nil {
+		return volume.PersistentVolumeClaim.ClaimName
+	}
+	if volume.DataVolume != nil {
+		return volume.DataVolume.Name
+	}
+	if volume.MemoryDump != nil {
+		return volume.MemoryDump.ClaimName
+	}
+	return ""
+}
+
 // GetVolumesForVm returns a list of PVC names associated with the VirtualMachine.
 // It extracts PVC names from:
 // - PersistentVolumeClaim volume sources
@@ -125,28 +138,36 @@ func ValidateVMForBackup(vm *kubevirtcorev1.VirtualMachine) error {
 func GetVolumesForVm(vm *kubevirtcorev1.VirtualMachine) []string {
 	var pvcNames []string
 
-	if vm == nil {
-		return pvcNames
-	}
-
-	if vm.Spec.Template == nil || vm.Spec.Template.Spec.Volumes == nil {
+	if vm == nil || vm.Spec.Template == nil || vm.Spec.Template.Spec.Volumes == nil {
 		return pvcNames
 	}
 
 	for _, volume := range vm.Spec.Template.Spec.Volumes {
-		// Check for PersistentVolumeClaim source
-		if volume.PersistentVolumeClaim != nil {
-			pvcNames = append(pvcNames, volume.PersistentVolumeClaim.ClaimName)
-		}
-		// Check for DataVolume source (which creates a PVC with the same name)
-		if volume.DataVolume != nil {
-			pvcNames = append(pvcNames, volume.DataVolume.Name)
-		}
-		// Check for memory dump volume
-		if volume.MemoryDump != nil {
-			pvcNames = append(pvcNames, volume.MemoryDump.ClaimName)
+		if pvcName := getPvcNameFromVolume(volume); pvcName != "" {
+			pvcNames = append(pvcNames, pvcName)
 		}
 	}
 
 	return pvcNames
+}
+
+// GetVolumeMapForVm returns a map of volume names to PVC names associated with the VirtualMachine.
+// It extracts PVC names from:
+// - PersistentVolumeClaim volume sources
+// - DataVolume volume sources (which create PVCs with the same name)
+// - MemoryDump volume sources
+func GetVolumeMapForVm(vm *kubevirtcorev1.VirtualMachine) map[string]string {
+	volumeMap := make(map[string]string)
+
+	if vm == nil || vm.Spec.Template == nil || vm.Spec.Template.Spec.Volumes == nil {
+		return volumeMap
+	}
+
+	for _, volume := range vm.Spec.Template.Spec.Volumes {
+		if pvcName := getPvcNameFromVolume(volume); pvcName != "" {
+			volumeMap[volume.Name] = pvcName
+		}
+	}
+
+	return volumeMap
 }
