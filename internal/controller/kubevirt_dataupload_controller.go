@@ -835,9 +835,12 @@ func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Con
 
 }
 
-// cleanupVMBackupResources deletes VMB and VMBT CRs in the VM namespace.
+// cleanupVMBackupResources deletes VMB CRs in the VM namespace.
 // Used during cancellation when the datamover pod won't run its own cleanup.
-func (r *KubeVirtDataUploadReconciler) cleanupVMBackupResources(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmName, vmNamespace string) {
+// The VMBT is intentionally preserved so KubeVirt can use it during VM lifecycle
+// events (restarts, migrations) to redefine libvirt checkpoints.
+// See https://github.com/migtools/kubevirt-datamover-controller/issues/32.
+func (r *KubeVirtDataUploadReconciler) cleanupVMBackupResources(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmNamespace string) {
 	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
 	if err := r.List(ctx, vmbList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
 		logger.Error(err, "Failed to list VMBs for cleanup")
@@ -848,20 +851,6 @@ func (r *KubeVirtDataUploadReconciler) cleanupVMBackupResources(ctx context.Cont
 				logger.Error(err, "Failed to delete VMB", "vmb", vmb.Name)
 			} else {
 				logger.Info("Deleted VMB", "vmb", vmb.Name, "namespace", vmNamespace)
-			}
-		}
-	}
-
-	vmbtList := &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerList{}
-	if err := r.List(ctx, vmbtList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelVMNameHash: common.HashForLabel(vmName)}); err != nil {
-		logger.Error(err, "Failed to list VMBTs for cleanup")
-	} else {
-		for i := range vmbtList.Items {
-			vmbt := &vmbtList.Items[i]
-			if err := r.Delete(ctx, vmbt); err != nil && !errors.IsNotFound(err) {
-				logger.Error(err, "Failed to delete VMBT", "vmbt", vmbt.Name)
-			} else {
-				logger.Info("Deleted VMBT", "vmbt", vmbt.Name, "namespace", vmNamespace)
 			}
 		}
 	}
@@ -882,7 +871,7 @@ func (r *KubeVirtDataUploadReconciler) handleCanceling(ctx context.Context, logg
 	// When canceling, the datamover pod won't run its cleanup, so we handle it here.
 	vmRef, _ := common.GetVMReference(du)
 	if vmRef != nil {
-		r.cleanupVMBackupResources(ctx, logger, du, vmRef.Name, vmRef.Namespace)
+		r.cleanupVMBackupResources(ctx, logger, du, vmRef.Namespace)
 	}
 
 	if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseCanceled, "DataUpload canceled"); err != nil {
@@ -1011,48 +1000,27 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 	return pvc, nil
 }
 
-// prepareVMBackupTracker creates a VirtualMachineBackupTracker for the VM,
-// restoring the LatestCheckpoint from the archived VMBT in S3 if available.
-// Existing VMBTs are deleted first unless they are still referenced by an active
-// (non-terminal) VMB, to avoid destroying VMBTs used by concurrent DataUploads.
+// prepareVMBackupTracker returns an existing on-cluster VirtualMachineBackupTracker
+// for the VM if one exists, or creates a new one (restoring LatestCheckpoint from
+// S3 if available). The VMBT is left on-cluster between backups so KubeVirt can
+// use it during VM lifecycle events (restarts, migrations) to redefine libvirt
+// checkpoints. See https://github.com/migtools/kubevirt-datamover-controller/issues/32.
 func (r *KubeVirtDataUploadReconciler) prepareVMBackupTracker(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmName, vmNamespace string) (*kubevirtbackupv1alpha1.VirtualMachineBackupTracker, error) {
-	// Delete existing VMBTs for this VM before creating a new one, but only if
-	// they are not still referenced by an active (non-terminal) VMB. This prevents
-	// concurrent DataUploads from destroying each other's VMBTs.
+	// Check for an existing on-cluster VMBT for this VM.
 	existingVMBTList := &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerList{}
 	if err := r.List(ctx, existingVMBTList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelVMNameHash: common.HashForLabel(vmName)}); err != nil {
 		return nil, fmt.Errorf("failed to list existing VMBTs: %w", err)
 	}
 
-	// Pre-fetch all VMBs in the namespace to check references
-	allVMBs := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
-	if err := r.List(ctx, allVMBs, client.InNamespace(vmNamespace)); err != nil {
-		return nil, fmt.Errorf("failed to list VMBs: %w", err)
+	// Reuse the on-cluster VMBT if one exists. KubeVirt needs it to persist
+	// across backups for checkpoint redefinition during VM lifecycle events.
+	if len(existingVMBTList.Items) > 0 {
+		vmbt := &existingVMBTList.Items[0]
+		logger.Info("Reusing existing on-cluster VMBT", "vmbt", vmbt.Name)
+		return vmbt, nil
 	}
 
-	for i := range existingVMBTList.Items {
-		vmbtToDelete := &existingVMBTList.Items[i]
-
-		// Check if any non-terminal VMB still references this VMBT
-		referenced := false
-		for j := range allVMBs.Items {
-			if allVMBs.Items[j].Spec.Source.Name == vmbtToDelete.Name && !isVMBTerminal(&allVMBs.Items[j]) {
-				referenced = true
-				break
-			}
-		}
-		if referenced {
-			logger.Info("Skipping VMBT deletion, still referenced by active VMB",
-				"vmbt", vmbtToDelete.Name)
-			continue
-		}
-
-		logger.Info("Deleting existing VMBT before recreation", "vmbt", vmbtToDelete.Name)
-		if err := r.Delete(ctx, vmbtToDelete); err != nil && !errors.IsNotFound(err) {
-			return nil, fmt.Errorf("failed to delete existing VMBT %s: %w", vmbtToDelete.Name, err)
-		}
-	}
-
+	// No VMBT on-cluster (e.g., first backup or namespace was recreated).
 	// Try to fetch the archived VMBT from S3 to restore LatestCheckpoint.
 	// This is non-fatal: if BSL is unreachable or no VMBT exists yet (first backup),
 	// we create a fresh VMBT without a checkpoint.
