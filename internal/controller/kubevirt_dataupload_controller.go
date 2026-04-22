@@ -1377,7 +1377,7 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 
 	pullPolicy := r.DatamoverImagePullPolicy
 	if pullPolicy == "" {
-		pullPolicy = corev1.PullIfNotPresent
+		pullPolicy = corev1.PullAlways
 	}
 
 	return &DatamoverPodConfig{

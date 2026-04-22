@@ -37,6 +37,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -313,7 +314,9 @@ func updateVMIndex(
 
 	// Create new checkpoint entry
 	vm := &kubevirtcorev1.VirtualMachine{}
-	_ = k8sClient.Get(ctx, types.NamespacedName{Name: config.VMName, Namespace: config.VMNamespace}, vm)
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: config.VMName, Namespace: config.VMNamespace}, vm); err != nil {
+		return fmt.Errorf("failed to get VM %s/%s: %w", config.VMNamespace, config.VMName, err)
+	}
 	volumeMap := common.GetVolumeMapForVm(vm)
 
 	// Extract PVC/disk names from uploaded files
@@ -681,8 +684,14 @@ func cleanupKubeResources(ctx context.Context, k8sClient client.Client, cfg *Upl
 // Extracted as a variable to allow overriding in tests.
 var newKubeClient = func() (client.Client, error) {
 	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
 	if err := kubevirtbackupv1alpha1.AddToScheme(scheme); err != nil {
 		return nil, fmt.Errorf("failed to register KubeVirt backup scheme: %w", err)
+	}
+	if err := kubevirtcorev1.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("failed to register KubeVirt scheme: %w", err)
 	}
 
 	restConfig, err := restcfg.GetConfig()
