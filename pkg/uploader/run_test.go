@@ -29,7 +29,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
+	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -253,6 +255,10 @@ func TestLoadConfigFromEnv(t *testing.T) {
 }
 
 func TestUpdateVMIndex(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = kubevirtcorev1.AddToScheme(scheme)
+
 	tests := []struct {
 		name           string
 		config         *UploaderConfig
@@ -566,7 +572,15 @@ func TestUpdateVMIndex(t *testing.T) {
 					})
 				}
 			}
-			fakeClient := fake.NewClientBuilder().WithObjects(objects...).Build()
+			objects = append(objects, &kubevirtcorev1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-vm",
+					Namespace: "test-ns",
+				},
+			})
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objects...).Build()
 
 			err := updateVMIndex(context.Background(), store, fakeClient, tt.config, tt.files, tt.archived, logr.Discard())
 
@@ -787,6 +801,10 @@ func TestPropagateReferencedBy(t *testing.T) {
 }
 
 func TestUpdateVMIndex_ReferencedByPropagation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = kubevirtcorev1.AddToScheme(scheme)
+
 	tests := []struct {
 		name           string
 		config         *UploaderConfig
@@ -1121,7 +1139,15 @@ func TestUpdateVMIndex_ReferencedByPropagation(t *testing.T) {
 					})
 				}
 			}
-			fakeClient := fake.NewClientBuilder().WithObjects(objects...).Build()
+			objects = append(objects, &kubevirtcorev1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-vm",
+					Namespace: "test-ns",
+				},
+			})
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objects...).Build()
 
 			err := updateVMIndex(context.Background(), store, fakeClient, tt.config, tt.files, tt.archived, logr.Discard())
 			if err != nil {
@@ -1165,6 +1191,9 @@ func assertReferencedBy(t *testing.T, cpID string, got, want []string) {
 // incremental backup re-runs with the same checkpoint ID, the Parent field
 // is preserved from the existing entry (not corrupted to a self-reference).
 func TestUpdateVMIndex_DedupIncrementalPreservesParent(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = kubevirtcorev1.AddToScheme(scheme)
 	store := NewMockObjectStore("test-bucket", "")
 
 	existingIndex := &VMIndex{
@@ -1225,7 +1254,15 @@ func TestUpdateVMIndex_DedupIncrementalPreservesParent(t *testing.T) {
 			})
 		}
 	}
-	fakeClient := fake.NewClientBuilder().WithObjects(objects...).Build()
+	objects = append(objects, &kubevirtcorev1.VirtualMachine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-vm",
+			Namespace: "test-ns",
+		},
+	})
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objects...).Build()
 
 	err := updateVMIndex(context.Background(), store, fakeClient, config, files, &archivedPaths{}, logr.Discard())
 	if err != nil {

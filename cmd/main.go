@@ -109,7 +109,7 @@ func main() {
 		"Maximum number of concurrent reconciles for the KubeVirt DataUpload controller")
 	flag.StringVar(&datamoverImage, "datamover-image", common.DefaultDatamoverImage,
 		"Image to use for datamover pods")
-	flag.StringVar(&datamoverImagePullPolicy, "datamover-image-pull-policy", "IfNotPresent",
+	flag.StringVar(&datamoverImagePullPolicy, "datamover-image-pull-policy", "Always",
 		"Image pull policy for datamover pods (Always, IfNotPresent, Never)")
 	flag.StringVar(&oadpNamespace, "oadp-namespace", "openshift-adp",
 		"Namespace where OADP/Velero resources are located")
