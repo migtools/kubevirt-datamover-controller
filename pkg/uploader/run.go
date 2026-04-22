@@ -314,7 +314,10 @@ func updateVMIndex(
 
 	// Create new checkpoint entry
 	vm := &kubevirtcorev1.VirtualMachine{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: config.VMName, Namespace: config.VMNamespace}, vm); err != nil {
+	if err := k8sClient.Get(ctx, types.NamespacedName{
+		Name:      config.VMName,
+		Namespace: config.VMNamespace,
+	}, vm); err != nil {
 		return fmt.Errorf("failed to get VM %s/%s: %w", config.VMNamespace, config.VMName, err)
 	}
 	volumeMap := common.GetVolumeMapForVm(vm)
