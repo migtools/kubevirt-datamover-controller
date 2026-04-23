@@ -36,6 +36,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+func getTestScheme() *runtime.Scheme {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = kubevirtcorev1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	return scheme
+}
+
 func TestExtractDiskName(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -255,9 +263,7 @@ func TestLoadConfigFromEnv(t *testing.T) {
 }
 
 func TestUpdateVMIndex(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = clientgoscheme.AddToScheme(scheme)
-	_ = kubevirtcorev1.AddToScheme(scheme)
+	scheme := getTestScheme()
 
 	tests := []struct {
 		name           string
@@ -801,9 +807,7 @@ func TestPropagateReferencedBy(t *testing.T) {
 }
 
 func TestUpdateVMIndex_ReferencedByPropagation(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = clientgoscheme.AddToScheme(scheme)
-	_ = kubevirtcorev1.AddToScheme(scheme)
+	scheme := getTestScheme()
 
 	tests := []struct {
 		name           string
@@ -1191,9 +1195,7 @@ func assertReferencedBy(t *testing.T, cpID string, got, want []string) {
 // incremental backup re-runs with the same checkpoint ID, the Parent field
 // is preserved from the existing entry (not corrupted to a self-reference).
 func TestUpdateVMIndex_DedupIncrementalPreservesParent(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = clientgoscheme.AddToScheme(scheme)
-	_ = kubevirtcorev1.AddToScheme(scheme)
+	scheme := getTestScheme()
 	store := NewMockObjectStore("test-bucket", "")
 
 	existingIndex := &VMIndex{
@@ -1428,8 +1430,7 @@ func TestUpdateBackupManifests(t *testing.T) {
 }
 
 func TestArchiveKubeResources(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	scheme := getTestScheme()
 
 	apiGroup := "kubevirt.io"
 	backupAPIGroup := "backup.kubevirt.io"
@@ -1658,8 +1659,7 @@ func TestArchiveKubeResources(t *testing.T) {
 }
 
 func TestCleanupKubeResources(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	scheme := getTestScheme()
 
 	apiGroup := "kubevirt.io"
 	backupAPIGroup := "backup.kubevirt.io"
@@ -1769,8 +1769,7 @@ func TestCleanupKubeResources(t *testing.T) {
 // TestCleanupKubeResources_PreservesVMBT verifies that cleanupKubeResources
 // deletes the VMB but preserves the VMBT on-cluster (issue #32).
 func TestCleanupKubeResources_PreservesVMBT(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	scheme := getTestScheme()
 
 	apiGroup := "kubevirt.io"
 	backupAPIGroup := "backup.kubevirt.io"
