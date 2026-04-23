@@ -47,6 +47,7 @@ func getTestScheme() *runtime.Scheme {
 
 func getTestClientObjects(config *UploaderConfig, files []CheckpointFile) []client.Object {
 	var objects []client.Object
+	var volumes []kubevirtcorev1.Volume
 	for _, f := range files {
 		if f.DiskName != "" {
 			objects = append(objects, &corev1.PersistentVolumeClaim{
@@ -62,12 +63,27 @@ func getTestClientObjects(config *UploaderConfig, files []CheckpointFile) []clie
 					},
 				},
 			})
+			volumes = append(volumes, kubevirtcorev1.Volume{
+				Name: f.DiskName,
+				VolumeSource: kubevirtcorev1.VolumeSource{
+					DataVolume: &kubevirtcorev1.DataVolumeSource{
+						Name: f.DiskName,
+					},
+				},
+			})
 		}
 	}
 	objects = append(objects, &kubevirtcorev1.VirtualMachine{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      config.VMName,
 			Namespace: config.VMNamespace,
+		},
+		Spec: kubevirtcorev1.VirtualMachineSpec{
+			Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+				Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+					Volumes: volumes,
+				},
+			},
 		},
 	})
 	return objects
