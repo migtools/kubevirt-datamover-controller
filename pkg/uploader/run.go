@@ -329,7 +329,8 @@ func updateVMIndex(
 		if f.DiskName != "" {
 			pvcName := volumeMap[f.DiskName]
 			if pvcName == "" {
-				pvcName = f.DiskName
+				// Erroring out if there's a non-PVC volume
+				return fmt.Errorf("no PVC found for %s", f.DiskName)
 			}
 			pvcNames = append(pvcNames, pvcName)
 			pvc := &corev1.PersistentVolumeClaim{}
