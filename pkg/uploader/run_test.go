@@ -44,6 +44,27 @@ func getTestScheme() *runtime.Scheme {
 	return scheme
 }
 
+func getTestClientObjects(config *UploaderConfig, files []CheckpointFile) []client.Object {
+	var objects []client.Object
+	for _, f := range files {
+		if f.DiskName != "" {
+			objects = append(objects, &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      f.DiskName,
+					Namespace: config.VMNamespace,
+				},
+			})
+		}
+	}
+	objects = append(objects, &kubevirtcorev1.VirtualMachine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      config.VMName,
+			Namespace: config.VMNamespace,
+		},
+	})
+	return objects
+}
+
 func TestExtractDiskName(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -567,23 +588,7 @@ func TestUpdateVMIndex(t *testing.T) {
 				tt.setupStore(store)
 			}
 
-			var objects []client.Object
-			for _, f := range tt.files {
-				if f.DiskName != "" {
-					objects = append(objects, &corev1.PersistentVolumeClaim{
-						ObjectMeta: metav1.ObjectMeta{
-							Name:      f.DiskName,
-							Namespace: tt.config.VMNamespace,
-						},
-					})
-				}
-			}
-			objects = append(objects, &kubevirtcorev1.VirtualMachine{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-vm",
-					Namespace: "test-ns",
-				},
-			})
+			objects := getTestClientObjects(tt.config, tt.files)
 			fakeClient := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithObjects(objects...).Build()
@@ -1132,23 +1137,7 @@ func TestUpdateVMIndex_ReferencedByPropagation(t *testing.T) {
 				}
 			}
 
-			var objects []client.Object
-			for _, f := range tt.files {
-				if f.DiskName != "" {
-					objects = append(objects, &corev1.PersistentVolumeClaim{
-						ObjectMeta: metav1.ObjectMeta{
-							Name:      f.DiskName,
-							Namespace: tt.config.VMNamespace,
-						},
-					})
-				}
-			}
-			objects = append(objects, &kubevirtcorev1.VirtualMachine{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-vm",
-					Namespace: "test-ns",
-				},
-			})
+			objects := getTestClientObjects(tt.config, tt.files)
 			fakeClient := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithObjects(objects...).Build()
@@ -1245,23 +1234,7 @@ func TestUpdateVMIndex_DedupIncrementalPreservesParent(t *testing.T) {
 			ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-2-disk1.qcow2"},
 	}
 
-	var objects []client.Object
-	for _, f := range files {
-		if f.DiskName != "" {
-			objects = append(objects, &corev1.PersistentVolumeClaim{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      f.DiskName,
-					Namespace: config.VMNamespace,
-				},
-			})
-		}
-	}
-	objects = append(objects, &kubevirtcorev1.VirtualMachine{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-vm",
-			Namespace: "test-ns",
-		},
-	})
+	objects := getTestClientObjects(config, files)
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(objects...).Build()
