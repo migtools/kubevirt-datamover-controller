@@ -338,6 +338,8 @@ func updateVMIndex(
 			}
 			if storage, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; ok {
 				pvcSizes = append(pvcSizes, storage)
+			} else {
+				return fmt.Errorf("Missing storage request value in PVC %s", pvcName)
 			}
 		}
 	}
