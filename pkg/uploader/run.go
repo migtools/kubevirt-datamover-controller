@@ -635,10 +635,11 @@ func reconstructVMBT(cfg *UploaderConfig) *kubevirtbackupv1alpha1.VirtualMachine
 	}
 }
 
-// cleanupKubeResources deletes VMB and VMBT CRs from the cluster after they have
-// been archived to S3. This is non-fatal — if deletion fails, we log a warning
-// but don't fail the upload. Stale CRs will be cleaned up on the next backup cycle
-// (prepareVMBackupTracker deletes before recreating).
+// cleanupKubeResources deletes VMB CRs from the cluster after they have been
+// archived to S3. The VMBT is intentionally preserved so KubeVirt can use it
+// during VM lifecycle events (restarts, migrations) to redefine libvirt checkpoints.
+// This is non-fatal — if deletion fails, we log a warning but don't fail the upload.
+// See https://github.com/migtools/kubevirt-datamover-controller/issues/32.
 func cleanupKubeResources(ctx context.Context, k8sClient client.Client, cfg *UploaderConfig, logger logr.Logger) {
 	// Delete VMB by constructing a minimal object with just name/namespace.
 	// No need to Get first — Delete with NotFound is a no-op.
@@ -653,21 +654,6 @@ func cleanupKubeResources(ctx context.Context, k8sClient client.Client, cfg *Upl
 			}
 		} else {
 			logger.Info("Deleted VMB from cluster", "vmb", cfg.VMNamespace+"/"+cfg.VMBName)
-		}
-	}
-
-	// Delete VMBT
-	if cfg.VMBTName != "" {
-		vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
-		vmbt.Name = cfg.VMBTName
-		vmbt.Namespace = cfg.VMNamespace
-		if err := k8sClient.Delete(ctx, vmbt); err != nil {
-			if !apierrors.IsNotFound(err) {
-				logger.Info("Failed to delete VMBT from cluster",
-					"vmbt", cfg.VMNamespace+"/"+cfg.VMBTName, "reason", err.Error())
-			}
-		} else {
-			logger.Info("Deleted VMBT from cluster", "vmbt", cfg.VMNamespace+"/"+cfg.VMBTName)
 		}
 	}
 }

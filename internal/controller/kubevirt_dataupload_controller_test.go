@@ -1395,15 +1395,15 @@ func TestHandleAccepted_ProceedsWhenOlderDUCompleted(t *testing.T) {
 	// It will proceed into prepareVMBackupTracker, which will fail because
 	// BSL credentials aren't fully set up in this test. That's fine — we're
 	// testing that the serialization guard does NOT block.
-	// The important assertion is that DU-1's VMBT gets deleted (normal cleanup).
-	deletedVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+	// The important assertion is that DU-1's VMBT is reused (not deleted) per issue #32.
+	reusedVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
 	getErr := fakeClient.Get(context.Background(), types.NamespacedName{
 		Name: vmbt1.Name, Namespace: vmNamespace,
-	}, deletedVMBT)
+	}, reusedVMBT)
 
-	// prepareVMBackupTracker should have deleted DU-1's old VMBT
-	if getErr == nil {
-		t.Error("expected DU-1's VMBT to be deleted by prepareVMBackupTracker, but it still exists")
+	// prepareVMBackupTracker should have reused DU-1's existing VMBT
+	if getErr != nil {
+		t.Errorf("expected DU-1's VMBT to be reused by prepareVMBackupTracker, but it was deleted: %v", getErr)
 	}
 	// We don't care about the error from handleAccepted itself — it may fail
 	// on BSL credential lookup. The point is it got past the serialization guard.
@@ -5513,8 +5513,9 @@ func TestPrepareVMBackupTracker_FromS3(t *testing.T) {
 	}
 }
 
-func TestPrepareVMBackupTracker_DeletesExisting(t *testing.T) {
-	// VMBT already exists in cluster → should be deleted and recreated
+func TestPrepareVMBackupTracker_ReusesExisting(t *testing.T) {
+	// VMBT already exists in cluster → should be reused (not deleted and recreated).
+	// Issue #32: VMBT must persist on-cluster for KubeVirt lifecycle events.
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
 	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
@@ -5522,7 +5523,7 @@ func TestPrepareVMBackupTracker_DeletesExisting(t *testing.T) {
 
 	vmName := "test-vm"
 	vmNamespace := "test-ns"
-	duName := "test-du-delete"
+	duName := "test-du-reuse"
 
 	du := &velerov2alpha1.DataUpload{
 		ObjectMeta: metav1.ObjectMeta{
@@ -5538,13 +5539,12 @@ func TestPrepareVMBackupTracker_DeletesExisting(t *testing.T) {
 		},
 	}
 
-	// Pre-create an existing VMBT with stale label
+	// Pre-create an existing VMBT
 	existingVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "vmbt-" + vmName + "-old",
 			Namespace: vmNamespace,
 			Labels: map[string]string{
-				"stale-label":          "old-value",
 				common.LabelVMNameHash: common.HashForLabel(vmName),
 			},
 		},
@@ -5574,22 +5574,27 @@ func TestPrepareVMBackupTracker_DeletesExisting(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Verify new VMBT was created (should have our label, not the stale one)
-	if vmbt.Labels["stale-label"] == "old-value" {
-		t.Error("expected old VMBT to be deleted and new one created, but old labels persist")
-	}
-	if vmbt.Annotations[common.AnnotationDataUploadName] != duName {
-		t.Errorf("expected new VMBT to have DataUpload annotation %q, got %q",
-			duName, vmbt.Annotations[common.AnnotationDataUploadName])
+	// Verify the existing VMBT was reused (same name)
+	if vmbt.Name != existingVMBT.Name {
+		t.Errorf("expected existing VMBT %q to be reused, got %q", existingVMBT.Name, vmbt.Name)
 	}
 	if vmbt.Labels[common.LabelVMNameHash] != common.HashForLabel(vmName) {
-		t.Errorf("expected new VMBT to have label %s, got %q",
+		t.Errorf("expected VMBT to have label %s, got %q",
 			common.LabelVMNameHash, vmbt.Labels[common.LabelVMNameHash])
+	}
+
+	// Verify the VMBT still exists on-cluster
+	preserved := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: existingVMBT.Name, Namespace: vmNamespace,
+	}, preserved); err != nil {
+		t.Errorf("existing VMBT was deleted when it should have been reused: %v", err)
 	}
 }
 
-func TestPrepareVMBackupTracker_SkipsReferencedVMBT(t *testing.T) {
-	// A VMBT referenced by a non-terminal VMB must NOT be deleted.
+func TestPrepareVMBackupTracker_ReusesVMBTEvenIfReferencedByActiveVMB(t *testing.T) {
+	// A VMBT referenced by a non-terminal VMB is still reused (not deleted).
+	// Issue #32: VMBTs are never deleted — they persist on-cluster.
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
 	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
@@ -5668,25 +5673,26 @@ func TestPrepareVMBackupTracker_SkipsReferencedVMBT(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// New VMBT should be created
+	// The existing VMBT should be reused
 	if vmbt == nil {
-		t.Fatal("expected new VMBT to be created")
+		t.Fatal("expected VMBT to be returned")
 	}
-	if vmbt.Name == otherVMBT.Name {
-		t.Error("new VMBT should not be the same object as the protected VMBT")
+	if vmbt.Name != otherVMBT.Name {
+		t.Errorf("expected existing VMBT %q to be reused, got %q", otherVMBT.Name, vmbt.Name)
 	}
 
-	// The other VMBT must NOT be deleted
+	// The VMBT must still exist on-cluster
 	preserved := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
 	if err := fakeClient.Get(context.Background(), types.NamespacedName{
 		Name: otherVMBT.Name, Namespace: vmNamespace,
 	}, preserved); err != nil {
-		t.Errorf("referenced VMBT was deleted when it should have been preserved: %v", err)
+		t.Errorf("VMBT was deleted when it should have been preserved: %v", err)
 	}
 }
 
-func TestPrepareVMBackupTracker_DeletesVMBTWithTerminalVMB(t *testing.T) {
-	// A VMBT referenced by a terminal VMB (Done=True) should be deleted normally.
+func TestPrepareVMBackupTracker_ReusesVMBTWithTerminalVMB(t *testing.T) {
+	// A VMBT referenced by a terminal VMB (Done=True) should be reused.
+	// Issue #32: VMBTs are never deleted — they persist on-cluster.
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
 	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
@@ -5765,17 +5771,21 @@ func TestPrepareVMBackupTracker_DeletesVMBTWithTerminalVMB(t *testing.T) {
 		OADPNamespace: vmNamespace,
 	}
 
-	_, err := r.prepareVMBackupTracker(context.Background(), logr.Discard(), du, vmName, vmNamespace)
+	vmbt, err := r.prepareVMBackupTracker(context.Background(), logr.Discard(), du, vmName, vmNamespace)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// The old VMBT should be deleted (its VMB is terminal)
-	deleted := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+	// The old VMBT should be reused (not deleted)
+	if vmbt.Name != oldVMBT.Name {
+		t.Errorf("expected VMBT %q to be reused, got %q", oldVMBT.Name, vmbt.Name)
+	}
+
+	preserved := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
 	if err := fakeClient.Get(context.Background(), types.NamespacedName{
 		Name: oldVMBT.Name, Namespace: vmNamespace,
-	}, deleted); err == nil {
-		t.Error("expected old VMBT to be deleted (VMB is terminal), but it still exists")
+	}, preserved); err != nil {
+		t.Errorf("VMBT was deleted when it should have been preserved: %v", err)
 	}
 }
 
@@ -6019,5 +6029,94 @@ func TestSafeGenerateNamePrefix(t *testing.T) {
 				t.Errorf("result length %d exceeds max prefix length %d", len(result), maxPrefixLen)
 			}
 		})
+	}
+}
+
+// TestCleanupVMBackupResources_PreservesVMBT verifies that cleanupVMBackupResources
+// deletes the VMB but preserves the VMBT on-cluster (issue #32).
+func TestCleanupVMBackupResources_PreservesVMBT(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du-cleanup",
+			Namespace: "openshift-adp",
+			UID:       types.UID("cleanup-uid"),
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+	}
+
+	// VMB that should be deleted during cleanup
+	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmb-test-cleanup",
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadUID: string(du.UID),
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("backup.kubevirt.io"),
+				Kind:     "VirtualMachineBackupTracker",
+				Name:     "vmbt-test-cleanup",
+			},
+		},
+	}
+
+	// VMBT that should be PRESERVED during cleanup
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-test-cleanup",
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelVMNameHash: common.HashForLabel(vmName),
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, vmb, vmbt).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: "openshift-adp",
+	}
+
+	r.cleanupVMBackupResources(context.Background(), logr.Discard(), du, vmNamespace)
+
+	// VMB should be deleted
+	deletedVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: vmb.Name, Namespace: vmNamespace,
+	}, deletedVMB); err == nil {
+		t.Error("VMB should have been deleted during cleanup, but it still exists")
+	}
+
+	// VMBT should be PRESERVED (not deleted)
+	preservedVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: vmbt.Name, Namespace: vmNamespace,
+	}, preservedVMBT); err != nil {
+		t.Errorf("VMBT should have been preserved during cleanup, but it was deleted: %v", err)
 	}
 }
