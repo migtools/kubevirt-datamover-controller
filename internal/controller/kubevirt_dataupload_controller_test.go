@@ -6465,3 +6465,554 @@ func TestCalculateBackupPVCSize(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveBackupMode_MaxIncrementalBackups(t *testing.T) {
+	buildChain := func(vmName, vmNamespace string, numIncrementals int) (uploader.VMIndex, []string) {
+		var checkpoints []uploader.CheckpointEntry
+		var files []string
+
+		fullPath := fmt.Sprintf("checkpoints/%s/%s/cp-000/disk.qcow2", vmNamespace, vmName)
+		checkpoints = append(checkpoints, uploader.CheckpointEntry{
+			ID:       "cp-000",
+			Type:     "full",
+			VMBackup: "vmb-000",
+			Files:    []uploader.CheckpointFile{{ObjectPath: fullPath}},
+		})
+		files = append(files, fullPath)
+
+		for i := 1; i <= numIncrementals; i++ {
+			cpID := fmt.Sprintf("cp-%03d", i)
+			parentID := fmt.Sprintf("cp-%03d", i-1)
+			path := fmt.Sprintf("checkpoints/%s/%s/%s/disk.qcow2", vmNamespace, vmName, cpID)
+			checkpoints = append(checkpoints, uploader.CheckpointEntry{
+				ID:       cpID,
+				Type:     "incremental",
+				Parent:   parentID,
+				VMBackup: fmt.Sprintf("vmb-%03d", i),
+				Files:    []uploader.CheckpointFile{{ObjectPath: path}},
+			})
+			files = append(files, path)
+		}
+
+		return uploader.VMIndex{
+			VMName:      vmName,
+			Namespace:   vmNamespace,
+			Checkpoints: checkpoints,
+		}, files
+	}
+
+	tests := []struct {
+		name                  string
+		maxIncrementalBackups int
+		numIncrementals       int
+		vmAnnotation          *string
+		wantForceFullBackup   bool
+	}{
+		{
+			name:                  "limit reached forces full backup",
+			maxIncrementalBackups: 3,
+			numIncrementals:       3,
+			wantForceFullBackup:   true,
+		},
+		{
+			name:                  "below limit allows incremental",
+			maxIncrementalBackups: 5,
+			numIncrementals:       2,
+			wantForceFullBackup:   false,
+		},
+		{
+			name:                  "unlimited (0) allows any chain length",
+			maxIncrementalBackups: 0,
+			numIncrementals:       9,
+			wantForceFullBackup:   false,
+		},
+		{
+			name:                  "exactly at boundary allows incremental",
+			maxIncrementalBackups: 3,
+			numIncrementals:       2,
+			wantForceFullBackup:   false,
+		},
+		{
+			name:                  "exceeded limit forces full backup",
+			maxIncrementalBackups: 3,
+			numIncrementals:       5,
+			wantForceFullBackup:   true,
+		},
+		{
+			name:                  "per-VM annotation overrides global to force full",
+			maxIncrementalBackups: 10,
+			numIncrementals:       3,
+			vmAnnotation:          strPtr("3"),
+			wantForceFullBackup:   true,
+		},
+		{
+			name:                  "per-VM annotation allows incremental when below its limit",
+			maxIncrementalBackups: 10,
+			numIncrementals:       2,
+			vmAnnotation:          strPtr("5"),
+			wantForceFullBackup:   false,
+		},
+		{
+			name:                  "per-VM annotation 0 means unlimited overriding global",
+			maxIncrementalBackups: 3,
+			numIncrementals:       9,
+			vmAnnotation:          strPtr("0"),
+			wantForceFullBackup:   false,
+		},
+		{
+			name:                  "invalid annotation falls back to global",
+			maxIncrementalBackups: 3,
+			numIncrementals:       3,
+			vmAnnotation:          strPtr("abc"),
+			wantForceFullBackup:   true,
+		},
+		{
+			name:                  "negative annotation falls back to global",
+			maxIncrementalBackups: 3,
+			numIncrementals:       3,
+			vmAnnotation:          strPtr("-1"),
+			wantForceFullBackup:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vmName := "test-vm"
+			vmNamespace := "test-ns"
+
+			scheme := runtime.NewScheme()
+			_ = velerov2alpha1.AddToScheme(scheme)
+			_ = velerov1.AddToScheme(scheme)
+			_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+			_ = kubevirtcorev1.AddToScheme(scheme)
+			_ = corev1.AddToScheme(scheme)
+
+			du := &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: vmNamespace,
+					UID:       types.UID("test-uid"),
+					Annotations: map[string]string{
+						common.AnnotationVMName:      vmName,
+						common.AnnotationVMNamespace: vmNamespace,
+					},
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					DataMover:             common.DataMoverKubeVirt,
+					SourceNamespace:       vmNamespace,
+					BackupStorageLocation: "default",
+				},
+				Status: velerov2alpha1.DataUploadStatus{
+					Phase: velerov2alpha1.DataUploadPhaseAccepted,
+				},
+			}
+
+			bsl := &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "default",
+					Namespace: vmNamespace,
+				},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "test-bucket",
+							Prefix: "velero",
+						},
+					},
+					Config: map[string]string{"region": "us-east-1"},
+					Credential: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+						Key:                  "cloud",
+					},
+				},
+				Status: velerov1.BackupStorageLocationStatus{
+					Phase: velerov1.BackupStorageLocationPhaseAvailable,
+				},
+			}
+
+			credSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "cloud-creds",
+					Namespace: vmNamespace,
+				},
+				Data: map[string][]byte{
+					"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+				},
+			}
+
+			vmAnnotations := map[string]string{}
+			if tt.vmAnnotation != nil {
+				vmAnnotations[common.AnnotationMaxIncrementalBackups] = *tt.vmAnnotation
+			}
+
+			vm := &kubevirtcorev1.VirtualMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        vmName,
+					Namespace:   vmNamespace,
+					Annotations: vmAnnotations,
+				},
+			}
+
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(du, bsl, credSecret, vm).
+				Build()
+
+			vmIndex, filePaths := buildChain(vmName, vmNamespace, tt.numIncrementals)
+			mockStore := uploader.NewMockObjectStore("test-bucket", "velero-kubevirt-datamover")
+			indexData, _ := json.Marshal(vmIndex)
+			_ = mockStore.PutObjectBytes(fmt.Sprintf("checkpoints/%s/%s/index.json", vmNamespace, vmName), indexData)
+			for _, path := range filePaths {
+				_ = mockStore.PutObjectBytes(path, []byte("data"))
+			}
+
+			r := &KubeVirtDataUploadReconciler{
+				Client:                fakeClient,
+				Scheme:                scheme,
+				Log:                   logr.Discard(),
+				OADPNamespace:         vmNamespace,
+				MaxIncrementalBackups: tt.maxIncrementalBackups,
+				ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+					return mockStore, nil
+				},
+			}
+
+			vmRef := &common.VMReference{Name: vmName, Namespace: vmNamespace}
+			forceFullBackup, _ := r.resolveBackupMode(context.Background(), logr.Discard(), du, vmRef)
+
+			if forceFullBackup != tt.wantForceFullBackup {
+				t.Errorf("forceFullBackup = %v, want %v", forceFullBackup, tt.wantForceFullBackup)
+			}
+		})
+	}
+}
+
+func TestResolveBackupMode_MaxIncrementalSkippedOnBrokenChain(t *testing.T) {
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = kubevirtcorev1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du",
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-creds",
+			Namespace: vmNamespace,
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	vm := &kubevirtcorev1.VirtualMachine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      vmName,
+			Namespace: vmNamespace,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl, credSecret, vm).
+		Build()
+
+	vmIndex := uploader.VMIndex{
+		VMName:    vmName,
+		Namespace: vmNamespace,
+		Checkpoints: []uploader.CheckpointEntry{
+			{
+				ID:       "cp-000",
+				Type:     "full",
+				VMBackup: "vmb-000",
+				Files:    []uploader.CheckpointFile{{ObjectPath: "checkpoints/test-ns/test-vm/cp-000/disk.qcow2"}},
+			},
+			{
+				ID:       "cp-001",
+				Type:     "incremental",
+				Parent:   "cp-000",
+				VMBackup: "vmb-001",
+				Files:    []uploader.CheckpointFile{{ObjectPath: "checkpoints/test-ns/test-vm/cp-001/disk.qcow2"}},
+			},
+			{
+				ID:       "cp-002",
+				Type:     "incremental",
+				Parent:   "cp-001",
+				VMBackup: "vmb-002",
+				Files:    []uploader.CheckpointFile{{ObjectPath: "checkpoints/test-ns/test-vm/cp-002/disk.qcow2"}},
+			},
+		},
+	}
+	mockStore := uploader.NewMockObjectStore("test-bucket", "velero-kubevirt-datamover")
+	indexData, _ := json.Marshal(vmIndex)
+	_ = mockStore.PutObjectBytes("checkpoints/test-ns/test-vm/index.json", indexData)
+	_ = mockStore.PutObjectBytes("checkpoints/test-ns/test-vm/cp-000/disk.qcow2", []byte("full"))
+	_ = mockStore.PutObjectBytes("checkpoints/test-ns/test-vm/cp-002/disk.qcow2", []byte("inc2"))
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:                fakeClient,
+		Scheme:                scheme,
+		Log:                   logr.Discard(),
+		OADPNamespace:         vmNamespace,
+		MaxIncrementalBackups: 5,
+		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			return mockStore, nil
+		},
+	}
+
+	vmRef := &common.VMReference{Name: vmName, Namespace: vmNamespace}
+	forceFullBackup, checkpointLookup := r.resolveBackupMode(context.Background(), logr.Discard(), du, vmRef)
+
+	if !forceFullBackup {
+		t.Error("expected forceFullBackup=true when chain is broken, regardless of MaxIncrementalBackups")
+	}
+	if checkpointLookup == nil {
+		t.Fatal("expected checkpointLookup to be returned")
+	}
+	if checkpointLookup.IsChainValid {
+		t.Error("expected IsChainValid=false for broken chain")
+	}
+}
+
+func TestResolveBackupMode_MaxIncrementalFirstBackup(t *testing.T) {
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = kubevirtcorev1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du",
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-creds",
+			Namespace: vmNamespace,
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	vm := &kubevirtcorev1.VirtualMachine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      vmName,
+			Namespace: vmNamespace,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl, credSecret, vm).
+		Build()
+
+	mockStore := uploader.NewMockObjectStore("test-bucket", "velero-kubevirt-datamover")
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:                fakeClient,
+		Scheme:                scheme,
+		Log:                   logr.Discard(),
+		OADPNamespace:         vmNamespace,
+		MaxIncrementalBackups: 1,
+		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			return mockStore, nil
+		},
+	}
+
+	vmRef := &common.VMReference{Name: vmName, Namespace: vmNamespace}
+	forceFullBackup, checkpointLookup := r.resolveBackupMode(context.Background(), logr.Discard(), du, vmRef)
+
+	if !forceFullBackup {
+		t.Error("expected forceFullBackup=true for first backup (no checkpoint index)")
+	}
+	if checkpointLookup == nil {
+		t.Fatal("expected checkpointLookup to be returned")
+	}
+	if checkpointLookup.Found {
+		t.Error("expected Found=false for first backup")
+	}
+}
+
+func TestGetEffectiveMaxIncrementalBackups(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = kubevirtcorev1.AddToScheme(scheme)
+
+	tests := []struct {
+		name         string
+		globalMax    int
+		vmAnnotation *string
+		vmExists     bool
+		expectedMax  int
+	}{
+		{
+			name:        "no VM annotation uses global",
+			globalMax:   5,
+			vmExists:    true,
+			expectedMax: 5,
+		},
+		{
+			name:         "VM annotation overrides global",
+			globalMax:    5,
+			vmAnnotation: strPtr("3"),
+			vmExists:     true,
+			expectedMax:  3,
+		},
+		{
+			name:         "VM annotation 0 overrides global",
+			globalMax:    5,
+			vmAnnotation: strPtr("0"),
+			vmExists:     true,
+			expectedMax:  0,
+		},
+		{
+			name:         "invalid VM annotation falls back to global",
+			globalMax:    5,
+			vmAnnotation: strPtr("invalid"),
+			vmExists:     true,
+			expectedMax:  5,
+		},
+		{
+			name:         "negative VM annotation falls back to global",
+			globalMax:    5,
+			vmAnnotation: strPtr("-1"),
+			vmExists:     true,
+			expectedMax:  5,
+		},
+		{
+			name:        "VM not found falls back to global",
+			globalMax:   5,
+			vmExists:    false,
+			expectedMax: 5,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var objs []client.Object
+			if tt.vmExists {
+				annotations := map[string]string{}
+				if tt.vmAnnotation != nil {
+					annotations[common.AnnotationMaxIncrementalBackups] = *tt.vmAnnotation
+				}
+				objs = append(objs, &kubevirtcorev1.VirtualMachine{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:        "test-vm",
+						Namespace:   "test-ns",
+						Annotations: annotations,
+					},
+				})
+			}
+
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objs...).
+				Build()
+
+			r := &KubeVirtDataUploadReconciler{
+				Client:                fakeClient,
+				Scheme:                scheme,
+				MaxIncrementalBackups: tt.globalMax,
+			}
+
+			vmRef := &common.VMReference{Name: "test-vm", Namespace: "test-ns"}
+			result := r.getEffectiveMaxIncrementalBackups(context.Background(), logr.Discard(), vmRef)
+
+			if result != tt.expectedMax {
+				t.Errorf("getEffectiveMaxIncrementalBackups() = %d, want %d", result, tt.expectedMax)
+			}
+		})
+	}
+}

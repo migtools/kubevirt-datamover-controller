@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,6 +96,10 @@ type KubeVirtDataUploadReconciler struct {
 
 	// DatamoverImagePullPolicy is the pull policy for the datamover image
 	DatamoverImagePullPolicy corev1.PullPolicy
+
+	// MaxIncrementalBackups is the maximum number of incremental backups per VM
+	// before forcing a full backup. 0 means unlimited.
+	MaxIncrementalBackups int
 
 	// ObjectStoreFactory creates an ObjectStore from an UploaderConfig.
 	// Defaults to uploader.InitObjectStore if nil. Override in tests to inject mocks.
@@ -499,9 +504,10 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 // resolveBackupMode determines whether to force a full backup or allow incremental.
 // Returns (forceFullBackup, checkpointLookup) where checkpointLookup is the BSL
 // chain validation result (nil if BSL was unreachable or validation was skipped).
-// This covers two scenarios:
+// This covers three scenarios:
 //  1. User explicitly requested force-full-backup via annotation on DataUpload.
 //  2. BSL checkpoint validation found a broken chain, requiring a forced full backup.
+//  3. Max incremental backups limit reached (global or per-VM override).
 func (r *KubeVirtDataUploadReconciler) resolveBackupMode(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmRef *common.VMReference) (bool, *uploader.CheckpointLookupResult) {
 	// Check if force full backup is requested via annotation.
 	if du.Annotations[common.AnnotationForceFullBackup] == bslValidatedValue {
@@ -518,7 +524,47 @@ func (r *KubeVirtDataUploadReconciler) resolveBackupMode(ctx context.Context, lo
 		return false, nil
 	}
 
-	return r.validateBSLCheckpoint(ctx, logger, du, vmRef)
+	forceFullBackup, checkpointLookup := r.validateBSLCheckpoint(ctx, logger, du, vmRef)
+
+	// Check if max incremental backups limit is reached.
+	// ChainLength includes the root full backup, so incrementals = ChainLength - 1.
+	if !forceFullBackup &&
+		checkpointLookup != nil && checkpointLookup.Found && checkpointLookup.IsChainValid {
+		maxInc := r.getEffectiveMaxIncrementalBackups(ctx, logger, vmRef)
+		if maxInc > 0 {
+			incrementalCount := checkpointLookup.ChainLength - 1
+			if incrementalCount >= maxInc {
+				logger.Info("Max incremental backups reached, forcing full backup",
+					"incrementalCount", incrementalCount,
+					"maxIncrementalBackups", maxInc,
+					"chainLength", checkpointLookup.ChainLength)
+				forceFullBackup = true
+			}
+		}
+	}
+
+	return forceFullBackup, checkpointLookup
+}
+
+// getEffectiveMaxIncrementalBackups returns the max incremental backups limit
+// for the given VM. A per-VM annotation takes precedence over the global setting.
+func (r *KubeVirtDataUploadReconciler) getEffectiveMaxIncrementalBackups(ctx context.Context, logger logr.Logger, vmRef *common.VMReference) int {
+	vm := &kubevirtcorev1.VirtualMachine{}
+	if err := r.Get(ctx, types.NamespacedName{Name: vmRef.Name, Namespace: vmRef.Namespace}, vm); err != nil {
+		logger.V(1).Info("Could not fetch VM for max-incremental-backups annotation, using global setting",
+			"reason", err.Error())
+		return r.MaxIncrementalBackups
+	}
+	if val, ok := vm.Annotations[common.AnnotationMaxIncrementalBackups]; ok {
+		if parsed, err := strconv.Atoi(val); err == nil && parsed >= 0 {
+			logger.Info("Using per-VM max incremental backups override",
+				"vm", vmRef.Name, "maxIncrementalBackups", parsed)
+			return parsed
+		}
+		logger.Info("Invalid max-incremental-backups annotation value, using global setting",
+			"vm", vmRef.Name, "annotationValue", val)
+	}
+	return r.MaxIncrementalBackups
 }
 
 // validateBSLCheckpoint queries the BSL for a valid checkpoint chain and determines

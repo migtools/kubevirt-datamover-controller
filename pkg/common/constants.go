@@ -54,6 +54,14 @@ const (
 	AnnotationDataUploadName = "velero.io/dataupload-name"
 )
 
+// Annotation keys for VirtualMachine resources
+const (
+	// AnnotationMaxIncrementalBackups, when set on a VirtualMachine, overrides
+	// the global --max-incremental-backups setting for that VM.
+	// The value must be a non-negative integer string (e.g., "5"). "0" means unlimited.
+	AnnotationMaxIncrementalBackups = "kubevirt-datamover.io/max-incremental-backups"
+)
+
 // Label keys for resources created by the controller.
 // Note: Kubernetes label values are limited to 63 characters. Use UIDs or
 // hashes (which have fixed length) as label values for lookups; store
