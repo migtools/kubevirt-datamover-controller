@@ -415,6 +415,19 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 	}
 
 	if doneCond != nil && doneCond.Status == corev1.ConditionTrue {
+		// Done=True can mean "finished with error" — KubeVirt sets Done=True + Reason=Failed
+		// when the backup fails (e.g., "No space left on device"). Check Progressing condition.
+		if progressingCond != nil && progressingCond.Status == corev1.ConditionFalse &&
+			progressingCond.Reason == "Failed" {
+			logger.Error(nil, "VirtualMachineBackup failed (Done=True with failure)",
+				"vmb", vmb.Name, "reason", progressingCond.Reason, "message", progressingCond.Message)
+			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+				fmt.Sprintf("VMBackup failed: %s", progressingCond.Message)); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+
 		logger.Info("VirtualMachineBackup completed",
 			"vmb", vmb.Name,
 			"type", vmb.Status.Type,
@@ -952,6 +965,11 @@ func (r *KubeVirtDataUploadReconciler) filterKubeVirtDataMover() predicate.Predi
 }
 
 // ensureTempPVC creates or retrieves the temporary PVC for backup output.
+// The PVC is sized based on the source VM's disk size per issue #5:
+//  1. User override via annotation kubevirt-datamover.io/backup-pvc-size
+//  2. Source PVC capacity (from du.Spec.SourcePVC)
+//  3. Fallback to DefaultTempPVCSize (10Gi)
+//
 // Note: We don't set an owner reference because the PVC is in VM namespace
 // while DataUpload is in OADP namespace (cross-namespace owner refs not allowed).
 // The PVC will be cleaned up during PV rebinding or explicit cleanup.
@@ -967,6 +985,8 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 		logger.V(1).Info("Temporary PVC already exists", "pvc", pvcList.Items[0].Name)
 		return &pvcList.Items[0], nil
 	}
+
+	pvcSize := r.calculateBackupPVCSize(ctx, logger, du, namespace)
 
 	// Create new PVC
 	pvc := &corev1.PersistentVolumeClaim{
@@ -986,7 +1006,7 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 			},
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse(DefaultTempPVCSize),
+					corev1.ResourceStorage: pvcSize,
 				},
 			},
 		},
@@ -996,8 +1016,54 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 		return nil, fmt.Errorf("failed to create temporary PVC: %w", err)
 	}
 
-	logger.Info("Created temporary PVC", "generateName", pvc.GenerateName, "namespace", namespace)
+	logger.Info("Created temporary PVC", "generateName", pvc.GenerateName, "namespace", namespace, "size", pvcSize.String())
 	return pvc, nil
+}
+
+// calculateBackupPVCSize determines the appropriate size for the temporary backup PVC.
+// Priority: user annotation > source PVC capacity > default 10Gi.
+func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, namespace string) resource.Quantity {
+	minSize := resource.MustParse("1Gi")
+	defaultSize := resource.MustParse(DefaultTempPVCSize)
+
+	// 1. Check user override annotation
+	if du.Annotations != nil {
+		if override := du.Annotations[common.AnnotationBackupPVCSize]; override != "" {
+			qty, err := resource.ParseQuantity(override)
+			if err != nil {
+				logger.Info("Invalid backup-pvc-size annotation, ignoring", "value", override, "error", err)
+			} else {
+				logger.Info("Using user-specified backup PVC size", "size", qty.String())
+				return qty
+			}
+		}
+	}
+
+	// 2. Look up source PVC capacity
+	sourcePVCName := du.Spec.SourcePVC
+	sourceNamespace := du.Spec.SourceNamespace
+	if sourceNamespace == "" {
+		sourceNamespace = namespace
+	}
+
+	if sourcePVCName != "" {
+		sourcePVC := &corev1.PersistentVolumeClaim{}
+		if err := r.Get(ctx, types.NamespacedName{Name: sourcePVCName, Namespace: sourceNamespace}, sourcePVC); err != nil {
+			logger.Info("Could not fetch source PVC for sizing, using default", "pvc", sourcePVCName, "error", err)
+			return defaultSize
+		}
+
+		if capacity, ok := sourcePVC.Status.Capacity[corev1.ResourceStorage]; ok {
+			if capacity.Cmp(minSize) < 0 {
+				return minSize
+			}
+			logger.Info("Sizing backup PVC from source PVC capacity", "sourcePVC", sourcePVCName, "size", capacity.String())
+			return capacity
+		}
+	}
+
+	// 3. Fallback
+	return defaultSize
 }
 
 // prepareVMBackupTracker returns an existing on-cluster VirtualMachineBackupTracker

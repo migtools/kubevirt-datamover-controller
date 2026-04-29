@@ -44,6 +44,11 @@ const (
 	// ForceFullBackup=true. The new checkpoint replaces the old one in BSL.
 	AnnotationForceFullBackup = "kubevirt-datamover.io/force-full-backup"
 
+	// AnnotationBackupPVCSize, when set on a DataUpload, overrides the
+	// calculated temp PVC size. Value must be a valid Kubernetes quantity
+	// (e.g., "50Gi").
+	AnnotationBackupPVCSize = "kubevirt-datamover.io/backup-pvc-size"
+
 	// AnnotationDataUploadName is the annotation key for the DataUpload name.
 	// Used on VMB, VMBT, and PVC resources to track ownership.
 	AnnotationDataUploadName = "velero.io/dataupload-name"
