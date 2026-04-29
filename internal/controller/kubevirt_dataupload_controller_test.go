@@ -6139,3 +6139,217 @@ func TestCleanupVMBackupResources_PreservesVMBT(t *testing.T) {
 		t.Errorf("VMBT should have been preserved during cleanup, but it was deleted: %v", err)
 	}
 }
+
+func TestAddOverhead(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		percent  int64
+		expected string
+	}{
+		{
+			name:     "20% overhead on 30Gi",
+			input:    "30Gi",
+			percent:  20,
+			expected: "36Gi",
+		},
+		{
+			name:     "20% overhead on 10Gi",
+			input:    "10Gi",
+			percent:  20,
+			expected: "12Gi",
+		},
+		{
+			name:    "20% overhead on 1Gi",
+			input:   "1Gi",
+			percent: 20,
+			// 1Gi = 1073741824 bytes, 20% = 214748364, total = 1288490188
+			expected: "1288490188",
+		},
+		{
+			name:     "0% overhead returns same value",
+			input:    "50Gi",
+			percent:  0,
+			expected: "50Gi",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := resource.MustParse(tt.input)
+			result := addOverhead(input, tt.percent)
+			expected := resource.MustParse(tt.expected)
+			if result.Cmp(expected) != 0 {
+				t.Errorf("addOverhead(%s, %d%%) = %s, want %s", tt.input, tt.percent, result.String(), expected.String())
+			}
+		})
+	}
+}
+
+func TestCalculateBackupPVCSize(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	tests := []struct {
+		name         string
+		du           *velerov2alpha1.DataUpload
+		sourcePVC    *corev1.PersistentVolumeClaim // nil = don't create
+		expectedSize string
+	}{
+		{
+			name: "sizes from source PVC capacity with 20% overhead",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-du", Namespace: "openshift-adp"},
+				Spec: velerov2alpha1.DataUploadSpec{
+					SourcePVC:       "source-disk",
+					SourceNamespace: "vm-ns",
+				},
+			},
+			sourcePVC: &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "source-disk", Namespace: "vm-ns"},
+				Status: corev1.PersistentVolumeClaimStatus{
+					Capacity: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse("30Gi"),
+					},
+				},
+			},
+			expectedSize: "36Gi",
+		},
+		{
+			name: "user annotation overrides source PVC",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					Annotations: map[string]string{
+						common.AnnotationBackupPVCSize: "50Gi",
+					},
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					SourcePVC:       "source-disk",
+					SourceNamespace: "vm-ns",
+				},
+			},
+			sourcePVC: &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "source-disk", Namespace: "vm-ns"},
+				Status: corev1.PersistentVolumeClaimStatus{
+					Capacity: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse("30Gi"),
+					},
+				},
+			},
+			expectedSize: "50Gi",
+		},
+		{
+			name: "invalid annotation falls through to source PVC",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					Annotations: map[string]string{
+						common.AnnotationBackupPVCSize: "not-a-quantity",
+					},
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					SourcePVC:       "source-disk",
+					SourceNamespace: "vm-ns",
+				},
+			},
+			sourcePVC: &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "source-disk", Namespace: "vm-ns"},
+				Status: corev1.PersistentVolumeClaimStatus{
+					Capacity: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse("10Gi"),
+					},
+				},
+			},
+			expectedSize: "12Gi",
+		},
+		{
+			name: "falls back to default when source PVC not found",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-du", Namespace: "openshift-adp"},
+				Spec: velerov2alpha1.DataUploadSpec{
+					SourcePVC:       "nonexistent-disk",
+					SourceNamespace: "vm-ns",
+				},
+			},
+			sourcePVC:    nil,
+			expectedSize: DefaultTempPVCSize,
+		},
+		{
+			name: "falls back to default when no source PVC specified",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-du", Namespace: "openshift-adp"},
+				Spec:       velerov2alpha1.DataUploadSpec{},
+			},
+			sourcePVC:    nil,
+			expectedSize: DefaultTempPVCSize,
+		},
+		{
+			name: "enforces minimum 1Gi floor",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-du", Namespace: "openshift-adp"},
+				Spec: velerov2alpha1.DataUploadSpec{
+					SourcePVC:       "tiny-disk",
+					SourceNamespace: "vm-ns",
+				},
+			},
+			sourcePVC: &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "tiny-disk", Namespace: "vm-ns"},
+				Status: corev1.PersistentVolumeClaimStatus{
+					Capacity: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse("500Mi"),
+					},
+				},
+			},
+			expectedSize: "1Gi",
+		},
+		{
+			name: "uses SourceNamespace from DataUpload spec",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-du", Namespace: "openshift-adp"},
+				Spec: velerov2alpha1.DataUploadSpec{
+					SourcePVC:       "disk-in-other-ns",
+					SourceNamespace: "other-ns",
+				},
+			},
+			sourcePVC: &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "disk-in-other-ns", Namespace: "other-ns"},
+				Status: corev1.PersistentVolumeClaimStatus{
+					Capacity: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse("20Gi"),
+					},
+				},
+			},
+			expectedSize: "24Gi",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objs := []client.Object{}
+			if tt.sourcePVC != nil {
+				objs = append(objs, tt.sourcePVC)
+			}
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objs...).
+				Build()
+
+			r := &KubeVirtDataUploadReconciler{
+				Client: fakeClient,
+				Scheme: scheme,
+			}
+
+			logger := logr.Discard()
+			result := r.calculateBackupPVCSize(context.Background(), logger, tt.du, "vm-ns")
+			expected := resource.MustParse(tt.expectedSize)
+
+			if result.Cmp(expected) != 0 {
+				t.Errorf("calculateBackupPVCSize() = %s, want %s", result.String(), expected.String())
+			}
+		})
+	}
+}

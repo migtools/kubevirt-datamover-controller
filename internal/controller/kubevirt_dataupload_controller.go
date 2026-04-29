@@ -1020,13 +1020,27 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 	return pvc, nil
 }
 
+// sizeOverheadPercent is the percentage added on top of source PVC capacity when
+// sizing the temporary backup PVC. This accounts for filesystem overhead (~6% on
+// ext4/xfs) and qcow2 metadata, ensuring the backup has enough room to complete.
+const sizeOverheadPercent = 20
+
 // calculateBackupPVCSize determines the appropriate size for the temporary backup PVC.
-// Priority: user annotation > source PVC capacity > default 10Gi.
+//
+// Priority:
+//  1. User override via annotation kubevirt-datamover.io/backup-pvc-size
+//  2. Source PVC capacity + 20% overhead (filesystem overhead + qcow2 metadata)
+//  3. Fallback to DefaultTempPVCSize (10Gi)
+//
+// The 20% overhead is necessary because:
+//   - Filesystem-mode PVCs lose ~6% to filesystem structures (ext4/xfs)
+//   - qcow2 files include metadata (header, L1/L2 tables, refcount blocks)
+//   - Without overhead, a full backup of a 30Gi disk can fail with ENOSPC on a 30Gi PVC
 func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, namespace string) resource.Quantity {
 	minSize := resource.MustParse("1Gi")
 	defaultSize := resource.MustParse(DefaultTempPVCSize)
 
-	// 1. Check user override annotation
+	// 1. Check user override annotation — allows explicit size when heuristics don't fit
 	if du.Annotations != nil {
 		if override := du.Annotations[common.AnnotationBackupPVCSize]; override != "" {
 			qty, err := resource.ParseQuantity(override)
@@ -1039,7 +1053,7 @@ func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Contex
 		}
 	}
 
-	// 2. Look up source PVC capacity
+	// 2. Look up source PVC capacity and add overhead
 	sourcePVCName := du.Spec.SourcePVC
 	sourceNamespace := du.Spec.SourceNamespace
 	if sourceNamespace == "" {
@@ -1054,16 +1068,30 @@ func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Contex
 		}
 
 		if capacity, ok := sourcePVC.Status.Capacity[corev1.ResourceStorage]; ok {
-			if capacity.Cmp(minSize) < 0 {
+			withOverhead := addOverhead(capacity, sizeOverheadPercent)
+			if withOverhead.Cmp(minSize) < 0 {
 				return minSize
 			}
-			logger.Info("Sizing backup PVC from source PVC capacity", "sourcePVC", sourcePVCName, "size", capacity.String())
-			return capacity
+			logger.Info("Sizing backup PVC from source PVC capacity",
+				"sourcePVC", sourcePVCName,
+				"sourceCapacity", capacity.String(),
+				"overheadPercent", sizeOverheadPercent,
+				"finalSize", withOverhead.String())
+			return withOverhead
 		}
 	}
 
 	// 3. Fallback
 	return defaultSize
+}
+
+// addOverhead returns qty increased by the given percentage.
+// For example, addOverhead(30Gi, 20) returns 36Gi.
+func addOverhead(qty resource.Quantity, percent int64) resource.Quantity {
+	base := qty.Value()
+	overhead := base * percent / 100
+	result := resource.NewQuantity(base+overhead, resource.BinarySI)
+	return *result
 }
 
 // prepareVMBackupTracker returns an existing on-cluster VirtualMachineBackupTracker
