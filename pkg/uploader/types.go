@@ -71,7 +71,11 @@ limitations under the License.
 // To restore backup-day3, the checkpointChain includes all three checkpoints.
 package uploader
 
-import "time"
+import (
+	"time"
+
+	"k8s.io/apimachinery/pkg/api/resource"
+)
 
 // Environment variable names for uploader configuration
 const (
@@ -177,6 +181,9 @@ type CheckpointEntry struct {
 
 	// PVCs is a list of PVC names backed up in this checkpoint (design field)
 	PVCs []string `json:"pvcs"`
+
+	// PVCSizes is a list of PVC storage request sizes matching the PVCs list
+	PVCSizes []resource.Quantity `json:"pvcSizes,omitempty"`
 
 	// ReferencedBy is a list of Velero backup names that reference this checkpoint (design field)
 	ReferencedBy []string `json:"referencedBy"`

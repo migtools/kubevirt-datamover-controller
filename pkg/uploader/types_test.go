@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func TestCheckpointEntryJSONSerialization(t *testing.T) {
@@ -45,6 +47,7 @@ func TestCheckpointEntryJSONSerialization(t *testing.T) {
 					},
 				},
 				PVCs:         []string{"disk1"},
+				PVCSizes:     []resource.Quantity{resource.MustParse("10Gi")},
 				ReferencedBy: []string{"backup-001"},
 			},
 			expectJSON: map[string]any{
@@ -52,6 +55,7 @@ func TestCheckpointEntryJSONSerialization(t *testing.T) {
 				"type":         "full",
 				"vmBackup":     "vmb-test",
 				"pvcs":         []any{"disk1"},
+				"pvcSizes":     []any{"10Gi"},
 				"referencedBy": []any{"backup-001"},
 			},
 		},
@@ -72,6 +76,7 @@ func TestCheckpointEntryJSONSerialization(t *testing.T) {
 					},
 				},
 				PVCs:         []string{"disk1"},
+				PVCSizes:     []resource.Quantity{resource.MustParse("10Gi")},
 				ReferencedBy: []string{"backup-002"},
 			},
 			expectJSON: map[string]any{
@@ -80,6 +85,7 @@ func TestCheckpointEntryJSONSerialization(t *testing.T) {
 				"parent":       "cp-001",
 				"vmBackup":     "vmb-test-2",
 				"pvcs":         []any{"disk1"},
+				"pvcSizes":     []any{"10Gi"},
 				"referencedBy": []any{"backup-002"},
 			},
 		},

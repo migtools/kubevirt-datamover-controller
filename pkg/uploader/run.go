@@ -33,10 +33,13 @@ import (
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
+	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	restcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 )
@@ -109,7 +112,7 @@ func Run(ctx context.Context, logger logr.Logger) error {
 	logger.Info("Kube resources archived to S3")
 
 	// Update VM index (references the archived paths)
-	if err := updateVMIndex(ctx, store, config, files, archived, logger); err != nil {
+	if err := updateVMIndex(ctx, store, k8sClient, config, files, archived, logger); err != nil {
 		return fmt.Errorf("failed to update VM index: %w", err)
 	}
 
@@ -277,7 +280,7 @@ func extractDiskName(filename string) string {
 // that were uploaded by archiveKubeResources — these are stored on the
 // checkpoint entry so the index always references valid objects.
 func updateVMIndex(
-	ctx context.Context, store velero.ObjectStore, config *UploaderConfig,
+	ctx context.Context, store velero.ObjectStore, k8sClient client.Client, config *UploaderConfig,
 	files []CheckpointFile, archived *archivedPaths, logger logr.Logger,
 ) error {
 	indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", config.VMNamespace, config.VMName)
@@ -310,11 +313,35 @@ func updateVMIndex(
 	}
 
 	// Create new checkpoint entry
+	vm := &kubevirtcorev1.VirtualMachine{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{
+		Name:      config.VMName,
+		Namespace: config.VMNamespace,
+	}, vm); err != nil {
+		return fmt.Errorf("failed to get VM %s/%s: %w", config.VMNamespace, config.VMName, err)
+	}
+	volumeMap := common.GetVolumeMapForVm(vm)
+
 	// Extract PVC/disk names from uploaded files
 	var pvcNames []string
+	var pvcSizes []resource.Quantity
 	for _, f := range files {
 		if f.DiskName != "" {
-			pvcNames = append(pvcNames, f.DiskName)
+			pvcName := volumeMap[f.DiskName]
+			if pvcName == "" {
+				// Erroring out if there's a non-PVC volume
+				return fmt.Errorf("no PVC found for %s", f.DiskName)
+			}
+			pvcNames = append(pvcNames, pvcName)
+			pvc := &corev1.PersistentVolumeClaim{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: config.VMNamespace}, pvc); err != nil {
+				return fmt.Errorf("failed to get PVC %s: %w", pvcName, err)
+			}
+			if storage, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; ok {
+				pvcSizes = append(pvcSizes, storage)
+			} else {
+				return fmt.Errorf("missing storage request value in PVC %s", pvcName)
+			}
 		}
 	}
 
@@ -331,6 +358,7 @@ func updateVMIndex(
 		VMBackup:       config.VMBName,
 		Files:          files,
 		PVCs:           pvcNames,
+		PVCSizes:       pvcSizes,
 		ReferencedBy:   referencedBy,
 		VMBObjectPath:  archived.VMBObjectPath,
 		VMBTObjectPath: archived.VMBTObjectPath,
@@ -662,8 +690,14 @@ func cleanupKubeResources(ctx context.Context, k8sClient client.Client, cfg *Upl
 // Extracted as a variable to allow overriding in tests.
 var newKubeClient = func() (client.Client, error) {
 	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
 	if err := kubevirtbackupv1alpha1.AddToScheme(scheme); err != nil {
 		return nil, fmt.Errorf("failed to register KubeVirt backup scheme: %w", err)
+	}
+	if err := kubevirtcorev1.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("failed to register KubeVirt scheme: %w", err)
 	}
 
 	restConfig, err := restcfg.GetConfig()

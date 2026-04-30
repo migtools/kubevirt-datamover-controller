@@ -27,12 +27,67 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
+	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+func getTestScheme() *runtime.Scheme {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = kubevirtcorev1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	return scheme
+}
+
+func getTestClientObjects(config *UploaderConfig, files []CheckpointFile) []client.Object {
+	var objects []client.Object
+	var volumes []kubevirtcorev1.Volume
+	for _, f := range files {
+		if f.DiskName != "" {
+			objects = append(objects, &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      f.DiskName,
+					Namespace: config.VMNamespace,
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("10Gi"),
+						},
+					},
+				},
+			})
+			volumes = append(volumes, kubevirtcorev1.Volume{
+				Name: f.DiskName,
+				VolumeSource: kubevirtcorev1.VolumeSource{
+					DataVolume: &kubevirtcorev1.DataVolumeSource{
+						Name: f.DiskName,
+					},
+				},
+			})
+		}
+	}
+	objects = append(objects, &kubevirtcorev1.VirtualMachine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      config.VMName,
+			Namespace: config.VMNamespace,
+		},
+		Spec: kubevirtcorev1.VirtualMachineSpec{
+			Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+				Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+					Volumes: volumes,
+				},
+			},
+		},
+	})
+	return objects
+}
 
 func TestExtractDiskName(t *testing.T) {
 	tests := []struct {
@@ -253,6 +308,8 @@ func TestLoadConfigFromEnv(t *testing.T) {
 }
 
 func TestUpdateVMIndex(t *testing.T) {
+	scheme := getTestScheme()
+
 	tests := []struct {
 		name           string
 		config         *UploaderConfig
@@ -555,7 +612,12 @@ func TestUpdateVMIndex(t *testing.T) {
 				tt.setupStore(store)
 			}
 
-			err := updateVMIndex(context.Background(), store, tt.config, tt.files, tt.archived, logr.Discard())
+			objects := getTestClientObjects(tt.config, tt.files)
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objects...).Build()
+
+			err := updateVMIndex(context.Background(), store, fakeClient, tt.config, tt.files, tt.archived, logr.Discard())
 
 			if tt.expectError {
 				if err == nil {
@@ -774,6 +836,8 @@ func TestPropagateReferencedBy(t *testing.T) {
 }
 
 func TestUpdateVMIndex_ReferencedByPropagation(t *testing.T) {
+	scheme := getTestScheme()
+
 	tests := []struct {
 		name           string
 		config         *UploaderConfig
@@ -1097,7 +1161,12 @@ func TestUpdateVMIndex_ReferencedByPropagation(t *testing.T) {
 				}
 			}
 
-			err := updateVMIndex(context.Background(), store, tt.config, tt.files, tt.archived, logr.Discard())
+			objects := getTestClientObjects(tt.config, tt.files)
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objects...).Build()
+
+			err := updateVMIndex(context.Background(), store, fakeClient, tt.config, tt.files, tt.archived, logr.Discard())
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -1139,6 +1208,7 @@ func assertReferencedBy(t *testing.T, cpID string, got, want []string) {
 // incremental backup re-runs with the same checkpoint ID, the Parent field
 // is preserved from the existing entry (not corrupted to a self-reference).
 func TestUpdateVMIndex_DedupIncrementalPreservesParent(t *testing.T) {
+	scheme := getTestScheme()
 	store := NewMockObjectStore("test-bucket", "")
 
 	existingIndex := &VMIndex{
@@ -1188,7 +1258,12 @@ func TestUpdateVMIndex_DedupIncrementalPreservesParent(t *testing.T) {
 			ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-2-disk1.qcow2"},
 	}
 
-	err := updateVMIndex(context.Background(), store, config, files, &archivedPaths{}, logr.Discard())
+	objects := getTestClientObjects(config, files)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objects...).Build()
+
+	err := updateVMIndex(context.Background(), store, fakeClient, config, files, &archivedPaths{}, logr.Discard())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1352,8 +1427,7 @@ func TestUpdateBackupManifests(t *testing.T) {
 }
 
 func TestArchiveKubeResources(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	scheme := getTestScheme()
 
 	apiGroup := "kubevirt.io"
 	backupAPIGroup := "backup.kubevirt.io"
@@ -1582,8 +1656,7 @@ func TestArchiveKubeResources(t *testing.T) {
 }
 
 func TestCleanupKubeResources(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	scheme := getTestScheme()
 
 	apiGroup := "kubevirt.io"
 	backupAPIGroup := "backup.kubevirt.io"
@@ -1693,8 +1766,7 @@ func TestCleanupKubeResources(t *testing.T) {
 // TestCleanupKubeResources_PreservesVMBT verifies that cleanupKubeResources
 // deletes the VMB but preserves the VMBT on-cluster (issue #32).
 func TestCleanupKubeResources_PreservesVMBT(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	scheme := getTestScheme()
 
 	apiGroup := "kubevirt.io"
 	backupAPIGroup := "backup.kubevirt.io"
