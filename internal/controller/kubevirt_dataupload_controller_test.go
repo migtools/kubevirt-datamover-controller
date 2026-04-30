@@ -6190,12 +6190,14 @@ func TestCalculateBackupPVCSize(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
+	_ = kubevirtcorev1.AddToScheme(scheme)
 
 	tests := []struct {
 		name         string
 		du           *velerov2alpha1.DataUpload
-		sourcePVC    *corev1.PersistentVolumeClaim // nil = don't create
+		objects      []client.Object // PVCs, VMs, etc.
 		expectedSize string
+		expectErr    bool
 	}{
 		{
 			name: "sizes from source PVC capacity with 20% overhead",
@@ -6206,11 +6208,13 @@ func TestCalculateBackupPVCSize(t *testing.T) {
 					SourceNamespace: "vm-ns",
 				},
 			},
-			sourcePVC: &corev1.PersistentVolumeClaim{
-				ObjectMeta: metav1.ObjectMeta{Name: "source-disk", Namespace: "vm-ns"},
-				Status: corev1.PersistentVolumeClaimStatus{
-					Capacity: corev1.ResourceList{
-						corev1.ResourceStorage: resource.MustParse("30Gi"),
+			objects: []client.Object{
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "source-disk", Namespace: "vm-ns"},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("30Gi"),
+						},
 					},
 				},
 			},
@@ -6231,11 +6235,13 @@ func TestCalculateBackupPVCSize(t *testing.T) {
 					SourceNamespace: "vm-ns",
 				},
 			},
-			sourcePVC: &corev1.PersistentVolumeClaim{
-				ObjectMeta: metav1.ObjectMeta{Name: "source-disk", Namespace: "vm-ns"},
-				Status: corev1.PersistentVolumeClaimStatus{
-					Capacity: corev1.ResourceList{
-						corev1.ResourceStorage: resource.MustParse("30Gi"),
+			objects: []client.Object{
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "source-disk", Namespace: "vm-ns"},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("30Gi"),
+						},
 					},
 				},
 			},
@@ -6256,18 +6262,20 @@ func TestCalculateBackupPVCSize(t *testing.T) {
 					SourceNamespace: "vm-ns",
 				},
 			},
-			sourcePVC: &corev1.PersistentVolumeClaim{
-				ObjectMeta: metav1.ObjectMeta{Name: "source-disk", Namespace: "vm-ns"},
-				Status: corev1.PersistentVolumeClaimStatus{
-					Capacity: corev1.ResourceList{
-						corev1.ResourceStorage: resource.MustParse("10Gi"),
+			objects: []client.Object{
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "source-disk", Namespace: "vm-ns"},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("10Gi"),
+						},
 					},
 				},
 			},
 			expectedSize: "12Gi",
 		},
 		{
-			name: "falls back to default when source PVC not found",
+			name: "source PVC not found returns error",
 			du: &velerov2alpha1.DataUpload{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-du", Namespace: "openshift-adp"},
 				Spec: velerov2alpha1.DataUploadSpec{
@@ -6275,8 +6283,8 @@ func TestCalculateBackupPVCSize(t *testing.T) {
 					SourceNamespace: "vm-ns",
 				},
 			},
-			sourcePVC:    nil,
-			expectedSize: DefaultTempPVCSize,
+			objects:   nil,
+			expectErr: true,
 		},
 		{
 			name: "falls back to default when no source PVC specified",
@@ -6284,7 +6292,7 @@ func TestCalculateBackupPVCSize(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "test-du", Namespace: "openshift-adp"},
 				Spec:       velerov2alpha1.DataUploadSpec{},
 			},
-			sourcePVC:    nil,
+			objects:      nil,
 			expectedSize: DefaultTempPVCSize,
 		},
 		{
@@ -6296,11 +6304,13 @@ func TestCalculateBackupPVCSize(t *testing.T) {
 					SourceNamespace: "vm-ns",
 				},
 			},
-			sourcePVC: &corev1.PersistentVolumeClaim{
-				ObjectMeta: metav1.ObjectMeta{Name: "tiny-disk", Namespace: "vm-ns"},
-				Status: corev1.PersistentVolumeClaimStatus{
-					Capacity: corev1.ResourceList{
-						corev1.ResourceStorage: resource.MustParse("500Mi"),
+			objects: []client.Object{
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "tiny-disk", Namespace: "vm-ns"},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("500Mi"),
+						},
 					},
 				},
 			},
@@ -6315,23 +6325,115 @@ func TestCalculateBackupPVCSize(t *testing.T) {
 					SourceNamespace: "other-ns",
 				},
 			},
-			sourcePVC: &corev1.PersistentVolumeClaim{
-				ObjectMeta: metav1.ObjectMeta{Name: "disk-in-other-ns", Namespace: "other-ns"},
-				Status: corev1.PersistentVolumeClaimStatus{
-					Capacity: corev1.ResourceList{
-						corev1.ResourceStorage: resource.MustParse("20Gi"),
+			objects: []client.Object{
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "disk-in-other-ns", Namespace: "other-ns"},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("20Gi"),
+						},
 					},
 				},
 			},
 			expectedSize: "24Gi",
+		},
+		{
+			name: "multi-disk VM sums all PVC capacities",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					Annotations: map[string]string{
+						common.AnnotationVMName:      "multi-disk-vm",
+						common.AnnotationVMNamespace: "vm-ns",
+					},
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					SourcePVC:       "disk-1",
+					SourceNamespace: "vm-ns",
+				},
+			},
+			objects: []client.Object{
+				&kubevirtcorev1.VirtualMachine{
+					ObjectMeta: metav1.ObjectMeta{Name: "multi-disk-vm", Namespace: "vm-ns"},
+					Spec: kubevirtcorev1.VirtualMachineSpec{
+						Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+							Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+								Volumes: []kubevirtcorev1.Volume{
+									{Name: "vol1", VolumeSource: kubevirtcorev1.VolumeSource{
+										PersistentVolumeClaim: &kubevirtcorev1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{ClaimName: "disk-1"},
+										},
+									}},
+									{Name: "vol2", VolumeSource: kubevirtcorev1.VolumeSource{
+										PersistentVolumeClaim: &kubevirtcorev1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{ClaimName: "disk-2"},
+										},
+									}},
+								},
+							},
+						},
+					},
+				},
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "disk-1", Namespace: "vm-ns"},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Capacity: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("30Gi")},
+					},
+				},
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "disk-2", Namespace: "vm-ns"},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Capacity: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("20Gi")},
+					},
+				},
+			},
+			// 30Gi + 20Gi = 50Gi, +20% = 60Gi
+			expectedSize: "60Gi",
+		},
+		{
+			name: "multi-disk VM with missing PVC returns error",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					Annotations: map[string]string{
+						common.AnnotationVMName:      "vm-missing-pvc",
+						common.AnnotationVMNamespace: "vm-ns",
+					},
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					SourcePVC:       "disk-1",
+					SourceNamespace: "vm-ns",
+				},
+			},
+			objects: []client.Object{
+				&kubevirtcorev1.VirtualMachine{
+					ObjectMeta: metav1.ObjectMeta{Name: "vm-missing-pvc", Namespace: "vm-ns"},
+					Spec: kubevirtcorev1.VirtualMachineSpec{
+						Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+							Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+								Volumes: []kubevirtcorev1.Volume{
+									{Name: "vol1", VolumeSource: kubevirtcorev1.VolumeSource{
+										PersistentVolumeClaim: &kubevirtcorev1.PersistentVolumeClaimVolumeSource{
+											PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{ClaimName: "disk-that-doesnt-exist"},
+										},
+									}},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectErr: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			objs := []client.Object{}
-			if tt.sourcePVC != nil {
-				objs = append(objs, tt.sourcePVC)
+			if tt.objects != nil {
+				objs = append(objs, tt.objects...)
 			}
 			fakeClient := fake.NewClientBuilder().
 				WithScheme(scheme).
@@ -6344,9 +6446,19 @@ func TestCalculateBackupPVCSize(t *testing.T) {
 			}
 
 			logger := logr.Discard()
-			result := r.calculateBackupPVCSize(context.Background(), logger, tt.du, "vm-ns")
-			expected := resource.MustParse(tt.expectedSize)
+			result, err := r.calculateBackupPVCSize(context.Background(), logger, tt.du, "vm-ns")
 
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("calculateBackupPVCSize() expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("calculateBackupPVCSize() unexpected error: %v", err)
+			}
+
+			expected := resource.MustParse(tt.expectedSize)
 			if result.Cmp(expected) != 0 {
 				t.Errorf("calculateBackupPVCSize() = %s, want %s", result.String(), expected.String())
 			}

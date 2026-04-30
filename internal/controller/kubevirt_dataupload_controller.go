@@ -986,7 +986,10 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 		return &pvcList.Items[0], nil
 	}
 
-	pvcSize := r.calculateBackupPVCSize(ctx, logger, du, namespace)
+	pvcSize, err := r.calculateBackupPVCSize(ctx, logger, du, namespace)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate backup PVC size: %w", err)
+	}
 
 	// Create new PVC
 	pvc := &corev1.PersistentVolumeClaim{
@@ -1029,14 +1032,20 @@ const sizeOverheadPercent = 20
 //
 // Priority:
 //  1. User override via annotation kubevirt-datamover.io/backup-pvc-size
-//  2. Source PVC capacity + 20% overhead (filesystem overhead + qcow2 metadata)
-//  3. Fallback to DefaultTempPVCSize (10Gi)
+//  2. Sum of all VM disk PVC capacities + 20% overhead
+//  3. Source PVC capacity + 20% overhead (fallback if VM lookup fails)
+//  4. Fallback to DefaultTempPVCSize (10Gi)
 //
-// The 20% overhead is necessary because:
-//   - Filesystem-mode PVCs lose ~6% to filesystem structures (ext4/xfs)
-//   - qcow2 files include metadata (header, L1/L2 tables, refcount blocks)
-//   - Without overhead, a full backup of a 30Gi disk can fail with ENOSPC on a 30Gi PVC
-func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, namespace string) resource.Quantity {
+// For multi-disk VMs, KubeVirt writes all volumes' backup data into a single temp PVC,
+// so we must sum all disk sizes. The 20% overhead accounts for:
+//   - Filesystem-mode PVCs losing ~6% to filesystem structures (ext4/xfs)
+//   - qcow2 metadata (header, L1/L2 tables, refcount blocks)
+//   - Without overhead, a full backup of a 30Gi disk fails with ENOSPC on a 30Gi PVC
+//
+// Error handling: NotFound errors on PVC lookups are fatal (the VM references a
+// volume that doesn't exist — the backup will fail anyway). Other errors (RBAC,
+// cache not synced) fall back to the default to avoid infinite reconcile retries.
+func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, namespace string) (resource.Quantity, error) {
 	minSize := resource.MustParse("1Gi")
 	defaultSize := resource.MustParse(DefaultTempPVCSize)
 
@@ -1048,41 +1057,83 @@ func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Contex
 				logger.Info("Invalid backup-pvc-size annotation, ignoring", "value", override, "error", err)
 			} else {
 				logger.Info("Using user-specified backup PVC size", "size", qty.String())
-				return qty
+				return qty, nil
 			}
 		}
 	}
 
-	// 2. Look up source PVC capacity and add overhead
-	sourcePVCName := du.Spec.SourcePVC
 	sourceNamespace := du.Spec.SourceNamespace
 	if sourceNamespace == "" {
 		sourceNamespace = namespace
 	}
 
+	// 2. Sum all VM disk PVC capacities (handles multi-disk VMs correctly since
+	// KubeVirt writes all volumes' backup data into a single temp PVC)
+	vmRef, err := common.GetVMReference(du)
+	if err == nil {
+		vm := &kubevirtcorev1.VirtualMachine{}
+		if err := r.Get(ctx, types.NamespacedName{Name: vmRef.Name, Namespace: vmRef.Namespace}, vm); err == nil {
+			pvcNames := common.GetVolumesForVm(vm)
+			if len(pvcNames) > 0 {
+				totalCapacity := resource.Quantity{}
+				for _, pvcName := range pvcNames {
+					pvc := &corev1.PersistentVolumeClaim{}
+					if err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: vmRef.Namespace}, pvc); err != nil {
+						if errors.IsNotFound(err) {
+							return resource.Quantity{}, fmt.Errorf("VM PVC %s/%s not found, cannot determine backup size", vmRef.Namespace, pvcName)
+						}
+						logger.Info("Could not fetch VM PVC for sizing, skipping", "pvc", pvcName, "error", err)
+						continue
+					}
+					if capacity, ok := pvc.Status.Capacity[corev1.ResourceStorage]; ok {
+						totalCapacity.Add(capacity)
+					}
+				}
+				if !totalCapacity.IsZero() {
+					withOverhead := addOverhead(totalCapacity, sizeOverheadPercent)
+					if withOverhead.Cmp(minSize) < 0 {
+						withOverhead = minSize
+					}
+					logger.Info("Sizing backup PVC from VM disk capacities",
+						"vmName", vmRef.Name,
+						"diskCount", len(pvcNames),
+						"totalCapacity", totalCapacity.String(),
+						"overheadPercent", sizeOverheadPercent,
+						"finalSize", withOverhead.String())
+					return withOverhead, nil
+				}
+			}
+		}
+	}
+
+	// 3. Fall back to source PVC from DataUpload spec (single-disk fallback path)
+	sourcePVCName := du.Spec.SourcePVC
 	if sourcePVCName != "" {
 		sourcePVC := &corev1.PersistentVolumeClaim{}
 		if err := r.Get(ctx, types.NamespacedName{Name: sourcePVCName, Namespace: sourceNamespace}, sourcePVC); err != nil {
+			if errors.IsNotFound(err) {
+				return resource.Quantity{}, fmt.Errorf("source PVC %s/%s not found, cannot determine backup size", sourceNamespace, sourcePVCName)
+			}
 			logger.Info("Could not fetch source PVC for sizing, using default", "pvc", sourcePVCName, "error", err)
-			return defaultSize
+			return defaultSize, nil
 		}
 
 		if capacity, ok := sourcePVC.Status.Capacity[corev1.ResourceStorage]; ok {
 			withOverhead := addOverhead(capacity, sizeOverheadPercent)
 			if withOverhead.Cmp(minSize) < 0 {
-				return minSize
+				withOverhead = minSize
 			}
 			logger.Info("Sizing backup PVC from source PVC capacity",
 				"sourcePVC", sourcePVCName,
 				"sourceCapacity", capacity.String(),
 				"overheadPercent", sizeOverheadPercent,
 				"finalSize", withOverhead.String())
-			return withOverhead
+			return withOverhead, nil
 		}
 	}
 
-	// 3. Fallback
-	return defaultSize
+	// 4. Fallback
+	return defaultSize, nil
 }
 
 // addOverhead returns qty increased by the given percentage.
