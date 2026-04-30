@@ -276,6 +276,16 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	// Step 1: Create or get temporary PVC for backup output
 	pvc, err := r.ensureTempPVC(ctx, logger, du, vmRef.Namespace)
 	if err != nil {
+		// If a referenced PVC is permanently missing, fail the DataUpload
+		// instead of retrying forever. errors.IsNotFound matches wrapped errors.
+		if errors.IsNotFound(err) {
+			logger.Error(err, "PVC not found, failing DataUpload")
+			if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+				fmt.Sprintf("Failed to create backup PVC: %v", err)); updateErr != nil {
+				return ctrl.Result{}, updateErr
+			}
+			return ctrl.Result{}, nil
+		}
 		logger.Error(err, "Failed to ensure temporary PVC")
 		return ctrl.Result{}, err
 	}
@@ -1080,10 +1090,13 @@ func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Contex
 					pvc := &corev1.PersistentVolumeClaim{}
 					if err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: vmRef.Namespace}, pvc); err != nil {
 						if errors.IsNotFound(err) {
-							return resource.Quantity{}, fmt.Errorf("VM PVC %s/%s not found, cannot determine backup size", vmRef.Namespace, pvcName)
+							return resource.Quantity{}, fmt.Errorf("VM PVC %s/%s not found, cannot determine backup size: %w", vmRef.Namespace, pvcName, err)
 						}
-						logger.Info("Could not fetch VM PVC for sizing, skipping", "pvc", pvcName, "error", err)
-						continue
+						// Transient error — abort VM-based sizing and fall to source PVC fallback
+						// to avoid creating an undersized PVC from a partial sum
+						logger.Info("Could not fetch VM PVC for sizing, falling back to source PVC", "pvc", pvcName, "error", err)
+						totalCapacity = resource.Quantity{}
+						break
 					}
 					if capacity, ok := pvc.Status.Capacity[corev1.ResourceStorage]; ok {
 						totalCapacity.Add(capacity)
@@ -1112,7 +1125,7 @@ func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Contex
 		sourcePVC := &corev1.PersistentVolumeClaim{}
 		if err := r.Get(ctx, types.NamespacedName{Name: sourcePVCName, Namespace: sourceNamespace}, sourcePVC); err != nil {
 			if errors.IsNotFound(err) {
-				return resource.Quantity{}, fmt.Errorf("source PVC %s/%s not found, cannot determine backup size", sourceNamespace, sourcePVCName)
+				return resource.Quantity{}, fmt.Errorf("source PVC %s/%s not found, cannot determine backup size: %w", sourceNamespace, sourcePVCName, err)
 			}
 			logger.Info("Could not fetch source PVC for sizing, using default", "pvc", sourcePVCName, "error", err)
 			return defaultSize, nil
