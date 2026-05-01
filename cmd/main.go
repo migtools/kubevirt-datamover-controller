@@ -122,6 +122,11 @@ func main() {
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
+	if maxIncrementalBackups < 0 {
+		fmt.Fprintln(os.Stderr, "--max-incremental-backups must be >= 0")
+		os.Exit(1)
+	}
+
 	// Allow DATAMOVER_IMAGE env var to override the default
 	// This enables kustomize to set the image via environment variable
 	if envImage := os.Getenv("DATAMOVER_IMAGE"); envImage != "" && datamoverImage == common.DefaultDatamoverImage {
