@@ -4047,6 +4047,83 @@ func TestLookupCheckpointFromBSL_WithValidCredentials(t *testing.T) {
 	}
 }
 
+func TestLookupCheckpointFromBSL_NilResult(t *testing.T) {
+	// Tests that lookupCheckpointFromBSL converts a (nil, nil) return from
+	// LookupLatestCheckpoint into a definitive Found=false result so that
+	// validateBSLCheckpoint correctly forces a full backup and sets the
+	// BSL-validated annotation.
+	scheme := runtime.NewScheme()
+	_ = velerov1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-credentials",
+			Namespace: "openshift-adp",
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(credSecret).
+		Build()
+
+	mockStore := uploader.NewMockObjectStore("my-bucket", "velero-kubevirt-datamover")
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		OADPNamespace: "openshift-adp",
+		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			return mockStore, nil
+		},
+		// Inject a lookup func that returns (nil, nil) to exercise the guard.
+		CheckpointLookupFunc: func(_ context.Context, _ velero.ObjectStore, _, _, _ string) (*uploader.CheckpointLookupResult, error) {
+			return nil, nil
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: "openshift-adp",
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "my-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-credentials"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	result, err := r.lookupCheckpointFromBSL(context.Background(), bsl, "test-ns", "test-vm")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil result when LookupLatestCheckpoint returns (nil, nil)")
+	}
+	if result.Found {
+		t.Error("expected Found=false when LookupLatestCheckpoint returns (nil, nil)")
+	}
+	if !contains(result.Message, "no checkpoint found") {
+		t.Errorf("expected message about no checkpoint, got: %s", result.Message)
+	}
+}
+
 func TestLookupCheckpointFromBSL_WithExistingCheckpoint(t *testing.T) {
 	// Tests lookupCheckpointFromBSL when BSL has an existing valid checkpoint.
 	scheme := runtime.NewScheme()

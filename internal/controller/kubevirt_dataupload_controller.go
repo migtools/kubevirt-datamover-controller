@@ -99,6 +99,10 @@ type KubeVirtDataUploadReconciler struct {
 	// ObjectStoreFactory creates an ObjectStore from an UploaderConfig.
 	// Defaults to uploader.InitObjectStore if nil. Override in tests to inject mocks.
 	ObjectStoreFactory func(cfg *uploader.UploaderConfig) (velero.ObjectStore, error)
+
+	// CheckpointLookupFunc performs the BSL checkpoint lookup.
+	// Defaults to uploader.LookupLatestCheckpoint if nil. Override in tests to inject mocks.
+	CheckpointLookupFunc func(ctx context.Context, store velero.ObjectStore, bucket, vmNamespace, vmName string) (*uploader.CheckpointLookupResult, error)
 }
 
 // +kubebuilder:rbac:groups=velero.io,resources=datauploads,verbs=get;list;watch;update;patch
@@ -1656,9 +1660,23 @@ func (r *KubeVirtDataUploadReconciler) lookupCheckpointFromBSL(ctx context.Conte
 	}
 
 	// Lookup the latest checkpoint
-	result, err := uploader.LookupLatestCheckpoint(ctx, store, cfg.Bucket, vmNamespace, vmName)
+	lookupFunc := r.CheckpointLookupFunc
+	if lookupFunc == nil {
+		lookupFunc = uploader.LookupLatestCheckpoint
+	}
+	result, err := lookupFunc(ctx, store, cfg.Bucket, vmNamespace, vmName)
 	if err != nil {
 		return nil, fmt.Errorf("checkpoint lookup failed: %w", err)
+	}
+
+	// Guard against (nil, nil): treat a nil result with no error as a definitive
+	// "no checkpoint found" so that validateBSLCheckpoint forces a full backup and
+	// sets the BSL-validated annotation rather than silently skipping both.
+	if result == nil {
+		return &uploader.CheckpointLookupResult{
+			Found:   false,
+			Message: "no checkpoint found (first backup)",
+		}, nil
 	}
 
 	return result, nil
