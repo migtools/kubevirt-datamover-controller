@@ -64,9 +64,6 @@ const (
 	// bslValidatedValue is the annotation value indicating BSL validation is complete
 	bslValidatedValue = "true"
 
-	// defaultCredentialKey is the default key in BSL credential secrets
-	defaultCredentialKey = "cloud"
-
 	// AnnotationVMBTName is the annotation key for the generated VMBT name on a DataUpload
 	AnnotationVMBTName = "kubevirt-datamover.io/vmbt-name"
 
@@ -1300,7 +1297,7 @@ func (r *KubeVirtDataUploadReconciler) prepareVMBackupTracker(ctx context.Contex
 // latest checkpoint's vmbtObjectPath, fetches the archived vmbt.json, and returns
 // the deserialized VMBT. Returns nil if no VMBT is archived (first backup or old-format index).
 func (r *KubeVirtDataUploadReconciler) lookupLatestVMBTFromBSL(ctx context.Context, bsl *velerov1.BackupStorageLocation, vmNamespace, vmName string) (*kubevirtbackupv1alpha1.VirtualMachineBackupTracker, error) {
-	store, cfg, err := r.initObjectStoreFromBSL(ctx, bsl)
+	store, cfg, err := uploader.InitObjectStoreFromBSL(ctx, r.Client, r.OADPNamespace, bsl, r.ObjectStoreFactory)
 	if err != nil {
 		return nil, err
 	}
@@ -1564,7 +1561,7 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 	checkpointName string,
 	vmbtName string,
 ) (*DatamoverPodConfig, error) {
-	cfg, err := extractBSLConfig(bsl)
+	cfg, err := uploader.ExtractBSLConfig(bsl)
 	if err != nil {
 		return nil, err
 	}
@@ -1642,83 +1639,10 @@ func extractPodFailureMessage(pod *corev1.Pod) string {
 	return "unknown error"
 }
 
-// bslConfig holds extracted BSL configuration used by both the datamover pod
-// and the checkpoint lookup.
-type bslConfig struct {
-	Provider       string
-	Bucket         string
-	Prefix         string // Datamover prefix (e.g., "velero-kubevirt-datamover")
-	Region         string
-	CredentialName string
-	CredentialKey  string
-
-	// S3-compatible storage provider settings
-	S3URL                 string
-	S3ForcePathStyle      bool
-	InsecureSkipTLSVerify bool
-	CACert                string
-}
-
-// extractBSLConfig extracts and validates common BSL configuration fields.
-// The returned prefix includes the datamover suffix (e.g., "velero-kubevirt-datamover").
-func extractBSLConfig(bsl *velerov1.BackupStorageLocation) (*bslConfig, error) {
-	bucket := ""
-	prefix := ""
-	if bsl.Spec.ObjectStorage != nil {
-		bucket = bsl.Spec.ObjectStorage.Bucket
-		prefix = bsl.Spec.ObjectStorage.Prefix
-	}
-	if bucket == "" {
-		return nil, fmt.Errorf("BSL %s has no bucket configured", bsl.Name)
-	}
-
-	// Add our datamover prefix to the BSL prefix
-	if prefix != "" {
-		prefix = prefix + "-" + common.DatamoverBSLPrefix
-	} else {
-		prefix = common.DatamoverBSLPrefix
-	}
-
-	region := ""
-	s3URL := ""
-	s3ForcePathStyle := false
-	insecureSkipTLSVerify := false
-	caCert := ""
-	if bsl.Spec.Config != nil {
-		region = bsl.Spec.Config["region"]
-		s3URL = bsl.Spec.Config["s3Url"]
-		s3ForcePathStyle = strings.EqualFold(bsl.Spec.Config["s3ForcePathStyle"], "true")
-		insecureSkipTLSVerify = strings.EqualFold(bsl.Spec.Config["insecureSkipTLSVerify"], "true")
-		caCert = bsl.Spec.Config["caCert"]
-	}
-
-	credName := ""
-	credKey := defaultCredentialKey
-	if bsl.Spec.Credential != nil {
-		credName = bsl.Spec.Credential.Name
-		if bsl.Spec.Credential.Key != "" {
-			credKey = bsl.Spec.Credential.Key
-		}
-	}
-
-	return &bslConfig{
-		Provider:              bsl.Spec.Provider,
-		Bucket:                bucket,
-		Prefix:                prefix,
-		Region:                region,
-		CredentialName:        credName,
-		CredentialKey:         credKey,
-		S3URL:                 s3URL,
-		S3ForcePathStyle:      s3ForcePathStyle,
-		InsecureSkipTLSVerify: insecureSkipTLSVerify,
-		CACert:                caCert,
-	}, nil
-}
-
 // lookupCheckpointFromBSL reads the VM's checkpoint index from the BSL and returns
 // the latest valid checkpoint for incremental backup support.
 func (r *KubeVirtDataUploadReconciler) lookupCheckpointFromBSL(ctx context.Context, bsl *velerov1.BackupStorageLocation, vmNamespace, vmName string) (*uploader.CheckpointLookupResult, error) {
-	store, cfg, err := r.initObjectStoreFromBSL(ctx, bsl)
+	store, cfg, err := uploader.InitObjectStoreFromBSL(ctx, r.Client, r.OADPNamespace, bsl, r.ObjectStoreFactory)
 	if err != nil {
 		return nil, err
 	}
@@ -1730,93 +1654,6 @@ func (r *KubeVirtDataUploadReconciler) lookupCheckpointFromBSL(ctx context.Conte
 	}
 
 	return result, nil
-}
-
-// initObjectStoreFromBSL extracts BSL config, fetches credentials, and initializes
-// an ObjectStore client. Used by both lookupCheckpointFromBSL and lookupLatestVMBTFromBSL.
-func (r *KubeVirtDataUploadReconciler) initObjectStoreFromBSL(
-	ctx context.Context, bsl *velerov1.BackupStorageLocation,
-) (velero.ObjectStore, *bslConfig, error) {
-	cfg, err := extractBSLConfig(bsl)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	if cfg.CredentialName == "" {
-		return nil, nil, fmt.Errorf("BSL %s has no credential configured", bsl.Name)
-	}
-
-	credData, err := r.getCredentialsFromBSL(ctx, bsl)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get BSL credentials: %w", err)
-	}
-
-	factory := r.ObjectStoreFactory
-	if factory == nil {
-		factory = func(c *uploader.UploaderConfig) (velero.ObjectStore, error) {
-			return uploader.InitObjectStore(c)
-		}
-	}
-
-	store, err := factory(&uploader.UploaderConfig{
-		BSLProvider:              cfg.Provider,
-		BSLBucket:                cfg.Bucket,
-		BSLPrefix:                cfg.Prefix,
-		BSLRegion:                cfg.Region,
-		BSLS3URL:                 cfg.S3URL,
-		BSLS3ForcePathStyle:      cfg.S3ForcePathStyle,
-		BSLInsecureSkipTLSVerify: cfg.InsecureSkipTLSVerify,
-		BSLCACert:                cfg.CACert,
-		CredentialsData:          credData,
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to initialize object store: %w", err)
-	}
-
-	return store, cfg, nil
-}
-
-// getCredentialsFromBSL reads the BSL credential secret and returns the raw
-// credential bytes. The credentials are kept in memory and never written to disk.
-func (r *KubeVirtDataUploadReconciler) getCredentialsFromBSL(
-	ctx context.Context, bsl *velerov1.BackupStorageLocation,
-) ([]byte, error) {
-	if bsl.Spec.Credential == nil {
-		return nil, fmt.Errorf("BSL %s has no credential configured", bsl.Name)
-	}
-
-	secretName := bsl.Spec.Credential.Name
-	secretKey := bsl.Spec.Credential.Key
-	if secretKey == "" {
-		secretKey = defaultCredentialKey
-	}
-
-	// BSL credentials secret is in the same namespace as the BSL
-	namespace := bsl.Namespace
-	if namespace == "" {
-		namespace = r.OADPNamespace
-	}
-
-	// Fetch the secret
-	secret := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name: secretName, Namespace: namespace,
-	}, secret); err != nil {
-		return nil, fmt.Errorf(
-			"failed to get credential secret %s/%s: %w",
-			namespace, secretName, err,
-		)
-	}
-
-	credData, ok := secret.Data[secretKey]
-	if !ok {
-		return nil, fmt.Errorf(
-			"credential secret %s/%s does not contain key %q",
-			namespace, secretName, secretKey,
-		)
-	}
-
-	return credData, nil
 }
 
 // findPodForDataUpload finds the unique datamover pod associated with a DataUpload.

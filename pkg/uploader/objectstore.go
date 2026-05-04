@@ -36,7 +36,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // Compile-time check that S3ObjectStore implements velero.ObjectStore
@@ -432,4 +437,168 @@ func InitObjectStore(cfg *UploaderConfig) (velero.ObjectStore, error) {
 		// Try S3-compatible for unknown providers
 		return NewS3ObjectStore(configMap)
 	}
+}
+
+// DefaultCredentialKey is the default key in BSL credential secrets
+const DefaultCredentialKey = "cloud"
+
+// BSLConfig holds extracted BSL configuration used by both the datamover pod
+// and the checkpoint lookup.
+type BSLConfig struct {
+	Provider       string
+	Bucket         string
+	Prefix         string // Datamover prefix (e.g., "velero-kubevirt-datamover")
+	Region         string
+	CredentialName string
+	CredentialKey  string
+
+	// S3-compatible storage provider settings
+	S3URL                 string
+	S3ForcePathStyle      bool
+	InsecureSkipTLSVerify bool
+	CACert                string
+}
+
+// ExtractBSLConfig extracts and validates common BSL configuration fields.
+// The returned prefix includes the datamover suffix (e.g., "velero-kubevirt-datamover").
+func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
+	bucket := ""
+	prefix := ""
+	if bsl.Spec.ObjectStorage != nil {
+		bucket = bsl.Spec.ObjectStorage.Bucket
+		prefix = bsl.Spec.ObjectStorage.Prefix
+	}
+	if bucket == "" {
+		return nil, fmt.Errorf("BSL %s has no bucket configured", bsl.Name)
+	}
+
+	// Add our datamover prefix to the BSL prefix
+	if prefix != "" {
+		prefix = prefix + "-" + common.DatamoverBSLPrefix
+	} else {
+		prefix = common.DatamoverBSLPrefix
+	}
+
+	region := ""
+	s3URL := ""
+	s3ForcePathStyle := false
+	insecureSkipTLSVerify := false
+	caCert := ""
+	if bsl.Spec.Config != nil {
+		region = bsl.Spec.Config["region"]
+		s3URL = bsl.Spec.Config["s3Url"]
+		s3ForcePathStyle = strings.EqualFold(bsl.Spec.Config["s3ForcePathStyle"], "true")
+		insecureSkipTLSVerify = strings.EqualFold(bsl.Spec.Config["insecureSkipTLSVerify"], "true")
+		caCert = bsl.Spec.Config["caCert"]
+	}
+
+	credName := ""
+	credKey := DefaultCredentialKey
+	if bsl.Spec.Credential != nil {
+		credName = bsl.Spec.Credential.Name
+		if bsl.Spec.Credential.Key != "" {
+			credKey = bsl.Spec.Credential.Key
+		}
+	}
+
+	return &BSLConfig{
+		Provider:              bsl.Spec.Provider,
+		Bucket:                bucket,
+		Prefix:                prefix,
+		Region:                region,
+		CredentialName:        credName,
+		CredentialKey:         credKey,
+		S3URL:                 s3URL,
+		S3ForcePathStyle:      s3ForcePathStyle,
+		InsecureSkipTLSVerify: insecureSkipTLSVerify,
+		CACert:                caCert,
+	}, nil
+}
+
+// InitObjectStoreFromBSL extracts BSL config, fetches credentials, and initializes
+// an ObjectStore client.
+func InitObjectStoreFromBSL(
+	ctx context.Context,
+	k8sClient client.Client,
+	oadpNamespace string,
+	bsl *velerov1.BackupStorageLocation,
+	factory func(c *UploaderConfig) (velero.ObjectStore, error),
+) (velero.ObjectStore, *BSLConfig, error) {
+	cfg, err := ExtractBSLConfig(bsl)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if cfg.CredentialName == "" {
+		return nil, nil, fmt.Errorf("BSL %s has no credential configured", bsl.Name)
+	}
+
+	credData, err := GetCredentialsFromBSL(ctx, k8sClient, oadpNamespace, bsl)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get BSL credentials: %w", err)
+	}
+
+	if factory == nil {
+		factory = InitObjectStore
+	}
+
+	store, err := factory(&UploaderConfig{
+		BSLProvider:              cfg.Provider,
+		BSLBucket:                cfg.Bucket,
+		BSLPrefix:                cfg.Prefix,
+		BSLRegion:                cfg.Region,
+		BSLS3URL:                 cfg.S3URL,
+		BSLS3ForcePathStyle:      cfg.S3ForcePathStyle,
+		BSLInsecureSkipTLSVerify: cfg.InsecureSkipTLSVerify,
+		BSLCACert:                cfg.CACert,
+		CredentialsData:          credData,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to initialize object store: %w", err)
+	}
+
+	return store, cfg, nil
+}
+
+// GetCredentialsFromBSL reads the BSL credential secret and returns the raw
+// credential bytes. The credentials are kept in memory and never written to disk.
+func GetCredentialsFromBSL(
+	ctx context.Context, k8sClient client.Client, oadpNamespace string, bsl *velerov1.BackupStorageLocation,
+) ([]byte, error) {
+	if bsl.Spec.Credential == nil {
+		return nil, fmt.Errorf("BSL %s has no credential configured", bsl.Name)
+	}
+
+	secretName := bsl.Spec.Credential.Name
+	secretKey := bsl.Spec.Credential.Key
+	if secretKey == "" {
+		secretKey = DefaultCredentialKey
+	}
+
+	// BSL credentials secret is in the same namespace as the BSL
+	namespace := bsl.Namespace
+	if namespace == "" {
+		namespace = oadpNamespace
+	}
+
+	// Fetch the secret
+	secret := &corev1.Secret{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{
+		Name: secretName, Namespace: namespace,
+	}, secret); err != nil {
+		return nil, fmt.Errorf(
+			"failed to get credential secret %s/%s: %w",
+			namespace, secretName, err,
+		)
+	}
+
+	credData, ok := secret.Data[secretKey]
+	if !ok {
+		return nil, fmt.Errorf(
+			"credential secret %s/%s does not contain key %q",
+			namespace, secretName, secretKey,
+		)
+	}
+
+	return credData, nil
 }
