@@ -87,6 +87,7 @@ func main() {
 	var datamoverImage string
 	var datamoverImagePullPolicy string
 	var oadpNamespace string
+	var maxIncrementalBackups int
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -113,11 +114,18 @@ func main() {
 		"Image pull policy for datamover pods (Always, IfNotPresent, Never)")
 	flag.StringVar(&oadpNamespace, "oadp-namespace", "openshift-adp",
 		"Namespace where OADP/Velero resources are located")
+	flag.IntVar(&maxIncrementalBackups, "max-incremental-backups", 0,
+		"Maximum number of incremental backups per VM before forcing a full backup (0 = unlimited)")
 	opts := zap.Options{
 		Development: true,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+
+	if maxIncrementalBackups < 0 {
+		fmt.Fprintln(os.Stderr, "--max-incremental-backups must be >= 0")
+		os.Exit(1)
+	}
 
 	// Allow DATAMOVER_IMAGE env var to override the default
 	// This enables kustomize to set the image via environment variable
@@ -226,6 +234,7 @@ func main() {
 		MaxConcurrentReconciles:  maxConcurrentReconciles,
 		DatamoverImage:           datamoverImage,
 		DatamoverImagePullPolicy: corev1.PullPolicy(datamoverImagePullPolicy),
+		MaxIncrementalBackups:    maxIncrementalBackups,
 		OADPNamespace:            oadpNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "KubeVirtDataUpload")
