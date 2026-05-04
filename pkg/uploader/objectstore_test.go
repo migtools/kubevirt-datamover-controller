@@ -254,6 +254,55 @@ func TestS3ObjectStoreInit(t *testing.T) {
 	}
 }
 
+func TestInitObjectStoreWithCredentialsData(t *testing.T) {
+	tests := []struct {
+		name        string
+		credData    string
+		expectError bool
+	}{
+		{
+			name: "standard unquoted credentials",
+			credData: "[default]\n" +
+				"aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n" +
+				"aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n",
+			expectError: false,
+		},
+		{
+			name: "quoted credentials (the bug this fixes)",
+			credData: "[default]\n" +
+				"aws_access_key_id = \"AKIAIOSFODNN7EXAMPLE\"\n" +
+				"aws_secret_access_key = \"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\"\n",
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &UploaderConfig{
+				BSLProvider:     "aws",
+				BSLBucket:       "test-bucket",
+				BSLRegion:       "us-east-1",
+				CredentialsData: []byte(tt.credData),
+			}
+
+			store, err := InitObjectStore(cfg)
+
+			if tt.expectError {
+				if err == nil {
+					t.Error("expected error but got none")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if store == nil {
+					t.Error("expected non-nil store")
+				}
+			}
+		})
+	}
+}
+
 func TestInitObjectStore(t *testing.T) {
 	tests := []struct {
 		name        string
