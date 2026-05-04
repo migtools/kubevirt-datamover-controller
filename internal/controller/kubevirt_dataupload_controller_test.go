@@ -2840,7 +2840,7 @@ func TestGetCredentialsFromBSL(t *testing.T) {
 				OADPNamespace: "openshift-adp",
 			}
 
-			credData, err := r.getCredentialsFromBSL(context.Background(), tt.bsl)
+			credData, err := uploader.GetCredentialsFromBSL(context.Background(), fakeClient, "openshift-adp", tt.bsl)
 
 			if tt.expectError {
 				if err == nil {
@@ -4195,7 +4195,7 @@ func TestGetCredentialsFromBSL_ReturnsRawBytes(t *testing.T) {
 		},
 	}
 
-	credData, err := r.getCredentialsFromBSL(context.Background(), bsl)
+	credData, err := uploader.GetCredentialsFromBSL(context.Background(), fakeClient, "openshift-adp", bsl)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
