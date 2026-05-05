@@ -46,23 +46,6 @@ import (
 
 const apiGroupKubeVirt = "kubevirt.io"
 
-// Helper functions for working with velero.ObjectStore interface
-
-// putObjectBytes uploads bytes to the object store.
-func putObjectBytes(store velero.ObjectStore, bucket, key string, data []byte) error {
-	return store.PutObject(bucket, key, bytes.NewReader(data))
-}
-
-// getObjectBytes downloads an object as bytes from the object store.
-func getObjectBytes(store velero.ObjectStore, bucket, key string) ([]byte, error) {
-	reader, err := store.GetObject(bucket, key)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = reader.Close() }()
-	return io.ReadAll(reader)
-}
-
 // Run is the main entrypoint for the uploader.
 func Run(ctx context.Context, logger logr.Logger) error {
 	logger.Info("Starting kubevirt datamover uploader")
@@ -299,7 +282,7 @@ func updateVMIndex(
 	}
 
 	if exists {
-		data, err := getObjectBytes(store, config.BSLBucket, indexPath)
+		data, err := GetObjectBytes(store, config.BSLBucket, indexPath)
 		if err != nil {
 			return fmt.Errorf("failed to read existing VM index: %w", err)
 		}
@@ -429,7 +412,7 @@ func updateVMIndex(
 		return fmt.Errorf("failed to marshal VM index: %w", err)
 	}
 
-	if err := putObjectBytes(store, config.BSLBucket, indexPath, indexData); err != nil {
+	if err := PutObjectBytes(store, config.BSLBucket, indexPath, indexData); err != nil {
 		return fmt.Errorf("failed to write VM index: %w", err)
 	}
 
@@ -447,7 +430,7 @@ func updateBackupManifests(
 
 	// Load the VM index to get the checkpoint chain
 	indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", config.VMNamespace, config.VMName)
-	data, err := getObjectBytes(store, config.BSLBucket, indexPath)
+	data, err := GetObjectBytes(store, config.BSLBucket, indexPath)
 	if err != nil {
 		return fmt.Errorf("failed to read VM index: %w", err)
 	}
@@ -482,7 +465,7 @@ func updateBackupManifests(
 	}
 
 	if exists {
-		data, err = getObjectBytes(store, config.BSLBucket, backupIndexPath)
+		data, err = GetObjectBytes(store, config.BSLBucket, backupIndexPath)
 		if err != nil {
 			return fmt.Errorf("failed to read existing backup manifest: %w", err)
 		}
@@ -528,7 +511,7 @@ func updateBackupManifests(
 		return fmt.Errorf("failed to marshal backup manifest: %w", err)
 	}
 
-	if err := putObjectBytes(store, config.BSLBucket, backupIndexPath, manifestData); err != nil {
+	if err := PutObjectBytes(store, config.BSLBucket, backupIndexPath, manifestData); err != nil {
 		return fmt.Errorf("failed to write backup manifest: %w", err)
 	}
 
@@ -546,7 +529,7 @@ func updateBackupManifests(
 		return fmt.Errorf("failed to marshal VM backup manifest: %w", err)
 	}
 
-	if err := putObjectBytes(store, config.BSLBucket, vmManifestPath, vmManifestData); err != nil {
+	if err := PutObjectBytes(store, config.BSLBucket, vmManifestPath, vmManifestData); err != nil {
 		return fmt.Errorf("failed to write VM backup manifest: %w", err)
 	}
 
@@ -588,7 +571,7 @@ func archiveKubeResources(
 
 		paths.VMBObjectPath = fmt.Sprintf("checkpoints/%s/%s/%s/vmb.json",
 			cfg.VMNamespace, cfg.VMName, cfg.CheckpointName)
-		if err := putObjectBytes(store, cfg.BSLBucket, paths.VMBObjectPath, data); err != nil {
+		if err := PutObjectBytes(store, cfg.BSLBucket, paths.VMBObjectPath, data); err != nil {
 			return nil, fmt.Errorf("failed to upload vmb.json: %w", err)
 		}
 		logger.Info("Archived VMB", "path", paths.VMBObjectPath)
@@ -636,7 +619,7 @@ func archiveKubeResources(
 
 		paths.VMBTObjectPath = fmt.Sprintf("checkpoints/%s/%s/%s/vmbt.json",
 			cfg.VMNamespace, cfg.VMName, cfg.CheckpointName)
-		if err := putObjectBytes(store, cfg.BSLBucket, paths.VMBTObjectPath, data); err != nil {
+		if err := PutObjectBytes(store, cfg.BSLBucket, paths.VMBTObjectPath, data); err != nil {
 			return nil, fmt.Errorf("failed to upload vmbt.json: %w", err)
 		}
 		logger.Info("Archived VMBT", "path", paths.VMBTObjectPath)

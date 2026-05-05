@@ -363,6 +363,21 @@ func buildTLSHTTPClient(insecureSkipTLSVerify bool, caCert string) (*http.Client
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.TLSClientConfig = tlsConfig
 	return &http.Client{Transport: tr}, nil
+
+// PutObjectBytes uploads bytes to a velero.ObjectStore.
+func PutObjectBytes(store velero.ObjectStore, bucket, key string, data []byte) error {
+	return store.PutObject(bucket, key, bytes.NewReader(data))
+}
+
+// GetObjectBytes downloads an object as bytes from a velero.ObjectStore.
+func GetObjectBytes(store velero.ObjectStore, bucket, key string) ([]byte, error) {
+	reader, err := store.GetObject(bucket, key)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = reader.Close() }()
+
+	return io.ReadAll(reader)
 }
 
 // writeCredentialsToTempFile writes credential data to a temporary file and returns
