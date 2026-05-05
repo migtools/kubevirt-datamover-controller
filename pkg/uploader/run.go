@@ -17,11 +17,9 @@ limitations under the License.
 package uploader
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
