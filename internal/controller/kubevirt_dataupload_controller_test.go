@@ -2835,11 +2835,6 @@ func TestGetCredentialsFromBSL(t *testing.T) {
 			}
 			fakeClient := builder.Build()
 
-			r := &KubeVirtDataUploadReconciler{
-				Client:        fakeClient,
-				OADPNamespace: "openshift-adp",
-			}
-
 			credData, err := uploader.GetCredentialsFromBSL(context.Background(), fakeClient, "openshift-adp", tt.bsl)
 
 			if tt.expectError {
@@ -4177,11 +4172,6 @@ func TestGetCredentialsFromBSL_ReturnsRawBytes(t *testing.T) {
 		WithObjects(credSecret).
 		Build()
 
-	r := &KubeVirtDataUploadReconciler{
-		Client:        fakeClient,
-		OADPNamespace: "openshift-adp",
-	}
-
 	bsl := &velerov1.BackupStorageLocation{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "default",
@@ -4211,7 +4201,7 @@ func TestExtractBSLConfig(t *testing.T) {
 		bsl           *velerov1.BackupStorageLocation
 		expectError   bool
 		errorContains string
-		validate      func(*testing.T, *bslConfig)
+		validate      func(*testing.T, *uploader.BSLConfig)
 	}{
 		{
 			name: "full config with prefix",
@@ -4232,7 +4222,7 @@ func TestExtractBSLConfig(t *testing.T) {
 					},
 				},
 			},
-			validate: func(t *testing.T, cfg *bslConfig) {
+			validate: func(t *testing.T, cfg *uploader.BSLConfig) {
 				if cfg.Provider != "aws" {
 					t.Errorf("Provider = %q, want %q", cfg.Provider, "aws")
 				}
@@ -4270,7 +4260,7 @@ func TestExtractBSLConfig(t *testing.T) {
 					},
 				},
 			},
-			validate: func(t *testing.T, cfg *bslConfig) {
+			validate: func(t *testing.T, cfg *uploader.BSLConfig) {
 				if cfg.Prefix != "kubevirt-datamover" {
 					t.Errorf("Prefix = %q, want %q", cfg.Prefix, "kubevirt-datamover")
 				}
@@ -4323,7 +4313,7 @@ func TestExtractBSLConfig(t *testing.T) {
 					},
 				},
 			},
-			validate: func(t *testing.T, cfg *bslConfig) {
+			validate: func(t *testing.T, cfg *uploader.BSLConfig) {
 				if cfg.Region != "" {
 					t.Errorf("Region = %q, want empty", cfg.Region)
 				}
@@ -4343,7 +4333,7 @@ func TestExtractBSLConfig(t *testing.T) {
 					Credential: nil,
 				},
 			},
-			validate: func(t *testing.T, cfg *bslConfig) {
+			validate: func(t *testing.T, cfg *uploader.BSLConfig) {
 				if cfg.CredentialName != "" {
 					t.Errorf("CredentialName = %q, want empty", cfg.CredentialName)
 				}
@@ -4366,7 +4356,7 @@ func TestExtractBSLConfig(t *testing.T) {
 					},
 				},
 			},
-			validate: func(t *testing.T, cfg *bslConfig) {
+			validate: func(t *testing.T, cfg *uploader.BSLConfig) {
 				if cfg.CredentialKey != "cloud" {
 					t.Errorf("CredentialKey = %q, want %q", cfg.CredentialKey, "cloud")
 				}
@@ -4477,7 +4467,7 @@ func TestExtractBSLConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg, err := extractBSLConfig(tt.bsl)
+			cfg, err := uploader.ExtractBSLConfig(tt.bsl)
 
 			if tt.expectError {
 				if err == nil {
