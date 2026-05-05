@@ -114,7 +114,7 @@ func LookupLatestCheckpoint(
 
 // loadVMIndex reads and parses the VM checkpoint index from BSL.
 func loadVMIndex(store velero.ObjectStore, bucket, indexPath string) (*VMIndex, error) {
-	data, err := getObjectBytes(store, bucket, indexPath)
+	data, err := GetObjectBytes(store, bucket, indexPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read VM index at %s: %w", indexPath, err)
 	}
