@@ -270,3 +270,12 @@ type VMBackupManifest struct {
 	// Timestamp when this manifest was created
 	Timestamp time.Time `json:"timestamp,omitempty"`
 }
+
+// CheckpointIDs returns a slice containing the ID field from each CheckpointEntry.
+func CheckpointIDs(checkpoints []CheckpointEntry) []string {
+	ids := make([]string, len(checkpoints))
+	for i, cp := range checkpoints {
+		ids[i] = cp.ID
+	}
+	return ids
+}
