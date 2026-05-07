@@ -627,6 +627,22 @@ func DeleteVMBT(store velero.ObjectStore, ns, name, checkpoint, bucket string) e
 
 }
 
+// GetQCOWPath gets the path for the VMBackupTracker
+func GetQCOWPath(ns, name, checkpoint, qcowName string) string {
+	return fmt.Sprintf("checkpoints/%s/%s/%s/%s", ns, name, checkpoint, qcowName)
+}
+
+// DeleteVMBT deletes a qcow2 file from s3
+func DeleteQCOW(store velero.ObjectStore, ns, name, checkpoint, qcowName, bucket string) error {
+	qcowPath := GetQCOWPath(ns, name, checkpoint, qcowName)
+
+	if err := store.DeleteObject(bucket, qcowPath); err != nil {
+		return fmt.Errorf("failed to delete %s: %w", qcowName, err)
+	}
+	return nil
+
+}
+
 // writeCredentialsToTempFile writes credential data to a temporary file and returns
 // the file path. The caller is responsible for removing the file when done.
 // The file is created with restrictive permissions (0600) to protect credentials.
