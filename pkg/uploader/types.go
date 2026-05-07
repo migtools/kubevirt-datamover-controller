@@ -262,8 +262,7 @@ type VMBackupManifest struct {
 
 	// CheckpointChain is the ordered list of checkpoints needed for restore.
 	// The first entry is the full backup, followed by incrementals.
-	// Enhanced: contains full checkpoint objects for self-contained restore.
-	CheckpointChain []CheckpointEntry `json:"checkpointChain"`
+	CheckpointChain []string `json:"checkpointChain"`
 
 	// BackupName is the Velero backup this manifest belongs to
 	BackupName string `json:"backupName,omitempty"`
