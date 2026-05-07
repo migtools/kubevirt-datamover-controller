@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -36,11 +37,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/go-logr/logr"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -378,6 +381,250 @@ func GetObjectBytes(store velero.ObjectStore, bucket, key string) ([]byte, error
 	defer func() { _ = reader.Close() }()
 
 	return io.ReadAll(reader)
+}
+
+// GetVMIndex returns a VMIndex for this VM if it exists
+func GetVMIndex(store velero.ObjectStore, ns, name, bucket string, logger logr.Logger) (VMIndex, bool, error) {
+	indexPath := GetVMIndexPath(ns, name)
+	// Try to load existing index
+	var vmIndex VMIndex
+
+	exists, err := store.ObjectExists(bucket, indexPath)
+	if err != nil {
+		return vmIndex, false, fmt.Errorf("failed to check if VM index exists: %w", err)
+	}
+	if exists {
+		data, err := GetObjectBytes(store, bucket, indexPath)
+		if err != nil {
+			return vmIndex, false, fmt.Errorf("failed to read existing VM index: %w", err)
+		}
+		if err := json.Unmarshal(data, &vmIndex); err != nil {
+			logger.Info("Failed to parse existing index, creating new", "reason", err.Error())
+			exists = false
+		}
+	}
+	if !exists {
+		// Index doesn't exist, create new
+		vmIndex = VMIndex{
+			VMName:      name,
+			Namespace:   ns,
+			Checkpoints: []CheckpointEntry{},
+		}
+	}
+	return vmIndex, exists, nil
+}
+
+// GetVMIndexPath gets the path for the VMIndex
+func GetVMIndexPath(ns, name string) string {
+	return fmt.Sprintf("checkpoints/%s/%s/index.json", ns, name)
+}
+
+// PutVMIndex uploads a VMIndex to s3
+func PutVMIndex(store velero.ObjectStore, ns, name, bucket string, vmIndex VMIndex) error {
+	// Write updated index
+	indexPath := GetVMIndexPath(ns, name)
+	indexData, err := json.MarshalIndent(vmIndex, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal VM index: %w", err)
+	}
+
+	if err := PutObjectBytes(store, bucket, indexPath, indexData); err != nil {
+		return fmt.Errorf("failed to write VM index: %w", err)
+	}
+	return nil
+}
+
+// GetBackupManifest returns a BackupManifest for this backup if it exists
+func GetBackupManifest(store velero.ObjectStore, backupName, bucket string, logger logr.Logger) (BackupManifest, bool, error) {
+	indexPath := GetBackupManifestPath(backupName)
+	// Try to load existing index
+	var backupManifest BackupManifest
+
+	exists, err := store.ObjectExists(bucket, indexPath)
+	if err != nil {
+		return backupManifest, false, fmt.Errorf("failed to check if backup manifest exists: %w", err)
+	}
+	if exists {
+		data, err := GetObjectBytes(store, bucket, indexPath)
+		if err != nil {
+			return backupManifest, false, fmt.Errorf("failed to read existing backup manifest: %w", err)
+		}
+		if err := json.Unmarshal(data, &backupManifest); err != nil {
+			logger.Info("Failed to parse existing backup manifest, creating new", "reason", err.Error())
+			exists = false
+		}
+	}
+	if !exists {
+		// manifest doesn't exist, create new
+		backupManifest = BackupManifest{
+			BackupName: backupName,
+			Timestamp:  time.Now().UTC(),
+			VMs:        []VMBackupReference{},
+		}
+	}
+	return backupManifest, exists, nil
+}
+
+// GetBackupManifestPath gets the path for the BackupManifest
+func GetBackupManifestPath(backupName string) string {
+	return fmt.Sprintf("manifests/%s/index.json", backupName)
+}
+
+// PutBackupManifest uploads a BackupManifest to s3
+func PutBackupManifest(store velero.ObjectStore, backupName, bucket string, backupManifest BackupManifest) error {
+	// Write updated index
+	indexPath := GetBackupManifestPath(backupName)
+	indexData, err := json.MarshalIndent(backupManifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal backup manifest: %w", err)
+	}
+
+	if err := PutObjectBytes(store, bucket, indexPath, indexData); err != nil {
+		return fmt.Errorf("failed to write backup manifest: %w", err)
+	}
+	return nil
+
+}
+
+// GetVMBackupManifest returns a VMBackupManifest for this backup if it exists
+func GetVMBackupManifest(store velero.ObjectStore, ns, name, backupName, bucket string, logger logr.Logger) (VMBackupManifest, string, bool, error) {
+	manifestPath := GetVMBackupManifestPath(backupName, ns, name)
+	// Try to load existing index
+	var vmBackupManifest VMBackupManifest
+
+	exists, err := store.ObjectExists(bucket, manifestPath)
+	if err != nil {
+		return vmBackupManifest, manifestPath, false, fmt.Errorf("failed to check if VM backup manifest exists: %w", err)
+	}
+	if exists {
+		data, err := GetObjectBytes(store, bucket, manifestPath)
+		if err != nil {
+			return vmBackupManifest, manifestPath, false, fmt.Errorf("failed to read existing vm backup manifest: %w", err)
+		}
+		if err := json.Unmarshal(data, &vmBackupManifest); err != nil {
+			logger.Info("Failed to parse existing vm backup manifest", "reason", err.Error())
+			exists = false
+		}
+	}
+	return vmBackupManifest, manifestPath, exists, nil
+}
+
+// GetVMBackupManifestPath gets the path for the VMBackupManifest
+func GetVMBackupManifestPath(backupName, ns, name string) string {
+	return fmt.Sprintf("manifests/%s/%s-%s.json", backupName, ns, name)
+}
+
+// PutVMBackupManifest uploads a BackupManifest to s3
+func PutVMBackupManifest(store velero.ObjectStore, backupName, ns, name, bucket string, vmBackupManifest VMBackupManifest) error {
+	// Write updated index
+	indexPath := GetVMBackupManifestPath(backupName, ns, name)
+	indexData, err := json.MarshalIndent(vmBackupManifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal VM backup manifest: %w", err)
+	}
+
+	if err := PutObjectBytes(store, bucket, indexPath, indexData); err != nil {
+		return fmt.Errorf("failed to write VM backup manifest: %w", err)
+	}
+	return nil
+
+}
+
+// GetVMBPath gets the path for the VMBackup
+func GetVMBPath(ns, name, checkpoint string) string {
+	return fmt.Sprintf("checkpoints/%s/%s/%s/vmb.json", ns, name, checkpoint)
+}
+
+// PutVMB uploads a VMB to s3
+func PutVMB(store velero.ObjectStore, ns, name, checkpoint, bucket string, vmb *kubevirtbackupv1alpha1.VirtualMachineBackup) error {
+	// Write updated index
+	vmbPath := GetVMBPath(ns, name, checkpoint)
+	vmbData, err := json.MarshalIndent(vmb, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to serialize VMB: %w", err)
+	}
+
+	if err := PutObjectBytes(store, bucket, vmbPath, vmbData); err != nil {
+		return fmt.Errorf("failed to upload vmb.json: %w", err)
+	}
+	return nil
+
+}
+
+// GetVMBTPath gets the path for the VMBackupTracker
+func GetVMBTPath(ns, name, checkpoint string) string {
+	return fmt.Sprintf("checkpoints/%s/%s/%s/vmbt.json", ns, name, checkpoint)
+}
+
+// PutVMBT uploads a VMBT to s3
+func PutVMBT(store velero.ObjectStore, ns, name, checkpoint, bucket string, vmbt *kubevirtbackupv1alpha1.VirtualMachineBackupTracker) error {
+	// Write updated index
+	vmbtPath := GetVMBTPath(ns, name, checkpoint)
+	vmbtData, err := json.MarshalIndent(vmbt, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to serialize VMBT: %w", err)
+	}
+
+	if err := PutObjectBytes(store, bucket, vmbtPath, vmbtData); err != nil {
+		return fmt.Errorf("failed to upload vmbt.json: %w", err)
+	}
+	return nil
+
+}
+
+// DeleteVMIndex deletes a VMIndex from s3
+func DeleteVMIndex(store velero.ObjectStore, ns, name, bucket string) error {
+	manifestPath := GetVMIndexPath(ns, name)
+
+	if err := store.DeleteObject(bucket, manifestPath); err != nil {
+		return fmt.Errorf("failed to delete vm index: %w", err)
+	}
+	return nil
+
+}
+
+// DeleteBackupManifest deletes a BackupManifest from s3
+func DeleteBackupManifest(store velero.ObjectStore, backupName, bucket string) error {
+	manifestPath := GetBackupManifestPath(backupName)
+
+	if err := store.DeleteObject(bucket, manifestPath); err != nil {
+		return fmt.Errorf("failed to delete backup manifest: %w", err)
+	}
+	return nil
+
+}
+
+// DeleteVMBackupManifest deletes a VMBackupManifest from s3
+func DeleteVMBackupManifest(store velero.ObjectStore, backupName, ns, name, bucket string) error {
+	manifestPath := GetVMBackupManifestPath(backupName, ns, name)
+
+	if err := store.DeleteObject(bucket, manifestPath); err != nil {
+		return fmt.Errorf("failed to delete vm backup manifest: %w", err)
+	}
+	return nil
+
+}
+
+// DeleteVMB deletes a VMB from s3
+func DeleteVMB(store velero.ObjectStore, ns, name, checkpoint, bucket string) error {
+	vmbPath := GetVMBPath(ns, name, checkpoint)
+
+	if err := store.DeleteObject(bucket, vmbPath); err != nil {
+		return fmt.Errorf("failed to delete vmbt.json: %w", err)
+	}
+	return nil
+
+}
+
+// DeleteVMBT deletes a VMBT from s3
+func DeleteVMBT(store velero.ObjectStore, ns, name, checkpoint, bucket string) error {
+	vmbtPath := GetVMBTPath(ns, name, checkpoint)
+
+	if err := store.DeleteObject(bucket, vmbtPath); err != nil {
+		return fmt.Errorf("failed to delete vmbt.json: %w", err)
+	}
+	return nil
+
 }
 
 // writeCredentialsToTempFile writes credential data to a temporary file and returns

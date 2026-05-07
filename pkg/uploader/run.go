@@ -18,7 +18,6 @@ package uploader
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -268,33 +267,9 @@ func updateVMIndex(
 	ctx context.Context, store velero.ObjectStore, k8sClient client.Client, config *UploaderConfig,
 	files []CheckpointFile, archived *archivedPaths, logger logr.Logger,
 ) error {
-	indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", config.VMNamespace, config.VMName)
-
-	// Try to load existing index
-	var vmIndex VMIndex
-
-	// First check if index exists to distinguish "not found" from other errors
-	exists, err := store.ObjectExists(config.BSLBucket, indexPath)
+	vmIndex, _, err := GetVMIndex(store, config.VMNamespace, config.VMName, config.BSLBucket, logger)
 	if err != nil {
-		return fmt.Errorf("failed to check if VM index exists: %w", err)
-	}
-
-	if exists {
-		data, err := GetObjectBytes(store, config.BSLBucket, indexPath)
-		if err != nil {
-			return fmt.Errorf("failed to read existing VM index: %w", err)
-		}
-		if err := json.Unmarshal(data, &vmIndex); err != nil {
-			logger.Info("Failed to parse existing index, creating new", "reason", err.Error())
-			vmIndex = VMIndex{}
-		}
-	} else {
-		// Index doesn't exist, create new
-		vmIndex = VMIndex{
-			VMName:      config.VMName,
-			Namespace:   config.VMNamespace,
-			Checkpoints: []CheckpointEntry{},
-		}
+		return err
 	}
 
 	// Create new checkpoint entry
@@ -405,13 +380,8 @@ func updateVMIndex(
 	vmIndex.LastUpdated = time.Now().UTC()
 
 	// Write updated index
-	indexData, err := json.MarshalIndent(vmIndex, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal VM index: %w", err)
-	}
-
-	if err := PutObjectBytes(store, config.BSLBucket, indexPath, indexData); err != nil {
-		return fmt.Errorf("failed to write VM index: %w", err)
+	if err := PutVMIndex(store, config.VMNamespace, config.VMName, config.BSLBucket, vmIndex); err != nil {
+		return err
 	}
 
 	return nil
@@ -427,15 +397,12 @@ func updateBackupManifests(
 	}
 
 	// Load the VM index to get the checkpoint chain
-	indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", config.VMNamespace, config.VMName)
-	data, err := GetObjectBytes(store, config.BSLBucket, indexPath)
+	vmIndex, exists, err := GetVMIndex(store, config.VMNamespace, config.VMName, config.BSLBucket, logger)
 	if err != nil {
-		return fmt.Errorf("failed to read VM index: %w", err)
+		return err
 	}
-
-	var vmIndex VMIndex
-	if err := json.Unmarshal(data, &vmIndex); err != nil {
-		return fmt.Errorf("failed to parse VM index: %w", err)
+	if !exists {
+		return fmt.Errorf("VM index not found for VM: %s/%s", config.VMNamespace, config.VMName)
 	}
 
 	// Build checkpoint chain (for restore)
@@ -452,42 +419,17 @@ func updateBackupManifests(
 	}
 
 	// Create/update per-backup index.json
-	backupIndexPath := fmt.Sprintf("manifests/%s/index.json", config.VeleroBackupName)
-
-	var backupManifest BackupManifest
-
-	// Check if backup manifest exists to distinguish "not found" from other errors
-	exists, err := store.ObjectExists(config.BSLBucket, backupIndexPath)
+	backupManifest, exists, err := GetBackupManifest(store, config.VeleroBackupName, config.BSLBucket, logger)
 	if err != nil {
-		return fmt.Errorf("failed to check if backup manifest exists: %w", err)
-	}
-
-	if exists {
-		data, err = GetObjectBytes(store, config.BSLBucket, backupIndexPath)
-		if err != nil {
-			return fmt.Errorf("failed to read existing backup manifest: %w", err)
-		}
-		if err := json.Unmarshal(data, &backupManifest); err != nil {
-			logger.Info("Failed to parse existing backup manifest, creating new", "reason", err.Error())
-			backupManifest = BackupManifest{}
-		}
-	} else {
-		backupManifest = BackupManifest{
-			BackupName: config.VeleroBackupName,
-			Timestamp:  time.Now().UTC(),
-			VMs:        []VMBackupReference{},
-		}
+		return err
 	}
 
 	// Add/update VM reference
-	vmManifestPath := fmt.Sprintf("manifests/%s/%s-%s.json",
-		config.VeleroBackupName, config.VMNamespace, config.VMName)
-
 	vmRef := VMBackupReference{
 		Name:         config.VMName,
 		Namespace:    config.VMNamespace,
 		CheckpointID: config.CheckpointName,
-		ManifestPath: vmManifestPath,
+		ManifestPath: GetVMBackupManifestPath(config.VeleroBackupName, config.VMNamespace, config.VMName),
 	}
 
 	// Update or add VM reference
@@ -504,13 +446,8 @@ func updateBackupManifests(
 	}
 
 	// Write backup manifest
-	manifestData, err := json.MarshalIndent(backupManifest, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal backup manifest: %w", err)
-	}
-
-	if err := PutObjectBytes(store, config.BSLBucket, backupIndexPath, manifestData); err != nil {
-		return fmt.Errorf("failed to write backup manifest: %w", err)
+	if err := PutBackupManifest(store, config.VeleroBackupName, config.BSLBucket, backupManifest); err != nil {
+		return err
 	}
 
 	// Create per-VM backup manifest
@@ -522,13 +459,8 @@ func updateBackupManifests(
 		Timestamp:       time.Now().UTC(),
 	}
 
-	vmManifestData, err := json.MarshalIndent(vmBackupManifest, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal VM backup manifest: %w", err)
-	}
-
-	if err := PutObjectBytes(store, config.BSLBucket, vmManifestPath, vmManifestData); err != nil {
-		return fmt.Errorf("failed to write VM backup manifest: %w", err)
+	if err := PutVMBackupManifest(store, config.BSLBucket, config.VeleroBackupName, config.VMNamespace, config.VMName, vmBackupManifest); err != nil {
+		return err
 	}
 
 	return nil
@@ -562,15 +494,9 @@ func archiveKubeResources(
 			return nil, fmt.Errorf("failed to fetch VMB %s/%s: %w", cfg.VMNamespace, cfg.VMBName, err)
 		}
 
-		data, err := json.MarshalIndent(vmb, "", "  ")
-		if err != nil {
-			return nil, fmt.Errorf("failed to serialize VMB: %w", err)
-		}
-
-		paths.VMBObjectPath = fmt.Sprintf("checkpoints/%s/%s/%s/vmb.json",
-			cfg.VMNamespace, cfg.VMName, cfg.CheckpointName)
-		if err := PutObjectBytes(store, cfg.BSLBucket, paths.VMBObjectPath, data); err != nil {
-			return nil, fmt.Errorf("failed to upload vmb.json: %w", err)
+		paths.VMBObjectPath = GetVMBPath(cfg.VMNamespace, cfg.VMName, cfg.CheckpointName)
+		if err := PutVMB(store, cfg.VMNamespace, cfg.VMName, cfg.CheckpointName, cfg.BSLBucket, vmb); err != nil {
+			return nil, err
 		}
 		logger.Info("Archived VMB", "path", paths.VMBObjectPath)
 	}
@@ -610,15 +536,9 @@ func archiveKubeResources(
 				"latestCheckpoint", cfg.CheckpointName)
 		}
 
-		data, err := json.MarshalIndent(vmbt, "", "  ")
-		if err != nil {
-			return nil, fmt.Errorf("failed to serialize VMBT: %w", err)
-		}
-
-		paths.VMBTObjectPath = fmt.Sprintf("checkpoints/%s/%s/%s/vmbt.json",
-			cfg.VMNamespace, cfg.VMName, cfg.CheckpointName)
-		if err := PutObjectBytes(store, cfg.BSLBucket, paths.VMBTObjectPath, data); err != nil {
-			return nil, fmt.Errorf("failed to upload vmbt.json: %w", err)
+		paths.VMBTObjectPath = GetVMBTPath(cfg.VMNamespace, cfg.VMName, cfg.CheckpointName)
+		if err := PutVMBT(store, cfg.VMNamespace, cfg.VMName, cfg.CheckpointName, cfg.BSLBucket, vmbt); err != nil {
+			return nil, err
 		}
 		logger.Info("Archived VMBT", "path", paths.VMBTObjectPath)
 	}
