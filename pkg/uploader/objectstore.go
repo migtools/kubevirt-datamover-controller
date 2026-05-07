@@ -487,26 +487,26 @@ func PutBackupManifest(store velero.ObjectStore, backupName, bucket string, back
 }
 
 // GetVMBackupManifest returns a VMBackupManifest for this backup if it exists
-func GetVMBackupManifest(store velero.ObjectStore, ns, name, backupName, bucket string, logger logr.Logger) (VMBackupManifest, string, bool, error) {
+func GetVMBackupManifest(store velero.ObjectStore, ns, name, backupName, bucket string, logger logr.Logger) (VMBackupManifest, bool, error) {
 	manifestPath := GetVMBackupManifestPath(backupName, ns, name)
 	// Try to load existing index
 	var vmBackupManifest VMBackupManifest
 
 	exists, err := store.ObjectExists(bucket, manifestPath)
 	if err != nil {
-		return vmBackupManifest, manifestPath, false, fmt.Errorf("failed to check if VM backup manifest exists: %w", err)
+		return vmBackupManifest, false, fmt.Errorf("failed to check if VM backup manifest exists: %w", err)
 	}
 	if exists {
 		data, err := GetObjectBytes(store, bucket, manifestPath)
 		if err != nil {
-			return vmBackupManifest, manifestPath, false, fmt.Errorf("failed to read existing vm backup manifest: %w", err)
+			return vmBackupManifest, false, fmt.Errorf("failed to read existing vm backup manifest: %w", err)
 		}
 		if err := json.Unmarshal(data, &vmBackupManifest); err != nil {
 			logger.Info("Failed to parse existing vm backup manifest", "reason", err.Error())
 			exists = false
 		}
 	}
-	return vmBackupManifest, manifestPath, exists, nil
+	return vmBackupManifest, exists, nil
 }
 
 // GetVMBackupManifestPath gets the path for the VMBackupManifest
