@@ -1492,7 +1492,7 @@ func TestUpdateBackupManifests(t *testing.T) {
 			vmManifest := VMBackupManifest{
 				Namespace:       tt.config.VMNamespace,
 				Name:            tt.config.VMName,
-				CheckpointChain: chain,
+				CheckpointChain: CheckpointIDs(chain),
 				BackupName:      tt.config.VeleroBackupName,
 			}
 			vmManifestData, _ := json.Marshal(vmManifest)

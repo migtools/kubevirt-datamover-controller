@@ -219,14 +219,11 @@ func TestBackupManifestJSONSerialization(t *testing.T) {
 
 func TestVMBackupManifestJSONSerialization(t *testing.T) {
 	manifest := VMBackupManifest{
-		Namespace: "test-ns",
-		Name:      "test-vm",
-		CheckpointChain: []CheckpointEntry{
-			{ID: "cp-001", Type: "full"},
-			{ID: "cp-002", Type: "incremental", Parent: "cp-001"},
-		},
-		BackupName: "velero-backup-001",
-		Timestamp:  time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC),
+		Namespace:       "test-ns",
+		Name:            "test-vm",
+		CheckpointChain: []string{"cp-001", "cp-002"},
+		BackupName:      "velero-backup-001",
+		Timestamp:       time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC),
 	}
 
 	data, err := json.Marshal(manifest)

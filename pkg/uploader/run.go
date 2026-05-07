@@ -454,7 +454,7 @@ func updateBackupManifests(
 	vmBackupManifest := VMBackupManifest{
 		Namespace:       config.VMNamespace,
 		Name:            config.VMName,
-		CheckpointChain: chain,
+		CheckpointChain: CheckpointIDs(chain),
 		BackupName:      config.VeleroBackupName,
 		Timestamp:       time.Now().UTC(),
 	}
