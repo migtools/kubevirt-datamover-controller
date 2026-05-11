@@ -17,9 +17,18 @@ limitations under the License.
 package uploader
 
 import (
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestS3ObjectStoreFullKey(t *testing.T) {
@@ -344,4 +353,188 @@ func TestInitObjectStore(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIsValidS3URLScheme(t *testing.T) {
+	tests := []struct {
+		url  string
+		want bool
+	}{
+		{"https://minio.example.com", true},
+		{"http://minio.example.com", true},
+		{"https://minio.example.com:9000", true},
+		{"http://10.0.0.1:9000", true},
+		{"ftp://minio.example.com", false},
+		{"s3://my-bucket", false},
+		{"", false},
+		{"not-a-url", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.url, func(t *testing.T) {
+			if got := isValidS3URLScheme(tt.url); got != tt.want {
+				t.Errorf("isValidS3URLScheme(%q) = %v, want %v", tt.url, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildTLSHTTPClient(t *testing.T) {
+	t.Run("insecure skip verify only", func(t *testing.T) {
+		client, err := buildTLSHTTPClient(true, "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if client == nil {
+			t.Fatal("expected non-nil client")
+		}
+	})
+
+	t.Run("valid CA cert", func(t *testing.T) {
+		caCert := generateTestCACertPEM(t)
+		client, err := buildTLSHTTPClient(false, caCert)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if client == nil {
+			t.Fatal("expected non-nil client")
+		}
+	})
+
+	t.Run("invalid CA cert PEM", func(t *testing.T) {
+		_, err := buildTLSHTTPClient(false, "not-a-valid-pem")
+		if err == nil {
+			t.Error("expected error for invalid PEM, got none")
+		}
+	})
+
+	t.Run("empty CA cert with no insecure", func(t *testing.T) {
+		client, err := buildTLSHTTPClient(false, "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if client == nil {
+			t.Fatal("expected non-nil client")
+		}
+	})
+}
+
+func TestInitWithS3URL(t *testing.T) {
+	store := &S3ObjectStore{}
+	err := store.Init(map[string]string{
+		"bucket": "test-bucket",
+		"region": "us-east-1",
+		"s3Url":  "https://minio.example.com",
+	})
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestInitWithInvalidS3URLScheme(t *testing.T) {
+	tests := []struct {
+		name  string
+		s3URL string
+	}{
+		{"ftp scheme", "ftp://minio.example.com"},
+		{"s3 scheme", "s3://my-bucket"},
+		{"no scheme", "minio.example.com"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &S3ObjectStore{}
+			err := store.Init(map[string]string{
+				"bucket": "test-bucket",
+				"s3Url":  tt.s3URL,
+			})
+			if err == nil {
+				t.Error("expected error for invalid s3Url scheme, got none")
+			}
+		})
+	}
+}
+
+func TestInitWithForcePathStyle(t *testing.T) {
+	store := &S3ObjectStore{}
+	err := store.Init(map[string]string{
+		"bucket":           "test-bucket",
+		"region":           "us-east-1",
+		"s3Url":            "https://minio.example.com",
+		"s3ForcePathStyle": "true",
+	})
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestInitWithCACert(t *testing.T) {
+	caCert := generateTestCACertPEM(t)
+	store := &S3ObjectStore{}
+	err := store.Init(map[string]string{
+		"bucket": "test-bucket",
+		"region": "us-east-1",
+		"caCert": caCert,
+	})
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestInitWithInvalidCACert(t *testing.T) {
+	store := &S3ObjectStore{}
+	err := store.Init(map[string]string{
+		"bucket": "test-bucket",
+		"region": "us-east-1",
+		"caCert": "not-a-valid-pem",
+	})
+	if err == nil {
+		t.Error("expected error for invalid CA cert, got none")
+	}
+}
+
+func TestInitWithAllS3CompatibleOptions(t *testing.T) {
+	caCert := generateTestCACertPEM(t)
+	store := &S3ObjectStore{}
+	err := store.Init(map[string]string{
+		"bucket":                "test-bucket",
+		"region":                "us-east-1",
+		"s3Url":                 "https://minio.example.com:9000",
+		"s3ForcePathStyle":      "true",
+		"insecureSkipTLSVerify": "false",
+		"caCert":                caCert,
+	})
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// generateTestCACertPEM creates a self-signed CA certificate PEM at runtime for testing.
+func generateTestCACertPEM(t *testing.T) string {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate key: %v", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-ca"},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("failed to create certificate: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: certDER}); err != nil {
+		t.Fatalf("failed to encode PEM: %v", err)
+	}
+	return buf.String()
 }
