@@ -419,7 +419,7 @@ func updateBackupManifests(
 	}
 
 	// Create/update per-backup index.json
-	backupManifest, exists, err := GetBackupManifest(store, config.VeleroBackupName, config.BSLBucket, logger)
+	backupManifest, _, err := GetBackupManifest(store, config.VeleroBackupName, config.BSLBucket, logger)
 	if err != nil {
 		return err
 	}
@@ -459,7 +459,14 @@ func updateBackupManifests(
 		Timestamp:       time.Now().UTC(),
 	}
 
-	if err := PutVMBackupManifest(store, config.BSLBucket, config.VeleroBackupName, config.VMNamespace, config.VMName, vmBackupManifest); err != nil {
+	if err := PutVMBackupManifest(
+		store,
+		config.BSLBucket,
+		config.VeleroBackupName,
+		config.VMNamespace,
+		config.VMName,
+		vmBackupManifest,
+	); err != nil {
 		return err
 	}
 

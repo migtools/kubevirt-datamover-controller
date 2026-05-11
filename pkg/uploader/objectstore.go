@@ -435,7 +435,11 @@ func PutVMIndex(store velero.ObjectStore, ns, name, bucket string, vmIndex VMInd
 }
 
 // GetBackupManifest returns a BackupManifest for this backup if it exists
-func GetBackupManifest(store velero.ObjectStore, backupName, bucket string, logger logr.Logger) (BackupManifest, bool, error) {
+func GetBackupManifest(
+	store velero.ObjectStore,
+	backupName, bucket string,
+	logger logr.Logger,
+) (BackupManifest, bool, error) {
 	indexPath := GetBackupManifestPath(backupName)
 	// Try to load existing index
 	var backupManifest BackupManifest
@@ -487,7 +491,11 @@ func PutBackupManifest(store velero.ObjectStore, backupName, bucket string, back
 }
 
 // GetVMBackupManifest returns a VMBackupManifest for this backup if it exists
-func GetVMBackupManifest(store velero.ObjectStore, ns, name, backupName, bucket string, logger logr.Logger) (VMBackupManifest, bool, error) {
+func GetVMBackupManifest(
+	store velero.ObjectStore,
+	ns, name, backupName, bucket string,
+	logger logr.Logger,
+) (VMBackupManifest, bool, error) {
 	manifestPath := GetVMBackupManifestPath(backupName, ns, name)
 	// Try to load existing index
 	var vmBackupManifest VMBackupManifest
@@ -515,7 +523,11 @@ func GetVMBackupManifestPath(backupName, ns, name string) string {
 }
 
 // PutVMBackupManifest uploads a BackupManifest to s3
-func PutVMBackupManifest(store velero.ObjectStore, backupName, ns, name, bucket string, vmBackupManifest VMBackupManifest) error {
+func PutVMBackupManifest(
+	store velero.ObjectStore,
+	backupName, ns, name, bucket string,
+	vmBackupManifest VMBackupManifest,
+) error {
 	// Write updated index
 	indexPath := GetVMBackupManifestPath(backupName, ns, name)
 	indexData, err := json.MarshalIndent(vmBackupManifest, "", "  ")
@@ -536,7 +548,11 @@ func GetVMBPath(ns, name, checkpoint string) string {
 }
 
 // PutVMB uploads a VMB to s3
-func PutVMB(store velero.ObjectStore, ns, name, checkpoint, bucket string, vmb *kubevirtbackupv1alpha1.VirtualMachineBackup) error {
+func PutVMB(
+	store velero.ObjectStore,
+	ns, name, checkpoint, bucket string,
+	vmb *kubevirtbackupv1alpha1.VirtualMachineBackup,
+) error {
 	// Write updated index
 	vmbPath := GetVMBPath(ns, name, checkpoint)
 	vmbData, err := json.MarshalIndent(vmb, "", "  ")
@@ -557,7 +573,11 @@ func GetVMBTPath(ns, name, checkpoint string) string {
 }
 
 // PutVMBT uploads a VMBT to s3
-func PutVMBT(store velero.ObjectStore, ns, name, checkpoint, bucket string, vmbt *kubevirtbackupv1alpha1.VirtualMachineBackupTracker) error {
+func PutVMBT(
+	store velero.ObjectStore,
+	ns, name, checkpoint, bucket string,
+	vmbt *kubevirtbackupv1alpha1.VirtualMachineBackupTracker,
+) error {
 	// Write updated index
 	vmbtPath := GetVMBTPath(ns, name, checkpoint)
 	vmbtData, err := json.MarshalIndent(vmbt, "", "  ")
