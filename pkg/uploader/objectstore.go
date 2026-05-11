@@ -19,9 +19,13 @@ package uploader
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -64,10 +68,10 @@ func NewS3ObjectStore(configMap map[string]string) (*S3ObjectStore, error) {
 
 // Init initializes the ObjectStore with the provided config.
 // This implements velero.ObjectStore.Init().
-// Expected config keys: bucket, prefix, region, and optionally credentialsFile
-// (path to credentials file) or credentialsData (raw credential content that
-// will be written to a temp file). Credential parsing is delegated to the AWS
-// SDK via config.WithSharedCredentialsFiles, matching Velero's approach.
+// Expected config keys: bucket, prefix, region, credentialsFile, credentialsData,
+// s3Url, s3ForcePathStyle, insecureSkipTLSVerify, caCert.
+// Credential parsing is delegated to the AWS SDK via
+// config.WithSharedCredentialsFiles, matching Velero's approach.
 func (s *S3ObjectStore) Init(configMap map[string]string) error {
 	bucket := configMap["bucket"]
 	prefix := configMap["prefix"]
@@ -117,12 +121,41 @@ func (s *S3ObjectStore) Init(configMap map[string]string) error {
 		})
 	}))
 
+	// Configure custom TLS for S3-compatible endpoints with private CAs
+	// or when TLS verification needs to be skipped.
+	insecureSkipTLSVerify := strings.EqualFold(configMap["insecureSkipTLSVerify"], "true")
+	caCert := configMap["caCert"]
+	if insecureSkipTLSVerify || caCert != "" {
+		httpClient, err := buildTLSHTTPClient(insecureSkipTLSVerify, caCert)
+		if err != nil {
+			return fmt.Errorf("failed to configure TLS: %w", err)
+		}
+		opts = append(opts, config.WithHTTPClient(httpClient))
+	}
+
 	cfg, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	s.client = s3.NewFromConfig(cfg)
+	// Apply S3-specific options: custom endpoint URL and path-style addressing.
+	s3URL := configMap["s3Url"]
+	forcePathStyle := strings.EqualFold(configMap["s3ForcePathStyle"], "true")
+
+	if s3URL != "" {
+		if !isValidS3URLScheme(s3URL) {
+			return fmt.Errorf("invalid s3Url %q: must start with http:// or https://", s3URL)
+		}
+	}
+
+	s.client = s3.NewFromConfig(cfg, func(o *s3.Options) {
+		if s3URL != "" {
+			o.BaseEndpoint = aws.String(s3URL)
+		}
+		if forcePathStyle {
+			o.UsePathStyle = true
+		}
+	})
 	s.uploader = manager.NewUploader(s.client)
 
 	return nil
@@ -293,6 +326,40 @@ func (s *S3ObjectStore) GetObjectBytes(key string) ([]byte, error) {
 	defer func() { _ = reader.Close() }()
 
 	return io.ReadAll(reader)
+}
+
+// isValidS3URLScheme checks if the URL has a valid scheme (http or https).
+func isValidS3URLScheme(s3URL string) bool {
+	u, err := url.Parse(s3URL)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "http" || u.Scheme == "https"
+}
+
+// buildTLSHTTPClient creates an *http.Client with custom TLS settings
+// for S3-compatible endpoints with private CAs or disabled TLS verification.
+func buildTLSHTTPClient(insecureSkipTLSVerify bool, caCert string) (*http.Client, error) {
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: insecureSkipTLSVerify, //nolint:gosec // User-configured via BSL for private endpoints
+	}
+
+	if caCert != "" {
+		certPool, err := x509.SystemCertPool()
+		if err != nil {
+			certPool = x509.NewCertPool()
+		}
+		if !certPool.AppendCertsFromPEM([]byte(caCert)) {
+			return nil, fmt.Errorf("failed to parse CA certificate PEM")
+		}
+		tlsConfig.RootCAs = certPool
+	}
+
+	return &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
+		},
+	}, nil
 }
 
 // writeCredentialsToTempFile writes credential data to a temporary file and returns
