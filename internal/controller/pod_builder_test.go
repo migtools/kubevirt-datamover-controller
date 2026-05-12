@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
@@ -340,5 +341,84 @@ func TestDatamoverPodConfigDefaults(t *testing.T) {
 	}
 	if envMap[uploader.EnvSourcePVCPath] != uploader.DefaultSourcePVCPath {
 		t.Errorf("source pvc path = %q, want default %q", envMap[uploader.EnvSourcePVCPath], uploader.DefaultSourcePVCPath)
+	}
+}
+
+// TestS3CompatibleBooleanRoundtrip verifies the strconv.FormatBool → env var →
+// strings.EqualFold roundtrip. The controller converts bools to "true"/"false"
+// strings for env vars; the uploader parses them back. Only "true" (case-
+// insensitive) should produce true; "false" must not.
+func TestS3CompatibleBooleanRoundtrip(t *testing.T) {
+	tests := []struct {
+		name                 string
+		s3ForcePathStyle     string
+		insecureSkipTLSVerify string
+		wantForcePathStyle   bool
+		wantInsecureSkip     bool
+	}{
+		{
+			name:                 "both true",
+			s3ForcePathStyle:     "true",
+			insecureSkipTLSVerify: "true",
+			wantForcePathStyle:   true,
+			wantInsecureSkip:     true,
+		},
+		{
+			name:                 "both false (from strconv.FormatBool)",
+			s3ForcePathStyle:     "false",
+			insecureSkipTLSVerify: "false",
+			wantForcePathStyle:   false,
+			wantInsecureSkip:     false,
+		},
+		{
+			name:                 "both empty",
+			s3ForcePathStyle:     "",
+			insecureSkipTLSVerify: "",
+			wantForcePathStyle:   false,
+			wantInsecureSkip:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &DatamoverPodConfig{
+				Name:                     "test",
+				Namespace:                "default",
+				Image:                    "test",
+				CredentialSecretName:     "secret",
+				CredentialSecretKey:      "key",
+				SourcePVCName:            "pvc",
+				BSLS3ForcePathStyle:      tt.s3ForcePathStyle,
+				BSLInsecureSkipTLSVerify: tt.insecureSkipTLSVerify,
+			}
+
+			pod := buildDatamoverPod(config)
+			container := pod.Spec.Containers[0]
+			envMap := make(map[string]string)
+			for _, env := range container.Env {
+				envMap[env.Name] = env.Value
+			}
+
+			// Verify env var values match input
+			if envMap[uploader.EnvBSLS3ForcePathStyle] != tt.s3ForcePathStyle {
+				t.Errorf("env %s = %q, want %q",
+					uploader.EnvBSLS3ForcePathStyle, envMap[uploader.EnvBSLS3ForcePathStyle], tt.s3ForcePathStyle)
+			}
+			if envMap[uploader.EnvBSLInsecureSkipTLSVerify] != tt.insecureSkipTLSVerify {
+				t.Errorf("env %s = %q, want %q",
+					uploader.EnvBSLInsecureSkipTLSVerify, envMap[uploader.EnvBSLInsecureSkipTLSVerify], tt.insecureSkipTLSVerify)
+			}
+
+			// Simulate uploader-side parsing (same logic as LoadConfigFromEnv)
+			gotForcePathStyle := strings.EqualFold(envMap[uploader.EnvBSLS3ForcePathStyle], "true")
+			gotInsecureSkip := strings.EqualFold(envMap[uploader.EnvBSLInsecureSkipTLSVerify], "true")
+
+			if gotForcePathStyle != tt.wantForcePathStyle {
+				t.Errorf("parsed s3ForcePathStyle = %v, want %v", gotForcePathStyle, tt.wantForcePathStyle)
+			}
+			if gotInsecureSkip != tt.wantInsecureSkip {
+				t.Errorf("parsed insecureSkipTLSVerify = %v, want %v", gotInsecureSkip, tt.wantInsecureSkip)
+			}
+		})
 	}
 }

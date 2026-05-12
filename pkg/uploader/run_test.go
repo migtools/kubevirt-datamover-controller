@@ -335,6 +335,26 @@ func TestLoadConfigFromEnv(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "S3-compatible booleans reject non-true values",
+			envVars: map[string]string{
+				EnvBSLBucket:                "test-bucket",
+				EnvVMName:                   "test-vm",
+				EnvVMNamespace:              "test-ns",
+				EnvCheckpointName:           "cp-001",
+				EnvBSLS3ForcePathStyle:      "false",
+				EnvBSLInsecureSkipTLSVerify: "yes",
+			},
+			expectError: false,
+			validate: func(t *testing.T, cfg *UploaderConfig) {
+				if cfg.BSLS3ForcePathStyle {
+					t.Error("BSLS3ForcePathStyle = true for \"false\", want false")
+				}
+				if cfg.BSLInsecureSkipTLSVerify {
+					t.Error("BSLInsecureSkipTLSVerify = true for \"yes\", want false")
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {

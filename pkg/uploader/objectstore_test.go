@@ -509,6 +509,59 @@ func TestInitWithAllS3CompatibleOptions(t *testing.T) {
 	}
 }
 
+func TestInitWithInsecureSkipTLSVerify(t *testing.T) {
+	store := &S3ObjectStore{}
+	err := store.Init(map[string]string{
+		"bucket":                "test-bucket",
+		"region":                "us-east-1",
+		"insecureSkipTLSVerify": "true",
+	})
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestInitObjectStoreWithS3Settings(t *testing.T) {
+	caCert := generateTestCACertPEM(t)
+
+	cfg := &UploaderConfig{
+		BSLProvider:              "aws",
+		BSLBucket:                "test-bucket",
+		BSLRegion:                "us-east-1",
+		BSLS3URL:                 "https://minio.example.com:9000",
+		BSLS3ForcePathStyle:      true,
+		BSLInsecureSkipTLSVerify: false,
+		BSLCACert:                caCert,
+	}
+
+	store, err := InitObjectStore(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store == nil {
+		t.Fatal("expected non-nil store")
+	}
+}
+
+func TestInitObjectStoreWithS3SettingsDefaultProvider(t *testing.T) {
+	// Unknown providers should fall through to S3-compatible
+	cfg := &UploaderConfig{
+		BSLProvider:         "minio",
+		BSLBucket:           "test-bucket",
+		BSLRegion:           "us-east-1",
+		BSLS3URL:            "https://minio.example.com",
+		BSLS3ForcePathStyle: true,
+	}
+
+	store, err := InitObjectStore(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store == nil {
+		t.Fatal("expected non-nil store for unknown provider (S3-compatible fallback)")
+	}
+}
+
 // generateTestCACertPEM creates a self-signed CA certificate PEM at runtime for testing.
 func generateTestCACertPEM(t *testing.T) string {
 	t.Helper()
