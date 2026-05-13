@@ -137,6 +137,7 @@ func TestExtractDiskName(t *testing.T) {
 	}
 }
 
+//nolint:gocyclo // Table-driven test with many validation cases
 func TestLoadConfigFromEnv(t *testing.T) {
 	// Save original env and restore after test
 	originalEnv := map[string]string{

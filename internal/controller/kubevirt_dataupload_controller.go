@@ -1585,10 +1585,10 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 	}
 
 	return &DatamoverPodConfig{
-		Name:                 du.Name, // Used as a prefix for GenerateName
-		Namespace:            vmRef.Namespace,
-		Image:                image,
-		ImagePullPolicy:      pullPolicy,
+		Name:                     du.Name, // Used as a prefix for GenerateName
+		Namespace:                vmRef.Namespace,
+		Image:                    image,
+		ImagePullPolicy:          pullPolicy,
 		BSLProvider:              cfg.Provider,
 		BSLBucket:                cfg.Bucket,
 		BSLPrefix:                cfg.Prefix,
@@ -1599,17 +1599,17 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		BSLCACert:                cfg.CACert,
 		CredentialSecretName:     cfg.CredentialName,
 		CredentialSecretKey:      cfg.CredentialKey,
-		VMName:               vmRef.Name,
-		VMNamespace:          vmRef.Namespace,
-		CheckpointName:       checkpointName,
-		BackupType:           backupType,
-		VeleroBackupName:     getVeleroBackupName(du),
-		DataUploadName:       du.Name,
-		DataUploadUID:        string(du.UID),
-		VMBName:              vmb.Name,
-		VMBTName:             vmbtName,
-		SourcePVCName:        "", // overridden by handlePrepared with the rebound PVC name
-		Labels:               make(map[string]string),
+		VMName:                   vmRef.Name,
+		VMNamespace:              vmRef.Namespace,
+		CheckpointName:           checkpointName,
+		BackupType:               backupType,
+		VeleroBackupName:         getVeleroBackupName(du),
+		DataUploadName:           du.Name,
+		DataUploadUID:            string(du.UID),
+		VMBName:                  vmb.Name,
+		VMBTName:                 vmbtName,
+		SourcePVCName:            "", // overridden by handlePrepared with the rebound PVC name
+		Labels:                   make(map[string]string),
 	}, nil
 }
 
