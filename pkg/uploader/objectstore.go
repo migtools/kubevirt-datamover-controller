@@ -496,7 +496,7 @@ func GetVMBackupManifest(
 	ns, name, backupName, bucket string,
 	logger logr.Logger,
 ) (VMBackupManifest, bool, error) {
-	manifestPath := GetVMBackupManifestPath(backupName, ns, name)
+	manifestPath := GetVMBackupManifestPath(ns, name, backupName)
 	// Try to load existing index
 	var vmBackupManifest VMBackupManifest
 
@@ -525,11 +525,11 @@ func GetVMBackupManifestPath(backupName, ns, name string) string {
 // PutVMBackupManifest uploads a BackupManifest to s3
 func PutVMBackupManifest(
 	store velero.ObjectStore,
-	backupName, ns, name, bucket string,
+	ns, name, backupName, bucket string,
 	vmBackupManifest VMBackupManifest,
 ) error {
 	// Write updated index
-	indexPath := GetVMBackupManifestPath(backupName, ns, name)
+	indexPath := GetVMBackupManifestPath(ns, name, backupName)
 	indexData, err := json.MarshalIndent(vmBackupManifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal VM backup manifest: %w", err)
@@ -615,8 +615,8 @@ func DeleteBackupManifest(store velero.ObjectStore, backupName, bucket string) e
 }
 
 // DeleteVMBackupManifest deletes a VMBackupManifest from s3
-func DeleteVMBackupManifest(store velero.ObjectStore, backupName, ns, name, bucket string) error {
-	manifestPath := GetVMBackupManifestPath(backupName, ns, name)
+func DeleteVMBackupManifest(store velero.ObjectStore, ns, name, backupName, bucket string) error {
+	manifestPath := GetVMBackupManifestPath(ns, name, backupName)
 
 	if err := store.DeleteObject(bucket, manifestPath); err != nil {
 		return fmt.Errorf("failed to delete vm backup manifest: %w", err)
