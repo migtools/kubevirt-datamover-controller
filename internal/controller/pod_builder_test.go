@@ -350,32 +350,32 @@ func TestDatamoverPodConfigDefaults(t *testing.T) {
 // insensitive) should produce true; "false" must not.
 func TestS3CompatibleBooleanRoundtrip(t *testing.T) {
 	tests := []struct {
-		name                 string
-		s3ForcePathStyle     string
+		name                  string
+		s3ForcePathStyle      string
 		insecureSkipTLSVerify string
-		wantForcePathStyle   bool
-		wantInsecureSkip     bool
+		wantForcePathStyle    bool
+		wantInsecureSkip      bool
 	}{
 		{
-			name:                 "both true",
-			s3ForcePathStyle:     "true",
+			name:                  "both true",
+			s3ForcePathStyle:      "true",
 			insecureSkipTLSVerify: "true",
-			wantForcePathStyle:   true,
-			wantInsecureSkip:     true,
+			wantForcePathStyle:    true,
+			wantInsecureSkip:      true,
 		},
 		{
-			name:                 "both false (from strconv.FormatBool)",
-			s3ForcePathStyle:     "false",
+			name:                  "both false (from strconv.FormatBool)",
+			s3ForcePathStyle:      "false",
 			insecureSkipTLSVerify: "false",
-			wantForcePathStyle:   false,
-			wantInsecureSkip:     false,
+			wantForcePathStyle:    false,
+			wantInsecureSkip:      false,
 		},
 		{
-			name:                 "both empty",
-			s3ForcePathStyle:     "",
+			name:                  "both empty",
+			s3ForcePathStyle:      "",
 			insecureSkipTLSVerify: "",
-			wantForcePathStyle:   false,
-			wantInsecureSkip:     false,
+			wantForcePathStyle:    false,
+			wantInsecureSkip:      false,
 		},
 	}
 
