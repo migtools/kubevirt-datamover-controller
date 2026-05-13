@@ -461,10 +461,10 @@ func updateBackupManifests(
 
 	if err := PutVMBackupManifest(
 		store,
-		config.BSLBucket,
 		config.VeleroBackupName,
 		config.VMNamespace,
 		config.VMName,
+		config.BSLBucket,
 		vmBackupManifest,
 	); err != nil {
 		return err
