@@ -355,11 +355,9 @@ func buildTLSHTTPClient(insecureSkipTLSVerify bool, caCert string) (*http.Client
 		tlsConfig.RootCAs = certPool
 	}
 
-	return &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: tlsConfig,
-		},
-	}, nil
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = tlsConfig
+	return &http.Client{Transport: tr}, nil
 }
 
 // writeCredentialsToTempFile writes credential data to a temporary file and returns
