@@ -630,7 +630,7 @@ func DeleteVMB(store velero.ObjectStore, ns, name, checkpoint, bucket string) er
 	vmbPath := GetVMBPath(ns, name, checkpoint)
 
 	if err := store.DeleteObject(bucket, vmbPath); err != nil {
-		return fmt.Errorf("failed to delete vmbt.json: %w", err)
+		return fmt.Errorf("failed to delete vmb.json: %w", err)
 	}
 	return nil
 
@@ -652,7 +652,7 @@ func GetQCOWPath(ns, name, checkpoint, qcowName string) string {
 	return fmt.Sprintf("checkpoints/%s/%s/%s/%s", ns, name, checkpoint, qcowName)
 }
 
-// DeleteVMBT deletes a qcow2 file from s3
+// DeleteQCOW deletes a qcow2 file from s3
 func DeleteQCOW(store velero.ObjectStore, ns, name, checkpoint, qcowName, bucket string) error {
 	qcowPath := GetQCOWPath(ns, name, checkpoint, qcowName)
 
