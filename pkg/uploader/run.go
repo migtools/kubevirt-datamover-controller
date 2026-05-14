@@ -429,7 +429,7 @@ func updateBackupManifests(
 		Name:         config.VMName,
 		Namespace:    config.VMNamespace,
 		CheckpointID: config.CheckpointName,
-		ManifestPath: GetVMBackupManifestPath(config.VeleroBackupName, config.VMNamespace, config.VMName),
+		ManifestPath: GetVMBackupManifestPath(config.VMNamespace, config.VMName, config.VeleroBackupName),
 	}
 
 	// Update or add VM reference
@@ -461,9 +461,9 @@ func updateBackupManifests(
 
 	if err := PutVMBackupManifest(
 		store,
-		config.VeleroBackupName,
 		config.VMNamespace,
 		config.VMName,
+		config.VeleroBackupName,
 		config.BSLBucket,
 		vmBackupManifest,
 	); err != nil {

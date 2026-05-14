@@ -518,7 +518,7 @@ func GetVMBackupManifest(
 }
 
 // GetVMBackupManifestPath gets the path for the VMBackupManifest
-func GetVMBackupManifestPath(backupName, ns, name string) string {
+func GetVMBackupManifestPath(ns, name, backupName string) string {
 	return fmt.Sprintf("manifests/%s/%s-%s.json", backupName, ns, name)
 }
 
