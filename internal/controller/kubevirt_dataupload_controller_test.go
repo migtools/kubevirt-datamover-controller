@@ -4385,7 +4385,7 @@ func TestExtractBSLConfig(t *testing.T) {
 					},
 				},
 			},
-			validate: func(t *testing.T, cfg *bslConfig) {
+			validate: func(t *testing.T, cfg *uploader.BSLConfig) {
 				if cfg.S3URL != "https://minio.example.com" {
 					t.Errorf("S3URL = %q, want %q", cfg.S3URL, "https://minio.example.com")
 				}
@@ -4420,7 +4420,7 @@ func TestExtractBSLConfig(t *testing.T) {
 					},
 				},
 			},
-			validate: func(t *testing.T, cfg *bslConfig) {
+			validate: func(t *testing.T, cfg *uploader.BSLConfig) {
 				if !cfg.S3ForcePathStyle {
 					t.Error("S3ForcePathStyle = false, want true (case-insensitive)")
 				}
@@ -4448,7 +4448,7 @@ func TestExtractBSLConfig(t *testing.T) {
 					},
 				},
 			},
-			validate: func(t *testing.T, cfg *bslConfig) {
+			validate: func(t *testing.T, cfg *uploader.BSLConfig) {
 				if cfg.S3URL != "" {
 					t.Errorf("S3URL = %q, want empty", cfg.S3URL)
 				}

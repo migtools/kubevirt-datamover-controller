@@ -366,6 +366,7 @@ func buildTLSHTTPClient(insecureSkipTLSVerify bool, caCert string) (*http.Client
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.TLSClientConfig = tlsConfig
 	return &http.Client{Transport: tr}, nil
+}
 
 // PutObjectBytes uploads bytes to a velero.ObjectStore.
 func PutObjectBytes(store velero.ObjectStore, bucket, key string, data []byte) error {
