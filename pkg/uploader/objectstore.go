@@ -399,7 +399,7 @@ func GetVMIndex(store velero.ObjectStore, ns, name, bucket string, logger logr.L
 		if err != nil {
 			return vmIndex, false, fmt.Errorf("failed to read existing VM index: %w", err)
 		}
-		if err := json.Unmarshal(data, &vmIndex); err != nil {
+		if err = json.Unmarshal(data, &vmIndex); err != nil {
 			logger.Info("Failed to parse existing index, creating new", "reason", err.Error())
 			exists = false
 		}
@@ -412,7 +412,7 @@ func GetVMIndex(store velero.ObjectStore, ns, name, bucket string, logger logr.L
 			Checkpoints: []CheckpointEntry{},
 		}
 	}
-	return vmIndex, exists, nil
+	return vmIndex, exists, err
 }
 
 // GetVMIndexPath gets the path for the VMIndex
@@ -454,7 +454,7 @@ func GetBackupManifest(
 		if err != nil {
 			return backupManifest, false, fmt.Errorf("failed to read existing backup manifest: %w", err)
 		}
-		if err := json.Unmarshal(data, &backupManifest); err != nil {
+		if err = json.Unmarshal(data, &backupManifest); err != nil {
 			logger.Info("Failed to parse existing backup manifest, creating new", "reason", err.Error())
 			exists = false
 		}
@@ -467,7 +467,7 @@ func GetBackupManifest(
 			VMs:        []VMBackupReference{},
 		}
 	}
-	return backupManifest, exists, nil
+	return backupManifest, exists, err
 }
 
 // GetBackupManifestPath gets the path for the BackupManifest
@@ -510,12 +510,12 @@ func GetVMBackupManifest(
 		if err != nil {
 			return vmBackupManifest, false, fmt.Errorf("failed to read existing vm backup manifest: %w", err)
 		}
-		if err := json.Unmarshal(data, &vmBackupManifest); err != nil {
+		if err = json.Unmarshal(data, &vmBackupManifest); err != nil {
 			logger.Info("Failed to parse existing vm backup manifest", "reason", err.Error())
 			exists = false
 		}
 	}
-	return vmBackupManifest, exists, nil
+	return vmBackupManifest, exists, err
 }
 
 // GetVMBackupManifestPath gets the path for the VMBackupManifest
@@ -648,7 +648,7 @@ func DeleteVMBT(store velero.ObjectStore, ns, name, checkpoint, bucket string) e
 
 }
 
-// GetQCOWPath gets the path for the VMBackupTracker
+// GetQCOWPath gets the path for the qcow2 file
 func GetQCOWPath(ns, name, checkpoint, qcowName string) string {
 	return fmt.Sprintf("checkpoints/%s/%s/%s/%s", ns, name, checkpoint, qcowName)
 }
