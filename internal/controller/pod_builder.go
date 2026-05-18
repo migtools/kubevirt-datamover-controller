@@ -41,6 +41,12 @@ type DatamoverPodConfig struct {
 	BSLPrefix   string
 	BSLRegion   string
 
+	// S3-compatible storage provider settings
+	BSLS3URL                 string
+	BSLS3ForcePathStyle      string
+	BSLInsecureSkipTLSVerify string
+	BSLCACert                string
+
 	// Credentials
 	CredentialSecretName string
 	CredentialSecretKey  string
@@ -85,6 +91,10 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 		{Name: uploader.EnvBSLBucket, Value: config.BSLBucket},
 		{Name: uploader.EnvBSLPrefix, Value: config.BSLPrefix},
 		{Name: uploader.EnvBSLRegion, Value: config.BSLRegion},
+		{Name: uploader.EnvBSLS3URL, Value: config.BSLS3URL},
+		{Name: uploader.EnvBSLS3ForcePathStyle, Value: config.BSLS3ForcePathStyle},
+		{Name: uploader.EnvBSLInsecureSkipTLSVerify, Value: config.BSLInsecureSkipTLSVerify},
+		{Name: uploader.EnvBSLCACert, Value: config.BSLCACert},
 		{Name: uploader.EnvCredentialsFile, Value: uploader.DefaultCredentialsPath},
 		{Name: uploader.EnvVMName, Value: config.VMName},
 		{Name: uploader.EnvVMNamespace, Value: config.VMNamespace},

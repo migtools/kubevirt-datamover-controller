@@ -137,18 +137,23 @@ func TestExtractDiskName(t *testing.T) {
 	}
 }
 
+//nolint:gocyclo // Table-driven test with many validation cases
 func TestLoadConfigFromEnv(t *testing.T) {
 	// Save original env and restore after test
 	originalEnv := map[string]string{
-		EnvBSLBucket:      os.Getenv(EnvBSLBucket),
-		EnvVMName:         os.Getenv(EnvVMName),
-		EnvVMNamespace:    os.Getenv(EnvVMNamespace),
-		EnvBSLProvider:    os.Getenv(EnvBSLProvider),
-		EnvBSLPrefix:      os.Getenv(EnvBSLPrefix),
-		EnvBSLRegion:      os.Getenv(EnvBSLRegion),
-		EnvBackupType:     os.Getenv(EnvBackupType),
-		EnvSourcePVCPath:  os.Getenv(EnvSourcePVCPath),
-		EnvCheckpointName: os.Getenv(EnvCheckpointName),
+		EnvBSLBucket:                os.Getenv(EnvBSLBucket),
+		EnvVMName:                   os.Getenv(EnvVMName),
+		EnvVMNamespace:              os.Getenv(EnvVMNamespace),
+		EnvBSLProvider:              os.Getenv(EnvBSLProvider),
+		EnvBSLPrefix:                os.Getenv(EnvBSLPrefix),
+		EnvBSLRegion:                os.Getenv(EnvBSLRegion),
+		EnvBackupType:               os.Getenv(EnvBackupType),
+		EnvSourcePVCPath:            os.Getenv(EnvSourcePVCPath),
+		EnvCheckpointName:           os.Getenv(EnvCheckpointName),
+		EnvBSLS3URL:                 os.Getenv(EnvBSLS3URL),
+		EnvBSLS3ForcePathStyle:      os.Getenv(EnvBSLS3ForcePathStyle),
+		EnvBSLInsecureSkipTLSVerify: os.Getenv(EnvBSLInsecureSkipTLSVerify),
+		EnvBSLCACert:                os.Getenv(EnvBSLCACert),
 	}
 	defer func() {
 		for k, v := range originalEnv {
@@ -276,6 +281,78 @@ func TestLoadConfigFromEnv(t *testing.T) {
 			validate: func(t *testing.T, cfg *UploaderConfig) {
 				if cfg.BackupType != "incremental" {
 					t.Errorf("BackupType = %q, want %q", cfg.BackupType, "incremental")
+				}
+			},
+		},
+		{
+			name: "S3-compatible settings are parsed",
+			envVars: map[string]string{
+				EnvBSLBucket:                "test-bucket",
+				EnvVMName:                   "test-vm",
+				EnvVMNamespace:              "test-ns",
+				EnvCheckpointName:           "cp-001",
+				EnvBSLS3URL:                 "https://minio.example.com",
+				EnvBSLS3ForcePathStyle:      "true",
+				EnvBSLInsecureSkipTLSVerify: "true",
+				EnvBSLCACert:                "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----",
+			},
+			expectError: false,
+			validate: func(t *testing.T, cfg *UploaderConfig) {
+				if cfg.BSLS3URL != "https://minio.example.com" {
+					t.Errorf("BSLS3URL = %q, want %q", cfg.BSLS3URL, "https://minio.example.com")
+				}
+				if !cfg.BSLS3ForcePathStyle {
+					t.Error("BSLS3ForcePathStyle = false, want true")
+				}
+				if !cfg.BSLInsecureSkipTLSVerify {
+					t.Error("BSLInsecureSkipTLSVerify = false, want true")
+				}
+				if cfg.BSLCACert != "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----" {
+					t.Errorf("BSLCACert = %q, want PEM content", cfg.BSLCACert)
+				}
+			},
+		},
+		{
+			name: "S3-compatible booleans default to false when unset",
+			envVars: map[string]string{
+				EnvBSLBucket:      "test-bucket",
+				EnvVMName:         "test-vm",
+				EnvVMNamespace:    "test-ns",
+				EnvCheckpointName: "cp-001",
+			},
+			expectError: false,
+			validate: func(t *testing.T, cfg *UploaderConfig) {
+				if cfg.BSLS3URL != "" {
+					t.Errorf("BSLS3URL = %q, want empty", cfg.BSLS3URL)
+				}
+				if cfg.BSLS3ForcePathStyle {
+					t.Error("BSLS3ForcePathStyle = true, want false")
+				}
+				if cfg.BSLInsecureSkipTLSVerify {
+					t.Error("BSLInsecureSkipTLSVerify = true, want false")
+				}
+				if cfg.BSLCACert != "" {
+					t.Errorf("BSLCACert = %q, want empty", cfg.BSLCACert)
+				}
+			},
+		},
+		{
+			name: "S3-compatible booleans reject non-true values",
+			envVars: map[string]string{
+				EnvBSLBucket:                "test-bucket",
+				EnvVMName:                   "test-vm",
+				EnvVMNamespace:              "test-ns",
+				EnvCheckpointName:           "cp-001",
+				EnvBSLS3ForcePathStyle:      "false",
+				EnvBSLInsecureSkipTLSVerify: "yes",
+			},
+			expectError: false,
+			validate: func(t *testing.T, cfg *UploaderConfig) {
+				if cfg.BSLS3ForcePathStyle {
+					t.Error("BSLS3ForcePathStyle = true for \"false\", want false")
+				}
+				if cfg.BSLInsecureSkipTLSVerify {
+					t.Error("BSLInsecureSkipTLSVerify = true for \"yes\", want false")
 				}
 			},
 		},

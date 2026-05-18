@@ -19,9 +19,13 @@ package uploader
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -46,24 +50,13 @@ type S3ObjectStore struct {
 	prefix   string
 }
 
-// NewS3ObjectStore creates a new S3ObjectStore.
-// credentialsFile is the path to an AWS credentials file (INI-style).
-// Pass empty string to use the default AWS credential chain (env vars,
-// instance profile, etc.). The file is parsed by the AWS SDK which handles
-// quoted values, profiles, session tokens, and role assumption.
-func NewS3ObjectStore(bucket, prefix, region, credentialsFile string) (*S3ObjectStore, error) {
+// NewS3ObjectStore creates a new S3ObjectStore from a config map.
+// Supported keys: bucket, prefix, region, credentialsFile, credentialsData,
+// s3Url, s3ForcePathStyle, insecureSkipTLSVerify, caCert.
+func NewS3ObjectStore(configMap map[string]string) (*S3ObjectStore, error) {
 	store := &S3ObjectStore{
-		bucket: bucket,
-		prefix: prefix,
-	}
-
-	configMap := map[string]string{
-		"bucket": bucket,
-		"prefix": prefix,
-		"region": region,
-	}
-	if credentialsFile != "" {
-		configMap["credentialsFile"] = credentialsFile
+		bucket: configMap["bucket"],
+		prefix: configMap["prefix"],
 	}
 
 	if err := store.Init(configMap); err != nil {
@@ -75,10 +68,10 @@ func NewS3ObjectStore(bucket, prefix, region, credentialsFile string) (*S3Object
 
 // Init initializes the ObjectStore with the provided config.
 // This implements velero.ObjectStore.Init().
-// Expected config keys: bucket, prefix, region, and optionally credentialsFile
-// (path to credentials file) or credentialsData (raw credential content that
-// will be written to a temp file). Credential parsing is delegated to the AWS
-// SDK via config.WithSharedCredentialsFiles, matching Velero's approach.
+// Expected config keys: bucket, prefix, region, credentialsFile, credentialsData,
+// s3Url, s3ForcePathStyle, insecureSkipTLSVerify, caCert.
+// Credential parsing is delegated to the AWS SDK via
+// config.WithSharedCredentialsFiles, matching Velero's approach.
 func (s *S3ObjectStore) Init(configMap map[string]string) error {
 	bucket := configMap["bucket"]
 	prefix := configMap["prefix"]
@@ -128,12 +121,41 @@ func (s *S3ObjectStore) Init(configMap map[string]string) error {
 		})
 	}))
 
+	// Configure custom TLS for S3-compatible endpoints with private CAs
+	// or when TLS verification needs to be skipped.
+	insecureSkipTLSVerify := strings.EqualFold(configMap["insecureSkipTLSVerify"], "true")
+	caCert := configMap["caCert"]
+	if insecureSkipTLSVerify || caCert != "" {
+		httpClient, err := buildTLSHTTPClient(insecureSkipTLSVerify, caCert)
+		if err != nil {
+			return fmt.Errorf("failed to configure TLS: %w", err)
+		}
+		opts = append(opts, config.WithHTTPClient(httpClient))
+	}
+
 	cfg, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	s.client = s3.NewFromConfig(cfg)
+	// Apply S3-specific options: custom endpoint URL and path-style addressing.
+	s3URL := configMap["s3Url"]
+	forcePathStyle := strings.EqualFold(configMap["s3ForcePathStyle"], "true")
+
+	if s3URL != "" {
+		if !isValidS3URLScheme(s3URL) {
+			return fmt.Errorf("invalid s3Url %q: must start with http:// or https://", s3URL)
+		}
+	}
+
+	s.client = s3.NewFromConfig(cfg, func(o *s3.Options) {
+		if s3URL != "" {
+			o.BaseEndpoint = aws.String(s3URL)
+		}
+		if forcePathStyle {
+			o.UsePathStyle = true
+		}
+	})
 	s.uploader = manager.NewUploader(s.client)
 
 	return nil
@@ -306,6 +328,38 @@ func (s *S3ObjectStore) GetObjectBytes(key string) ([]byte, error) {
 	return io.ReadAll(reader)
 }
 
+// isValidS3URLScheme checks if the URL has a valid scheme (http or https).
+func isValidS3URLScheme(s3URL string) bool {
+	u, err := url.Parse(s3URL)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "http" || u.Scheme == "https"
+}
+
+// buildTLSHTTPClient creates an *http.Client with custom TLS settings
+// for S3-compatible endpoints with private CAs or disabled TLS verification.
+func buildTLSHTTPClient(insecureSkipTLSVerify bool, caCert string) (*http.Client, error) {
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: insecureSkipTLSVerify, //nolint:gosec // User-configured via BSL for private endpoints
+	}
+
+	if caCert != "" {
+		certPool, err := x509.SystemCertPool()
+		if err != nil {
+			certPool = x509.NewCertPool()
+		}
+		if !certPool.AppendCertsFromPEM([]byte(caCert)) {
+			return nil, fmt.Errorf("failed to parse CA certificate PEM")
+		}
+		tlsConfig.RootCAs = certPool
+	}
+
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = tlsConfig
+	return &http.Client{Transport: tr}, nil
+}
+
 // writeCredentialsToTempFile writes credential data to a temporary file and returns
 // the file path. The caller is responsible for removing the file when done.
 // The file is created with restrictive permissions (0600) to protect credentials.
@@ -330,33 +384,44 @@ func writeCredentialsToTempFile(data []byte) (string, error) {
 }
 
 // InitObjectStore creates an ObjectStore based on the provider type.
-// Credentials are resolved to a file path for the AWS SDK's built-in parser:
-// - If CredentialsData is set, it is written to a temp file.
-// - If CredentialsFile is set, the path is used directly.
+// Credentials and S3-compatible settings are passed through the config map
+// to Init(), which handles temp file creation for in-memory credentials.
 func InitObjectStore(cfg *UploaderConfig) (velero.ObjectStore, error) {
 	if cfg.BSLProvider == "" {
 		return nil, fmt.Errorf("BSL provider is required but was empty")
 	}
 
-	// Resolve credentials to a file path for the AWS SDK.
-	// Prefer in-memory data (controller path), fall back to file (uploader pod path).
-	credentialsFile := ""
+	// Build config map for the object store.
+	configMap := map[string]string{
+		"bucket": cfg.BSLBucket,
+		"prefix": cfg.BSLPrefix,
+		"region": cfg.BSLRegion,
+	}
+
+	// Credentials: prefer in-memory data (controller path), fall back to file (pod path).
 	if len(cfg.CredentialsData) > 0 {
-		tmpFile, err := writeCredentialsToTempFile(cfg.CredentialsData)
-		if err != nil {
-			return nil, fmt.Errorf("failed to write credentials: %w", err)
-		}
-		defer func() { _ = os.Remove(tmpFile) }()
-		credentialsFile = tmpFile
+		configMap["credentialsData"] = string(cfg.CredentialsData)
 	} else if cfg.CredentialsFile != "" {
-		credentialsFile = cfg.CredentialsFile
+		configMap["credentialsFile"] = cfg.CredentialsFile
+	}
+
+	// S3-compatible storage settings
+	if cfg.BSLS3URL != "" {
+		configMap["s3Url"] = cfg.BSLS3URL
+	}
+	if cfg.BSLS3ForcePathStyle {
+		configMap["s3ForcePathStyle"] = "true"
+	}
+	if cfg.BSLInsecureSkipTLSVerify {
+		configMap["insecureSkipTLSVerify"] = "true"
+	}
+	if cfg.BSLCACert != "" {
+		configMap["caCert"] = cfg.BSLCACert
 	}
 
 	switch strings.ToLower(cfg.BSLProvider) {
 	case "aws":
-		return NewS3ObjectStore(
-			cfg.BSLBucket, cfg.BSLPrefix, cfg.BSLRegion, credentialsFile,
-		)
+		return NewS3ObjectStore(configMap)
 	case "gcp":
 		// TODO: Implement GCP Cloud Storage support (issue #11)
 		return nil, fmt.Errorf("gcp object store not yet implemented")
@@ -365,8 +430,6 @@ func InitObjectStore(cfg *UploaderConfig) (velero.ObjectStore, error) {
 		return nil, fmt.Errorf("azure object store not yet implemented")
 	default:
 		// Try S3-compatible for unknown providers
-		return NewS3ObjectStore(
-			cfg.BSLBucket, cfg.BSLPrefix, cfg.BSLRegion, credentialsFile,
-		)
+		return NewS3ObjectStore(configMap)
 	}
 }

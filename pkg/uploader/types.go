@@ -94,6 +94,12 @@ const (
 	EnvDataUploadUID    = "KUBEVIRT_DM_DATAUPLOAD_UID"
 	EnvVMBName          = "KUBEVIRT_DM_VMB_NAME"
 	EnvVMBTName         = "KUBEVIRT_DM_VMBT_NAME"
+
+	// S3-compatible storage provider settings
+	EnvBSLS3URL                 = "KUBEVIRT_DM_BSL_S3_URL"
+	EnvBSLS3ForcePathStyle      = "KUBEVIRT_DM_BSL_S3_FORCE_PATH_STYLE"
+	EnvBSLInsecureSkipTLSVerify = "KUBEVIRT_DM_BSL_INSECURE_SKIP_TLS_VERIFY"
+	EnvBSLCACert                = "KUBEVIRT_DM_BSL_CA_CERT"
 )
 
 // Default paths and values
@@ -115,6 +121,12 @@ type UploaderConfig struct {
 	BSLBucket   string
 	BSLPrefix   string
 	BSLRegion   string
+
+	// S3-compatible storage provider settings
+	BSLS3URL                 string // Custom S3 endpoint URL (e.g., "https://minio.example.com")
+	BSLS3ForcePathStyle      bool   // Use path-style URLs (required by most S3-compatible stores)
+	BSLInsecureSkipTLSVerify bool   // Skip TLS certificate verification
+	BSLCACert                string // PEM-encoded custom CA certificate
 
 	// CredentialsData holds raw credential content (INI-style).
 	// Used by the controller to pass credentials from K8s Secrets directly

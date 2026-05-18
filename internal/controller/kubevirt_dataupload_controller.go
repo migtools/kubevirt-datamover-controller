@@ -1585,27 +1585,31 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 	}
 
 	return &DatamoverPodConfig{
-		Name:                 du.Name, // Used as a prefix for GenerateName
-		Namespace:            vmRef.Namespace,
-		Image:                image,
-		ImagePullPolicy:      pullPolicy,
-		BSLProvider:          cfg.Provider,
-		BSLBucket:            cfg.Bucket,
-		BSLPrefix:            cfg.Prefix,
-		BSLRegion:            cfg.Region,
-		CredentialSecretName: cfg.CredentialName,
-		CredentialSecretKey:  cfg.CredentialKey,
-		VMName:               vmRef.Name,
-		VMNamespace:          vmRef.Namespace,
-		CheckpointName:       checkpointName,
-		BackupType:           backupType,
-		VeleroBackupName:     getVeleroBackupName(du),
-		DataUploadName:       du.Name,
-		DataUploadUID:        string(du.UID),
-		VMBName:              vmb.Name,
-		VMBTName:             vmbtName,
-		SourcePVCName:        "", // overridden by handlePrepared with the rebound PVC name
-		Labels:               make(map[string]string),
+		Name:                     du.Name, // Used as a prefix for GenerateName
+		Namespace:                vmRef.Namespace,
+		Image:                    image,
+		ImagePullPolicy:          pullPolicy,
+		BSLProvider:              cfg.Provider,
+		BSLBucket:                cfg.Bucket,
+		BSLPrefix:                cfg.Prefix,
+		BSLRegion:                cfg.Region,
+		BSLS3URL:                 cfg.S3URL,
+		BSLS3ForcePathStyle:      strconv.FormatBool(cfg.S3ForcePathStyle),
+		BSLInsecureSkipTLSVerify: strconv.FormatBool(cfg.InsecureSkipTLSVerify),
+		BSLCACert:                cfg.CACert,
+		CredentialSecretName:     cfg.CredentialName,
+		CredentialSecretKey:      cfg.CredentialKey,
+		VMName:                   vmRef.Name,
+		VMNamespace:              vmRef.Namespace,
+		CheckpointName:           checkpointName,
+		BackupType:               backupType,
+		VeleroBackupName:         getVeleroBackupName(du),
+		DataUploadName:           du.Name,
+		DataUploadUID:            string(du.UID),
+		VMBName:                  vmb.Name,
+		VMBTName:                 vmbtName,
+		SourcePVCName:            "", // overridden by handlePrepared with the rebound PVC name
+		Labels:                   make(map[string]string),
 	}, nil
 }
 
@@ -1647,6 +1651,12 @@ type bslConfig struct {
 	Region         string
 	CredentialName string
 	CredentialKey  string
+
+	// S3-compatible storage provider settings
+	S3URL                 string
+	S3ForcePathStyle      bool
+	InsecureSkipTLSVerify bool
+	CACert                string
 }
 
 // extractBSLConfig extracts and validates common BSL configuration fields.
@@ -1670,8 +1680,16 @@ func extractBSLConfig(bsl *velerov1.BackupStorageLocation) (*bslConfig, error) {
 	}
 
 	region := ""
+	s3URL := ""
+	s3ForcePathStyle := false
+	insecureSkipTLSVerify := false
+	caCert := ""
 	if bsl.Spec.Config != nil {
 		region = bsl.Spec.Config["region"]
+		s3URL = bsl.Spec.Config["s3Url"]
+		s3ForcePathStyle = strings.EqualFold(bsl.Spec.Config["s3ForcePathStyle"], "true")
+		insecureSkipTLSVerify = strings.EqualFold(bsl.Spec.Config["insecureSkipTLSVerify"], "true")
+		caCert = bsl.Spec.Config["caCert"]
 	}
 
 	credName := ""
@@ -1684,12 +1702,16 @@ func extractBSLConfig(bsl *velerov1.BackupStorageLocation) (*bslConfig, error) {
 	}
 
 	return &bslConfig{
-		Provider:       bsl.Spec.Provider,
-		Bucket:         bucket,
-		Prefix:         prefix,
-		Region:         region,
-		CredentialName: credName,
-		CredentialKey:  credKey,
+		Provider:              bsl.Spec.Provider,
+		Bucket:                bucket,
+		Prefix:                prefix,
+		Region:                region,
+		CredentialName:        credName,
+		CredentialKey:         credKey,
+		S3URL:                 s3URL,
+		S3ForcePathStyle:      s3ForcePathStyle,
+		InsecureSkipTLSVerify: insecureSkipTLSVerify,
+		CACert:                caCert,
 	}, nil
 }
 
@@ -1737,11 +1759,15 @@ func (r *KubeVirtDataUploadReconciler) initObjectStoreFromBSL(
 	}
 
 	store, err := factory(&uploader.UploaderConfig{
-		BSLProvider:     cfg.Provider,
-		BSLBucket:       cfg.Bucket,
-		BSLPrefix:       cfg.Prefix,
-		BSLRegion:       cfg.Region,
-		CredentialsData: credData,
+		BSLProvider:              cfg.Provider,
+		BSLBucket:                cfg.Bucket,
+		BSLPrefix:                cfg.Prefix,
+		BSLRegion:                cfg.Region,
+		BSLS3URL:                 cfg.S3URL,
+		BSLS3ForcePathStyle:      cfg.S3ForcePathStyle,
+		BSLInsecureSkipTLSVerify: cfg.InsecureSkipTLSVerify,
+		BSLCACert:                cfg.CACert,
+		CredentialsData:          credData,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to initialize object store: %w", err)

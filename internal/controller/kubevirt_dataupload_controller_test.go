@@ -4372,6 +4372,107 @@ func TestExtractBSLConfig(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "S3-compatible config keys are extracted",
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{Name: "minio-bsl"},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "my-bucket",
+						},
+					},
+					Config: map[string]string{
+						"region":                "us-east-1",
+						"s3Url":                 "https://minio.example.com",
+						"s3ForcePathStyle":      "true",
+						"insecureSkipTLSVerify": "true",
+						"caCert":                "-----BEGIN CERTIFICATE-----\nMIIBxTCCAW...\n-----END CERTIFICATE-----",
+					},
+					Credential: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "creds"},
+					},
+				},
+			},
+			validate: func(t *testing.T, cfg *bslConfig) {
+				if cfg.S3URL != "https://minio.example.com" {
+					t.Errorf("S3URL = %q, want %q", cfg.S3URL, "https://minio.example.com")
+				}
+				if !cfg.S3ForcePathStyle {
+					t.Error("S3ForcePathStyle = false, want true")
+				}
+				if !cfg.InsecureSkipTLSVerify {
+					t.Error("InsecureSkipTLSVerify = false, want true")
+				}
+				if cfg.CACert != "-----BEGIN CERTIFICATE-----\nMIIBxTCCAW...\n-----END CERTIFICATE-----" {
+					t.Errorf("CACert = %q, want PEM content", cfg.CACert)
+				}
+			},
+		},
+		{
+			name: "S3-compatible booleans are case-insensitive",
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{Name: "bsl"},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "bucket",
+						},
+					},
+					Config: map[string]string{
+						"s3ForcePathStyle":      "TRUE",
+						"insecureSkipTLSVerify": "True",
+					},
+					Credential: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "creds"},
+					},
+				},
+			},
+			validate: func(t *testing.T, cfg *bslConfig) {
+				if !cfg.S3ForcePathStyle {
+					t.Error("S3ForcePathStyle = false, want true (case-insensitive)")
+				}
+				if !cfg.InsecureSkipTLSVerify {
+					t.Error("InsecureSkipTLSVerify = false, want true (case-insensitive)")
+				}
+			},
+		},
+		{
+			name: "S3-compatible fields default when Config has no S3 keys",
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{Name: "bsl"},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "bucket",
+						},
+					},
+					Config: map[string]string{
+						"region": "us-east-1",
+					},
+					Credential: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "creds"},
+					},
+				},
+			},
+			validate: func(t *testing.T, cfg *bslConfig) {
+				if cfg.S3URL != "" {
+					t.Errorf("S3URL = %q, want empty", cfg.S3URL)
+				}
+				if cfg.S3ForcePathStyle {
+					t.Error("S3ForcePathStyle = true, want false")
+				}
+				if cfg.InsecureSkipTLSVerify {
+					t.Error("InsecureSkipTLSVerify = true, want false")
+				}
+				if cfg.CACert != "" {
+					t.Errorf("CACert = %q, want empty", cfg.CACert)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
