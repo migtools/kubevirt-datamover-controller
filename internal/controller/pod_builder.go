@@ -60,10 +60,10 @@ type DatamoverPodConfig struct {
 	BackupType         string
 	ExpectedBackupType string
 	VeleroBackupName   string
-	DataUploadName   string
-	DataUploadUID    string
-	VMBName          string
-	VMBTName         string
+	DataUploadName     string
+	DataUploadUID      string
+	VMBName            string
+	VMBTName           string
 
 	// Source PVC
 	SourcePVCName string

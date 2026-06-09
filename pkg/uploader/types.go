@@ -79,22 +79,22 @@ import (
 
 // Environment variable names for uploader configuration
 const (
-	EnvBSLProvider      = "KUBEVIRT_DM_BSL_PROVIDER"
-	EnvBSLBucket        = "KUBEVIRT_DM_BSL_BUCKET"
-	EnvBSLPrefix        = "KUBEVIRT_DM_BSL_PREFIX"
-	EnvBSLRegion        = "KUBEVIRT_DM_BSL_REGION"
-	EnvCredentialsFile  = "KUBEVIRT_DM_CREDENTIALS_FILE"
-	EnvVMName           = "KUBEVIRT_DM_VM_NAME"
-	EnvVMNamespace      = "KUBEVIRT_DM_VM_NAMESPACE"
-	EnvCheckpointName   = "KUBEVIRT_DM_CHECKPOINT_NAME"
+	EnvBSLProvider        = "KUBEVIRT_DM_BSL_PROVIDER"
+	EnvBSLBucket          = "KUBEVIRT_DM_BSL_BUCKET"
+	EnvBSLPrefix          = "KUBEVIRT_DM_BSL_PREFIX"
+	EnvBSLRegion          = "KUBEVIRT_DM_BSL_REGION"
+	EnvCredentialsFile    = "KUBEVIRT_DM_CREDENTIALS_FILE"
+	EnvVMName             = "KUBEVIRT_DM_VM_NAME"
+	EnvVMNamespace        = "KUBEVIRT_DM_VM_NAMESPACE"
+	EnvCheckpointName     = "KUBEVIRT_DM_CHECKPOINT_NAME"
 	EnvBackupType         = "KUBEVIRT_DM_BACKUP_TYPE"
 	EnvExpectedBackupType = "KUBEVIRT_DM_EXPECTED_BACKUP_TYPE"
 	EnvVeleroBackupName   = "KUBEVIRT_DM_VELERO_BACKUP_NAME"
-	EnvSourcePVCPath    = "KUBEVIRT_DM_SOURCE_PVC_PATH"
-	EnvDataUploadName   = "KUBEVIRT_DM_DATAUPLOAD_NAME"
-	EnvDataUploadUID    = "KUBEVIRT_DM_DATAUPLOAD_UID"
-	EnvVMBName          = "KUBEVIRT_DM_VMB_NAME"
-	EnvVMBTName         = "KUBEVIRT_DM_VMBT_NAME"
+	EnvSourcePVCPath      = "KUBEVIRT_DM_SOURCE_PVC_PATH"
+	EnvDataUploadName     = "KUBEVIRT_DM_DATAUPLOAD_NAME"
+	EnvDataUploadUID      = "KUBEVIRT_DM_DATAUPLOAD_UID"
+	EnvVMBName            = "KUBEVIRT_DM_VMB_NAME"
+	EnvVMBTName           = "KUBEVIRT_DM_VMBT_NAME"
 
 	// S3-compatible storage provider settings
 	EnvBSLS3URL                 = "KUBEVIRT_DM_BSL_S3_URL"
@@ -147,10 +147,10 @@ type UploaderConfig struct {
 	BackupType         string // "full" or "incremental"
 	ExpectedBackupType string // backup type the controller expected based on BSL validation
 	VeleroBackupName   string
-	DataUploadName   string
-	DataUploadUID    string
-	VMBName          string
-	VMBTName         string
+	DataUploadName     string
+	DataUploadUID      string
+	VMBName            string
+	VMBTName           string
 
 	// Source PVC mount path
 	SourcePVCPath string
