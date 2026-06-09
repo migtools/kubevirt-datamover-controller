@@ -49,6 +49,12 @@ const (
 	// (e.g., "50Gi").
 	AnnotationBackupPVCSize = "kubevirt-datamover.io/backup-pvc-size"
 
+	// AnnotationExpectedBackupType records the backup type the controller
+	// expected based on BSL chain validation ("full" or "incremental").
+	// Used to detect mismatches when virt-controller reports a different
+	// type in VMB.Status.Type (e.g., VM lost its libvirt checkpoint).
+	AnnotationExpectedBackupType = "kubevirt-datamover.io/expected-backup-type"
+
 	// AnnotationDataUploadName is the annotation key for the DataUpload name.
 	// Used on VMB, VMBT, and PVC resources to track ownership.
 	AnnotationDataUploadName = "velero.io/dataupload-name"

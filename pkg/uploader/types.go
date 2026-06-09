@@ -87,8 +87,9 @@ const (
 	EnvVMName           = "KUBEVIRT_DM_VM_NAME"
 	EnvVMNamespace      = "KUBEVIRT_DM_VM_NAMESPACE"
 	EnvCheckpointName   = "KUBEVIRT_DM_CHECKPOINT_NAME"
-	EnvBackupType       = "KUBEVIRT_DM_BACKUP_TYPE"
-	EnvVeleroBackupName = "KUBEVIRT_DM_VELERO_BACKUP_NAME"
+	EnvBackupType         = "KUBEVIRT_DM_BACKUP_TYPE"
+	EnvExpectedBackupType = "KUBEVIRT_DM_EXPECTED_BACKUP_TYPE"
+	EnvVeleroBackupName   = "KUBEVIRT_DM_VELERO_BACKUP_NAME"
 	EnvSourcePVCPath    = "KUBEVIRT_DM_SOURCE_PVC_PATH"
 	EnvDataUploadName   = "KUBEVIRT_DM_DATAUPLOAD_NAME"
 	EnvDataUploadUID    = "KUBEVIRT_DM_DATAUPLOAD_UID"
@@ -142,9 +143,10 @@ type UploaderConfig struct {
 	VMNamespace string
 
 	// Backup context
-	CheckpointName   string
-	BackupType       string // "full" or "incremental"
-	VeleroBackupName string
+	CheckpointName     string
+	BackupType         string // "full" or "incremental"
+	ExpectedBackupType string // backup type the controller expected based on BSL validation
+	VeleroBackupName   string
 	DataUploadName   string
 	DataUploadUID    string
 	VMBName          string
@@ -205,6 +207,14 @@ type CheckpointEntry struct {
 
 	// VMBTObjectPath is the S3 path to the archived VMBT CR JSON for this checkpoint
 	VMBTObjectPath string `json:"vmbtObjectPath,omitempty"`
+
+	// Superseded indicates this checkpoint is part of a chain that has been
+	// replaced by a newer full backup. This happens when virt-controller
+	// performs a full backup despite the controller allowing incremental
+	// (e.g., VM restarted and lost its libvirt checkpoint). Superseded
+	// entries are kept for existing Velero backup references but are not
+	// part of the active chain.
+	Superseded bool `json:"superseded,omitempty"`
 }
 
 // VMIndex is the per-VM index structure stored at checkpoints/<ns>/<vm>/index.json.

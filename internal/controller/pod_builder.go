@@ -56,9 +56,10 @@ type DatamoverPodConfig struct {
 	VMNamespace string
 
 	// Backup context
-	CheckpointName   string
-	BackupType       string
-	VeleroBackupName string
+	CheckpointName     string
+	BackupType         string
+	ExpectedBackupType string
+	VeleroBackupName   string
 	DataUploadName   string
 	DataUploadUID    string
 	VMBName          string
@@ -100,6 +101,7 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 		{Name: uploader.EnvVMNamespace, Value: config.VMNamespace},
 		{Name: uploader.EnvCheckpointName, Value: config.CheckpointName},
 		{Name: uploader.EnvBackupType, Value: config.BackupType},
+		{Name: uploader.EnvExpectedBackupType, Value: config.ExpectedBackupType},
 		{Name: uploader.EnvVeleroBackupName, Value: config.VeleroBackupName},
 		{Name: uploader.EnvSourcePVCPath, Value: uploader.DefaultSourcePVCPath},
 		{Name: uploader.EnvDataUploadName, Value: config.DataUploadName},
