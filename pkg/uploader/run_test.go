@@ -1492,7 +1492,7 @@ func TestUpdateBackupManifests(t *testing.T) {
 			vmManifest := VMBackupManifest{
 				Namespace:       tt.config.VMNamespace,
 				Name:            tt.config.VMName,
-				CheckpointChain: chain,
+				CheckpointChain: CheckpointIDs(chain),
 				BackupName:      tt.config.VeleroBackupName,
 			}
 			vmManifestData, _ := json.Marshal(vmManifest)
@@ -1657,7 +1657,7 @@ func TestArchiveKubeResources(t *testing.T) {
 					t.Error("expected VMBT to be archived even when reconstructed")
 				}
 				// Verify the reconstructed VMBT was archived with correct checkpoint
-				data, err := getObjectBytes(store, "test-bucket", paths.VMBTObjectPath)
+				data, err := GetObjectBytes(store, "test-bucket", paths.VMBTObjectPath)
 				if err != nil {
 					t.Fatalf("failed to read archived VMBT: %v", err)
 				}
