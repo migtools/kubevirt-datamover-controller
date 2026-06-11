@@ -23,11 +23,11 @@ COPY pkg/ pkg/
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
 
-# Use UBI9 as base image to include qemu-img for VM disk restore.
+# Use CentOS Stream 9 as base image to include qemu-img for VM disk restore.
 # qemu-img is required by the datamover download path to reconstruct qcow2
 # incremental chains into raw disk images (issue #73).
-# UBI9-minimal lacks the appstream repo needed for qemu-img, so we use full UBI9.
-FROM registry.access.redhat.com/ubi9/ubi:latest
+# UBI9 repos do not include qemu-img; CentOS Stream 9 has it in AppStream.
+FROM quay.io/centos/centos:stream9
 RUN dnf install -y qemu-img && dnf clean all
 WORKDIR /
 COPY --from=builder /workspace/manager .
