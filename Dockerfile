@@ -26,7 +26,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o ma
 # Use CentOS Stream 9 as base image to include qemu-img for VM disk restore.
 # qemu-img is required by the datamover download path to reconstruct qcow2
 # incremental chains into raw disk images (issue #73).
-# UBI9 repos do not include qemu-img; CentOS Stream 9 has it in AppStream.
+# UBI9 repos (BaseOS, AppStream, CodeReady) do not include qemu-img.
+# CentOS Stream 9 has it in AppStream. For downstream Konflux builds,
+# UBI9 + full RHEL repos work — see:
+# https://github.com/migtools/oadp-vm-file-restore/blob/oadp-dev/containers/oadp-vmfr-access/konflux.Dockerfile
 FROM quay.io/centos/centos:stream9
 RUN dnf install -y qemu-img && dnf clean all
 WORKDIR /
