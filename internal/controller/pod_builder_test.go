@@ -65,8 +65,8 @@ func TestBuildDatamoverPod(t *testing.T) {
 				}
 
 				// Verify labels
-				if pod.Labels[common.LabelDatamoverPod] != "uploader" {
-					t.Errorf("label %s = %q, want %q", common.LabelDatamoverPod, pod.Labels[common.LabelDatamoverPod], "uploader")
+				if pod.Labels[common.LabelDatamoverPod] != "upload" {
+					t.Errorf("label %s = %q, want %q", common.LabelDatamoverPod, pod.Labels[common.LabelDatamoverPod], "upload")
 				}
 				if pod.Labels[common.LabelDataUploadUID] != "uid-12345" {
 					t.Errorf("label %s = %q, want %q", common.LabelDataUploadUID, pod.Labels[common.LabelDataUploadUID], "uid-12345")
@@ -88,8 +88,8 @@ func TestBuildDatamoverPod(t *testing.T) {
 					t.Fatalf("expected 1 container, got %d", len(pod.Spec.Containers))
 				}
 				container := pod.Spec.Containers[0]
-				if container.Name != "uploader" {
-					t.Errorf("container name = %q, want %q", container.Name, "uploader")
+				if container.Name != "upload" {
+					t.Errorf("container name = %q, want %q", container.Name, "upload")
 				}
 				if container.Image != "quay.io/test/datamover:latest" {
 					t.Errorf("container image = %q, want %q", container.Image, "quay.io/test/datamover:latest")
@@ -298,7 +298,7 @@ func TestBuildDatamoverPod(t *testing.T) {
 					t.Errorf("another-label = %q, want %q", pod.Labels["another-label"], "another-value")
 				}
 				// Check default labels are still present
-				if pod.Labels[common.LabelDatamoverPod] != "uploader" {
+				if pod.Labels[common.LabelDatamoverPod] != "upload" {
 					t.Errorf("default label missing: %s", common.LabelDatamoverPod)
 				}
 			},

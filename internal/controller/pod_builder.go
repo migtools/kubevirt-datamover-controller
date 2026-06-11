@@ -25,8 +25,22 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// OperationMode determines whether the datamover pod runs upload or download.
+type OperationMode string
+
+const (
+	// OperationModeUpload runs the backup upload path.
+	OperationModeUpload OperationMode = "upload"
+
+	// OperationModeDownload runs the restore download path.
+	OperationModeDownload OperationMode = "download"
+)
+
 // DatamoverPodConfig contains configuration for building a datamover pod.
 type DatamoverPodConfig struct {
+	// OperationMode selects upload or download. Defaults to upload.
+	OperationMode OperationMode
+
 	// Pod identity
 	Name      string
 	Namespace string
@@ -73,10 +87,15 @@ type DatamoverPodConfig struct {
 
 // buildDatamoverPod creates a Pod spec for the datamover.
 func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
+	mode := config.OperationMode
+	if mode == "" {
+		mode = OperationModeUpload
+	}
+
 	// Merge default labels with provided labels.
 	// Use UID for labels (always ≤ 63 chars); name goes in annotations.
 	labels := map[string]string{
-		common.LabelDatamoverPod:  "uploader",
+		common.LabelDatamoverPod:  string(mode),
 		common.LabelDataUploadUID: config.DataUploadUID,
 	}
 	maps.Copy(labels, config.Labels)
@@ -137,10 +156,10 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 			},
 			Containers: []corev1.Container{
 				{
-					Name:            "uploader",
+					Name:            string(mode),
 					Image:           config.Image,
 					ImagePullPolicy: config.ImagePullPolicy,
-					Command:         []string{"/manager", "upload"},
+					Command:         []string{"/manager", string(mode)},
 					Env:             envVars,
 					VolumeMounts: []corev1.VolumeMount{
 						{

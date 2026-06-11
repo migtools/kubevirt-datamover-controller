@@ -74,18 +74,19 @@ type PVRebindResult struct {
 // 4. Create new PVC in target namespace with volumeName and selector
 // 5. Reset PV binding: set claimRef to new PVC, add labels (using Patch)
 // 6. Wait for PV to bind to new PVC
-func (r *KubeVirtDataUploadReconciler) rebindPVToNamespace(
+func rebindPVToNamespace(
 	ctx context.Context,
+	k8sClient client.Client,
 	logger logr.Logger,
 	sourcePVCName string,
 	sourceNamespace string,
 	targetNamespace string,
-	dataUploadName string,
-	dataUploadUID string,
+	resourceName string,
+	resourceUID string,
 ) (*PVRebindResult, error) {
 	// Step 1: Get the source PVC and its bound PV
 	sourcePVC := &corev1.PersistentVolumeClaim{}
-	if err := r.Get(ctx, types.NamespacedName{Name: sourcePVCName, Namespace: sourceNamespace}, sourcePVC); err != nil {
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: sourcePVCName, Namespace: sourceNamespace}, sourcePVC); err != nil {
 		return nil, fmt.Errorf("failed to get source PVC %s/%s: %w", sourceNamespace, sourcePVCName, err)
 	}
 
@@ -99,7 +100,7 @@ func (r *KubeVirtDataUploadReconciler) rebindPVToNamespace(
 	}
 
 	pv := &corev1.PersistentVolume{}
-	if err := r.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
 		return nil, fmt.Errorf("failed to get PV %s: %w", pvName, err)
 	}
 
@@ -108,20 +109,20 @@ func (r *KubeVirtDataUploadReconciler) rebindPVToNamespace(
 	// Step 2: Set PV reclaim policy to Retain using Patch
 	originalReclaimPolicy := pv.Spec.PersistentVolumeReclaimPolicy
 	if pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
-		if err := r.patchPVReclaimPolicy(ctx, pv, corev1.PersistentVolumeReclaimRetain); err != nil {
+		if err := patchPVReclaimPolicy(ctx, k8sClient, pv, corev1.PersistentVolumeReclaimRetain); err != nil {
 			return nil, fmt.Errorf("failed to set PV %s reclaim policy to Retain: %w", pvName, err)
 		}
 		logger.Info("Set PV reclaim policy to Retain", "pv", pvName, "originalPolicy", originalReclaimPolicy)
 	}
 
 	// Step 3: Delete the source PVC
-	if err := r.Delete(ctx, sourcePVC); err != nil && !errors.IsNotFound(err) {
+	if err := k8sClient.Delete(ctx, sourcePVC); err != nil && !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("failed to delete source PVC %s/%s: %w", sourceNamespace, sourcePVCName, err)
 	}
 	logger.Info("Deleted source PVC", "pvc", sourcePVCName, "namespace", sourceNamespace)
 
 	// Wait for PVC to be fully deleted
-	if err := r.waitForPVCDeletion(ctx, sourcePVCName, sourceNamespace); err != nil {
+	if err := waitForPVCDeletion(ctx, k8sClient, sourcePVCName, sourceNamespace); err != nil {
 		return nil, fmt.Errorf("failed waiting for source PVC deletion: %w", err)
 	}
 
@@ -129,17 +130,17 @@ func (r *KubeVirtDataUploadReconciler) rebindPVToNamespace(
 	// Use LabelDataUploadUID for labels/selector (always ≤ 63 chars) instead of
 	// LabelDataUploadName which can exceed the 63-char Kubernetes label value limit.
 	labelKey := common.LabelDataUploadUID
-	labelValue := dataUploadUID
-	newPVCName := common.SafeResourceName(common.ReboundPVCNamePrefix, dataUploadName)
+	labelValue := resourceUID
+	newPVCName := common.SafeResourceName(common.ReboundPVCNamePrefix, resourceName)
 	newPVC := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      newPVCName,
 			Namespace: targetNamespace,
 			Labels: map[string]string{
-				common.LabelDataUploadUID: dataUploadUID,
+				common.LabelDataUploadUID: resourceUID,
 			},
 			Annotations: map[string]string{
-				common.AnnotationDataUploadName: dataUploadName,
+				common.AnnotationDataUploadName: resourceName,
 			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
@@ -158,7 +159,7 @@ func (r *KubeVirtDataUploadReconciler) rebindPVToNamespace(
 		},
 	}
 
-	if err := r.Create(ctx, newPVC); err != nil {
+	if err := k8sClient.Create(ctx, newPVC); err != nil {
 		if !errors.IsAlreadyExists(err) {
 			return nil, fmt.Errorf("failed to create new PVC %s/%s: %w", targetNamespace, newPVCName, err)
 		}
@@ -169,18 +170,18 @@ func (r *KubeVirtDataUploadReconciler) rebindPVToNamespace(
 
 	// Step 5: Reset PV binding using Patch (like Velero's ResetPVBinding)
 	// Re-fetch PV to get latest version
-	if err := r.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
 		return nil, fmt.Errorf("failed to re-fetch PV %s: %w", pvName, err)
 	}
 
 	labels := map[string]string{labelKey: labelValue}
-	if err := r.patchPVBinding(ctx, pv, newPVC, labels); err != nil {
+	if err := patchPVBinding(ctx, k8sClient, pv, newPVC, labels); err != nil {
 		return nil, fmt.Errorf("failed to reset PV %s binding: %w", pvName, err)
 	}
 	logger.Info("Reset PV binding to new PVC", "pv", pvName, "newPVC", newPVCName, "namespace", targetNamespace)
 
 	// Step 6: Wait for PV to bind to new PVC
-	if err := r.waitForPVCBound(ctx, newPVCName, targetNamespace); err != nil {
+	if err := waitForPVCBound(ctx, k8sClient, newPVCName, targetNamespace); err != nil {
 		return nil, fmt.Errorf("failed waiting for new PVC to bind: %w", err)
 	}
 	logger.Info("New PVC is bound to PV", "pvc", newPVCName, "pv", pvName)
@@ -193,20 +194,19 @@ func (r *KubeVirtDataUploadReconciler) rebindPVToNamespace(
 	}, nil
 }
 
-// patchPVReclaimPolicy patches a PV to set its reclaim policy (like Velero's SetPVReclaimPolicy)
+// patchPVReclaimPolicy patches a PV to set its reclaim policy (like Velero's SetPVReclaimPolicy).
 // Includes retry logic for transient errors.
-func (r *KubeVirtDataUploadReconciler) patchPVReclaimPolicy(ctx context.Context, pv *corev1.PersistentVolume, policy corev1.PersistentVolumeReclaimPolicy) error {
+func patchPVReclaimPolicy(ctx context.Context, k8sClient client.Client, pv *corev1.PersistentVolume, policy corev1.PersistentVolumeReclaimPolicy) error {
 	var lastErr error
 	for attempt := 1; attempt <= PatchRetryAttempts; attempt++ {
-		err := r.doPatchPVReclaimPolicy(ctx, pv, policy)
+		err := doPatchPVReclaimPolicy(ctx, k8sClient, pv, policy)
 		if err == nil {
 			return nil
 		}
 		lastErr = err
 		if attempt < PatchRetryAttempts {
 			time.Sleep(PatchRetryInterval)
-			// Re-fetch PV to get latest version for next attempt
-			if fetchErr := r.Get(ctx, types.NamespacedName{Name: pv.Name}, pv); fetchErr != nil {
+			if fetchErr := k8sClient.Get(ctx, types.NamespacedName{Name: pv.Name}, pv); fetchErr != nil {
 				return fmt.Errorf("failed to re-fetch PV after patch error: %w", fetchErr)
 			}
 		}
@@ -214,8 +214,7 @@ func (r *KubeVirtDataUploadReconciler) patchPVReclaimPolicy(ctx context.Context,
 	return fmt.Errorf("failed after %d attempts: %w", PatchRetryAttempts, lastErr)
 }
 
-// doPatchPVReclaimPolicy performs a single patch attempt
-func (r *KubeVirtDataUploadReconciler) doPatchPVReclaimPolicy(ctx context.Context, pv *corev1.PersistentVolume, policy corev1.PersistentVolumeReclaimPolicy) error {
+func doPatchPVReclaimPolicy(ctx context.Context, k8sClient client.Client, pv *corev1.PersistentVolume, policy corev1.PersistentVolumeReclaimPolicy) error {
 	origBytes, err := json.Marshal(pv)
 	if err != nil {
 		return fmt.Errorf("error marshaling original PV: %w", err)
@@ -234,23 +233,22 @@ func (r *KubeVirtDataUploadReconciler) doPatchPVReclaimPolicy(ctx context.Contex
 		return fmt.Errorf("error creating merge patch for PV: %w", err)
 	}
 
-	return r.Patch(ctx, pv, client.RawPatch(types.MergePatchType, patchBytes))
+	return k8sClient.Patch(ctx, pv, client.RawPatch(types.MergePatchType, patchBytes))
 }
 
-// patchPVBinding patches a PV to reset its binding info (like Velero's ResetPVBinding)
+// patchPVBinding patches a PV to reset its binding info (like Velero's ResetPVBinding).
 // Includes retry logic for transient errors.
-func (r *KubeVirtDataUploadReconciler) patchPVBinding(ctx context.Context, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, labels map[string]string) error {
+func patchPVBinding(ctx context.Context, k8sClient client.Client, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, labels map[string]string) error {
 	var lastErr error
 	for attempt := 1; attempt <= PatchRetryAttempts; attempt++ {
-		err := r.doPatchPVBinding(ctx, pv, pvc, labels)
+		err := doPatchPVBinding(ctx, k8sClient, pv, pvc, labels)
 		if err == nil {
 			return nil
 		}
 		lastErr = err
 		if attempt < PatchRetryAttempts {
 			time.Sleep(PatchRetryInterval)
-			// Re-fetch PV to get latest version for next attempt
-			if fetchErr := r.Get(ctx, types.NamespacedName{Name: pv.Name}, pv); fetchErr != nil {
+			if fetchErr := k8sClient.Get(ctx, types.NamespacedName{Name: pv.Name}, pv); fetchErr != nil {
 				return fmt.Errorf("failed to re-fetch PV after patch error: %w", fetchErr)
 			}
 		}
@@ -258,25 +256,21 @@ func (r *KubeVirtDataUploadReconciler) patchPVBinding(ctx context.Context, pv *c
 	return fmt.Errorf("failed after %d attempts: %w", PatchRetryAttempts, lastErr)
 }
 
-// doPatchPVBinding performs a single patch attempt
-func (r *KubeVirtDataUploadReconciler) doPatchPVBinding(ctx context.Context, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, labels map[string]string) error {
+func doPatchPVBinding(ctx context.Context, k8sClient client.Client, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, labels map[string]string) error {
 	origBytes, err := json.Marshal(pv)
 	if err != nil {
 		return fmt.Errorf("error marshaling original PV: %w", err)
 	}
 
 	updated := pv.DeepCopy()
-	// Set claimRef to new PVC (without UID, like Velero)
 	updated.Spec.ClaimRef = &corev1.ObjectReference{
 		Kind:      "PersistentVolumeClaim",
 		Namespace: pvc.Namespace,
 		Name:      pvc.Name,
 	}
-	// Remove bound-by-controller annotation
 	if updated.Annotations != nil {
 		delete(updated.Annotations, KubeAnnBoundByController)
 	}
-	// Add labels for selector matching
 	if labels != nil {
 		if updated.Labels == nil {
 			updated.Labels = make(map[string]string)
@@ -294,14 +288,14 @@ func (r *KubeVirtDataUploadReconciler) doPatchPVBinding(ctx context.Context, pv 
 		return fmt.Errorf("error creating merge patch for PV: %w", err)
 	}
 
-	return r.Patch(ctx, pv, client.RawPatch(types.MergePatchType, patchBytes))
+	return k8sClient.Patch(ctx, pv, client.RawPatch(types.MergePatchType, patchBytes))
 }
 
-// waitForPVCDeletion waits for a PVC to be fully deleted
-func (r *KubeVirtDataUploadReconciler) waitForPVCDeletion(ctx context.Context, pvcName, namespace string) error {
+// waitForPVCDeletion waits for a PVC to be fully deleted.
+func waitForPVCDeletion(ctx context.Context, k8sClient client.Client, pvcName, namespace string) error {
 	return wait.PollUntilContextTimeout(ctx, PVRebindPollInterval, PVRebindTimeout, true, func(ctx context.Context) (bool, error) {
 		pvc := &corev1.PersistentVolumeClaim{}
-		err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, pvc)
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, pvc)
 		if errors.IsNotFound(err) {
 			return true, nil
 		}
@@ -312,14 +306,12 @@ func (r *KubeVirtDataUploadReconciler) waitForPVCDeletion(ctx context.Context, p
 	})
 }
 
-// waitForPVCBound waits for a PVC to be bound
-func (r *KubeVirtDataUploadReconciler) waitForPVCBound(ctx context.Context, pvcName, namespace string) error {
+// waitForPVCBound waits for a PVC to be bound.
+func waitForPVCBound(ctx context.Context, k8sClient client.Client, pvcName, namespace string) error {
 	return wait.PollUntilContextTimeout(ctx, PVRebindPollInterval, PVRebindTimeout, true, func(ctx context.Context) (bool, error) {
 		pvc := &corev1.PersistentVolumeClaim{}
-		if err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, pvc); err != nil {
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, pvc); err != nil {
 			if errors.IsNotFound(err) {
-				// With a cached client, the PVC can be briefly invisible after creation.
-				// Treat NotFound as a transient condition and keep polling.
 				return false, nil
 			}
 			return false, err
@@ -331,46 +323,40 @@ func (r *KubeVirtDataUploadReconciler) waitForPVCBound(ctx context.Context, pvcN
 // cleanupReboundPVCAndPV deletes the rebound PVC and PV after upload completes.
 // The dataUploadUID is used to find the PV by label if the PVC is already gone,
 // preventing storage leakage.
-func (r *KubeVirtDataUploadReconciler) cleanupReboundPVCAndPV(
+func cleanupReboundPVCAndPV(
 	ctx context.Context,
+	k8sClient client.Client,
 	logger logr.Logger,
 	pvcName string,
 	pvcNamespace string,
-	dataUploadUID string,
+	resourceUID string,
 ) error {
 	var pvName string
 
-	// Get the PVC to find the PV name
 	pvc := &corev1.PersistentVolumeClaim{}
-	err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: pvcNamespace}, pvc)
+	err := k8sClient.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: pvcNamespace}, pvc)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			logger.V(1).Info("Rebound PVC already deleted, will find PV by label", "pvc", pvcName)
-			// PVC is gone, but we still need to clean up the PV to prevent storage leakage.
-			// Find PV by the label we set during rebind.
 		} else {
 			return fmt.Errorf("failed to get rebound PVC %s/%s: %w", pvcNamespace, pvcName, err)
 		}
 	} else {
 		pvName = pvc.Spec.VolumeName
 
-		// Delete the PVC first
-		if err := r.Delete(ctx, pvc); err != nil && !errors.IsNotFound(err) {
+		if err := k8sClient.Delete(ctx, pvc); err != nil && !errors.IsNotFound(err) {
 			return fmt.Errorf("failed to delete rebound PVC %s/%s: %w", pvcNamespace, pvcName, err)
 		}
 		logger.Info("Deleted rebound PVC", "pvc", pvcName, "namespace", pvcNamespace)
 
-		// Wait for PVC deletion
-		if err := r.waitForPVCDeletion(ctx, pvcName, pvcNamespace); err != nil {
+		if err := waitForPVCDeletion(ctx, k8sClient, pvcName, pvcNamespace); err != nil {
 			logger.Error(err, "Timeout waiting for PVC deletion", "pvc", pvcName)
-			// Continue to try deleting PV anyway
 		}
 	}
 
-	// Find PV by name if we got it from PVC, otherwise find by label
 	pv := &corev1.PersistentVolume{}
 	if pvName != "" {
-		if err := r.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
 			if errors.IsNotFound(err) {
 				logger.V(1).Info("PV already deleted", "pv", pvName)
 				return nil
@@ -378,13 +364,12 @@ func (r *KubeVirtDataUploadReconciler) cleanupReboundPVCAndPV(
 			return fmt.Errorf("failed to get PV %s: %w", pvName, err)
 		}
 	} else {
-		// Find PV by label (PVC was already deleted)
 		pvList := &corev1.PersistentVolumeList{}
-		if err := r.List(ctx, pvList, client.MatchingLabels{common.LabelDataUploadUID: dataUploadUID}); err != nil {
+		if err := k8sClient.List(ctx, pvList, client.MatchingLabels{common.LabelDataUploadUID: resourceUID}); err != nil {
 			return fmt.Errorf("failed to list PVs by label: %w", err)
 		}
 		if len(pvList.Items) == 0 {
-			logger.V(1).Info("No PV found with label, already cleaned up", "label", common.LabelDataUploadUID, "value", dataUploadUID)
+			logger.V(1).Info("No PV found with label, already cleaned up", "label", common.LabelDataUploadUID, "value", resourceUID)
 			return nil
 		}
 		if len(pvList.Items) > 1 {
@@ -395,15 +380,12 @@ func (r *KubeVirtDataUploadReconciler) cleanupReboundPVCAndPV(
 		logger.Info("Found PV by label", "pv", pvName, "label", common.LabelDataUploadUID)
 	}
 
-	// Set reclaim policy to Delete to ensure underlying storage is cleaned up
-	// This includes retry logic. If it fails, we must NOT delete the PV
-	// because that would orphan the underlying storage (storage leakage).
-	if err := r.patchPVReclaimPolicy(ctx, pv, corev1.PersistentVolumeReclaimDelete); err != nil {
+	if err := patchPVReclaimPolicy(ctx, k8sClient, pv, corev1.PersistentVolumeReclaimDelete); err != nil {
 		logger.Error(err, "Failed to set PV reclaim policy to Delete after retries", "pv", pvName)
 		return fmt.Errorf("cannot delete PV %s: failed to set reclaim policy to Delete (would cause storage leakage): %w", pvName, err)
 	}
 
-	if err := r.Delete(ctx, pv); err != nil && !errors.IsNotFound(err) {
+	if err := k8sClient.Delete(ctx, pv); err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete PV %s: %w", pvName, err)
 	}
 	logger.Info("Deleted PV", "pv", pvName)
