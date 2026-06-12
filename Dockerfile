@@ -23,15 +23,15 @@ COPY pkg/ pkg/
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
 
-# Use CentOS Stream 9 as base image to include qemu-img for VM disk restore.
+# Use CentOS Stream 9 minimal as base image to include qemu-img for VM disk restore.
 # qemu-img is required by the datamover download path to reconstruct qcow2
 # incremental chains into raw disk images (issue #73).
 # UBI9 repos (BaseOS, AppStream, CodeReady) do not include qemu-img.
 # CentOS Stream 9 has it in AppStream. For downstream Konflux builds,
 # UBI9 + full RHEL repos work — see:
 # https://github.com/migtools/oadp-vm-file-restore/blob/oadp-dev/containers/oadp-vmfr-access/konflux.Dockerfile
-FROM quay.io/centos/centos:stream9
-RUN dnf install -y qemu-img && dnf clean all
+FROM quay.io/centos/centos:stream9-minimal
+RUN microdnf install -y qemu-img && microdnf clean all
 WORKDIR /
 COPY --from=builder /workspace/manager .
 USER 65532:65532
