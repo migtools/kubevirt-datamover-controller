@@ -17,19 +17,18 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/go-logr/logr"
-	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"context"
-
-	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 )
 
 // getBackupStorageLocation fetches the BSL by name from the OADP namespace,

@@ -127,13 +127,15 @@ const (
 	VMBackupNamePrefix = "vmb-"
 )
 
-// Pod type values used with LabelDatamoverPod
+// Pod type values used with LabelDatamoverPod.
+// These match OperationMode values in the pod builder so label selectors
+// and pod builder stay consistent.
 const (
-	// PodTypeUploader identifies a datamover pod running the upload path.
-	PodTypeUploader = "uploader"
+	// PodTypeUpload identifies a datamover pod running the upload (backup) path.
+	PodTypeUpload = "upload"
 
-	// PodTypeDownloader identifies a datamover pod running the download path.
-	PodTypeDownloader = "downloader"
+	// PodTypeDownload identifies a datamover pod running the download (restore) path.
+	PodTypeDownload = "download"
 )
 
 // DataMover identifier
