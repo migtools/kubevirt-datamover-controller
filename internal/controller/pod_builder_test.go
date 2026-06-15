@@ -104,15 +104,18 @@ func TestBuildDatamoverPod(t *testing.T) {
 		{
 			name: "download mode sets correct label, container name, and command",
 			config: &DatamoverPodConfig{
-				OperationMode:     OperationModeDownload,
-				Name:              "test-dl",
-				Namespace:         "test-ns",
-				Image:             "quay.io/test/datamover:latest",
-				ImagePullPolicy:   corev1.PullAlways,
-				ResourceName:      "test-dd",
-				ResourceUID:       "uid-dl-123",
-				UIDLabelKey:       common.LabelDataDownloadUID,
-				NameAnnotationKey: common.AnnotationDataDownloadName,
+				OperationMode:        OperationModeDownload,
+				Name:                 "test-dl",
+				Namespace:            "test-ns",
+				Image:                "quay.io/test/datamover:latest",
+				ImagePullPolicy:      corev1.PullAlways,
+				ResourceName:         "test-dd",
+				ResourceUID:          "uid-dl-123",
+				UIDLabelKey:          common.LabelDataDownloadUID,
+				NameAnnotationKey:    common.AnnotationDataDownloadName,
+				CredentialSecretName: "cloud-credentials",
+				CredentialSecretKey:  "cloud",
+				SourcePVCName:        "restore-scratch-pvc",
 			},
 			validate: func(t *testing.T, pod *corev1.Pod) {
 				if pod.Labels[common.LabelDatamoverPod] != "download" {

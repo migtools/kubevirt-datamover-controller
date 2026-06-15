@@ -61,7 +61,7 @@ func findPodByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid
 		return nil, nil
 	}
 	if len(podList.Items) > 1 {
-		return nil, fmt.Errorf("found multiple datamover pods for UID %s", uid)
+		return nil, fmt.Errorf("found multiple datamover pods in namespace %s with label %s=%s", namespace, uidLabelKey, uid)
 	}
 	return &podList.Items[0], nil
 }
