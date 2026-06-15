@@ -30,10 +30,10 @@ type OperationMode string
 
 const (
 	// OperationModeUpload runs the backup upload path.
-	OperationModeUpload OperationMode = "upload"
+	OperationModeUpload OperationMode = OperationMode(common.PodTypeUpload)
 
 	// OperationModeDownload runs the restore download path.
-	OperationModeDownload OperationMode = "download"
+	OperationModeDownload OperationMode = OperationMode(common.PodTypeDownload)
 )
 
 // DatamoverPodConfig contains configuration for building a datamover pod.
@@ -73,10 +73,15 @@ type DatamoverPodConfig struct {
 	CheckpointName   string
 	BackupType       string
 	VeleroBackupName string
-	DataUploadName   string
-	DataUploadUID    string
+	ResourceName     string
+	ResourceUID      string
 	VMBName          string
 	VMBTName         string
+
+	// Identity label/annotation keys for the owning resource (DataUpload or DataDownload).
+	// These determine which label key carries the UID and which annotation carries the name.
+	UIDLabelKey       string
+	NameAnnotationKey string
 
 	// Source PVC
 	SourcePVCName string
@@ -94,14 +99,23 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 
 	// Merge default labels with provided labels.
 	// Use UID for labels (always ≤ 63 chars); name goes in annotations.
+	uidLabelKey := config.UIDLabelKey
+	if uidLabelKey == "" {
+		uidLabelKey = common.LabelDataUploadUID
+	}
+	nameAnnotationKey := config.NameAnnotationKey
+	if nameAnnotationKey == "" {
+		nameAnnotationKey = common.AnnotationDataUploadName
+	}
+
 	labels := map[string]string{
-		common.LabelDatamoverPod:  string(mode),
-		common.LabelDataUploadUID: config.DataUploadUID,
+		common.LabelDatamoverPod: string(mode),
+		uidLabelKey:              config.ResourceUID,
 	}
 	maps.Copy(labels, config.Labels)
 
 	annotations := map[string]string{
-		common.AnnotationDataUploadName: config.DataUploadName,
+		nameAnnotationKey: config.ResourceName,
 	}
 
 	// Build environment variables
@@ -121,8 +135,8 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 		{Name: uploader.EnvBackupType, Value: config.BackupType},
 		{Name: uploader.EnvVeleroBackupName, Value: config.VeleroBackupName},
 		{Name: uploader.EnvSourcePVCPath, Value: uploader.DefaultSourcePVCPath},
-		{Name: uploader.EnvDataUploadName, Value: config.DataUploadName},
-		{Name: uploader.EnvDataUploadUID, Value: config.DataUploadUID},
+		{Name: uploader.EnvDataUploadName, Value: config.ResourceName},
+		{Name: uploader.EnvDataUploadUID, Value: config.ResourceUID},
 		{Name: uploader.EnvVMBName, Value: config.VMBName},
 		{Name: uploader.EnvVMBTName, Value: config.VMBTName},
 	}

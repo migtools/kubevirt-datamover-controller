@@ -83,6 +83,8 @@ func rebindPVToNamespace(
 	targetNamespace string,
 	resourceName string,
 	resourceUID string,
+	uidLabelKey string,
+	nameAnnotationKey string,
 ) (*PVRebindResult, error) {
 	// Step 1: Get the source PVC and its bound PV
 	sourcePVC := &corev1.PersistentVolumeClaim{}
@@ -127,9 +129,7 @@ func rebindPVToNamespace(
 	}
 
 	// Step 4: Create new PVC in target namespace with volumeName and selector
-	// Use LabelDataUploadUID for labels/selector (always ≤ 63 chars) instead of
-	// LabelDataUploadName which can exceed the 63-char Kubernetes label value limit.
-	labelKey := common.LabelDataUploadUID
+	labelKey := uidLabelKey
 	labelValue := resourceUID
 	newPVCName := common.SafeResourceName(common.ReboundPVCNamePrefix, resourceName)
 	newPVC := &corev1.PersistentVolumeClaim{
@@ -137,10 +137,10 @@ func rebindPVToNamespace(
 			Name:      newPVCName,
 			Namespace: targetNamespace,
 			Labels: map[string]string{
-				common.LabelDataUploadUID: resourceUID,
+				uidLabelKey: resourceUID,
 			},
 			Annotations: map[string]string{
-				common.AnnotationDataUploadName: resourceName,
+				nameAnnotationKey: resourceName,
 			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
@@ -320,8 +320,8 @@ func waitForPVCBound(ctx context.Context, k8sClient client.Client, pvcName, name
 	})
 }
 
-// cleanupReboundPVCAndPV deletes the rebound PVC and PV after upload completes.
-// The dataUploadUID is used to find the PV by label if the PVC is already gone,
+// cleanupReboundPVCAndPV deletes the rebound PVC and PV after a datamover operation completes.
+// The resourceUID is used to find the PV by label if the PVC is already gone,
 // preventing storage leakage.
 func cleanupReboundPVCAndPV(
 	ctx context.Context,
@@ -330,6 +330,7 @@ func cleanupReboundPVCAndPV(
 	pvcName string,
 	pvcNamespace string,
 	resourceUID string,
+	uidLabelKey string,
 ) error {
 	var pvName string
 
@@ -365,11 +366,11 @@ func cleanupReboundPVCAndPV(
 		}
 	} else {
 		pvList := &corev1.PersistentVolumeList{}
-		if err := k8sClient.List(ctx, pvList, client.MatchingLabels{common.LabelDataUploadUID: resourceUID}); err != nil {
+		if err := k8sClient.List(ctx, pvList, client.MatchingLabels{uidLabelKey: resourceUID}); err != nil {
 			return fmt.Errorf("failed to list PVs by label: %w", err)
 		}
 		if len(pvList.Items) == 0 {
-			logger.V(1).Info("No PV found with label, already cleaned up", "label", common.LabelDataUploadUID, "value", resourceUID)
+			logger.V(1).Info("No PV found with label, already cleaned up", "label", uidLabelKey, "value", resourceUID)
 			return nil
 		}
 		if len(pvList.Items) > 1 {
@@ -377,7 +378,7 @@ func cleanupReboundPVCAndPV(
 		}
 		pv = &pvList.Items[0]
 		pvName = pv.Name
-		logger.Info("Found PV by label", "pv", pvName, "label", common.LabelDataUploadUID)
+		logger.Info("Found PV by label", "pv", pvName, "label", uidLabelKey)
 	}
 
 	if err := patchPVReclaimPolicy(ctx, k8sClient, pv, corev1.PersistentVolumeReclaimDelete); err != nil {

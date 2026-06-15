@@ -50,8 +50,8 @@ func TestBuildDatamoverPod(t *testing.T) {
 				CheckpointName:       "checkpoint-001",
 				BackupType:           "full",
 				VeleroBackupName:     "backup-001",
-				DataUploadName:       "test-du",
-				DataUploadUID:        "uid-12345",
+				ResourceName:         "test-du",
+				ResourceUID:          "uid-12345",
 				VMBName:              "vmb-test-du",
 				SourcePVCName:        "kubevirt-backup-test-du",
 			},
@@ -102,6 +102,38 @@ func TestBuildDatamoverPod(t *testing.T) {
 			},
 		},
 		{
+			name: "download mode sets correct label, container name, and command",
+			config: &DatamoverPodConfig{
+				OperationMode:     OperationModeDownload,
+				Name:              "test-dl",
+				Namespace:         "test-ns",
+				Image:             "quay.io/test/datamover:latest",
+				ImagePullPolicy:   corev1.PullAlways,
+				ResourceName:      "test-dd",
+				ResourceUID:       "uid-dl-123",
+				UIDLabelKey:       common.LabelDataDownloadUID,
+				NameAnnotationKey: common.AnnotationDataDownloadName,
+			},
+			validate: func(t *testing.T, pod *corev1.Pod) {
+				if pod.Labels[common.LabelDatamoverPod] != "download" {
+					t.Errorf("label %s = %q, want %q", common.LabelDatamoverPod, pod.Labels[common.LabelDatamoverPod], "download")
+				}
+				if pod.Labels[common.LabelDataDownloadUID] != "uid-dl-123" {
+					t.Errorf("label %s = %q, want %q", common.LabelDataDownloadUID, pod.Labels[common.LabelDataDownloadUID], "uid-dl-123")
+				}
+				if pod.Annotations[common.AnnotationDataDownloadName] != "test-dd" {
+					t.Errorf("annotation %s = %q, want %q", common.AnnotationDataDownloadName, pod.Annotations[common.AnnotationDataDownloadName], "test-dd")
+				}
+				container := pod.Spec.Containers[0]
+				if container.Name != "download" {
+					t.Errorf("container name = %q, want %q", container.Name, "download")
+				}
+				if len(container.Command) != 2 || container.Command[0] != "/manager" || container.Command[1] != "download" {
+					t.Errorf("container command = %v, want [/manager download]", container.Command)
+				}
+			},
+		},
+		{
 			name: "environment variables are set correctly",
 			config: &DatamoverPodConfig{
 				Name:                     "test-pod",
@@ -122,8 +154,8 @@ func TestBuildDatamoverPod(t *testing.T) {
 				CheckpointName:           "cp-001",
 				BackupType:               "incremental",
 				VeleroBackupName:         "velero-backup",
-				DataUploadName:           "du-001",
-				DataUploadUID:            "uid-001",
+				ResourceName:             "du-001",
+				ResourceUID:              "uid-001",
 				VMBName:                  "vmb-001",
 				SourcePVCName:            "pvc-001",
 			},
@@ -279,8 +311,8 @@ func TestBuildDatamoverPod(t *testing.T) {
 				Name:                 "test-pod",
 				Namespace:            "default",
 				Image:                "test-image",
-				DataUploadName:       "du-001",
-				DataUploadUID:        "uid-001",
+				ResourceName:         "du-001",
+				ResourceUID:          "uid-001",
 				CredentialSecretName: "secret",
 				CredentialSecretKey:  "key",
 				SourcePVCName:        "pvc",

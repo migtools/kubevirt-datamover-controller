@@ -741,7 +741,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 			"sourceNamespace", vmRef.Namespace,
 			"targetNamespace", podNamespace)
 
-		rebindResult, err := rebindPVToNamespace(ctx, r.Client, logger, sourcePVCName, vmRef.Namespace, podNamespace, du.Name, string(du.UID))
+		rebindResult, err := rebindPVToNamespace(ctx, r.Client, logger, sourcePVCName, vmRef.Namespace, podNamespace, du.Name, string(du.UID), common.LabelDataUploadUID, common.AnnotationDataUploadName)
 		if err != nil {
 			// Fail without retry: PV rebind is a multi-step operation (delete PVC, patch PV, create new PVC).
 			// If it fails partway through, automatic retries could leave resources in an inconsistent state.
@@ -906,7 +906,7 @@ func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Con
 	cleanupPodsByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), podNamespace, logger)
 
 	reboundPVCName := common.SafeResourceName(common.ReboundPVCNamePrefix, du.Name)
-	if err := cleanupReboundPVCAndPV(ctx, r.Client, logger, reboundPVCName, podNamespace, string(du.UID)); err != nil {
+	if err := cleanupReboundPVCAndPV(ctx, r.Client, logger, reboundPVCName, podNamespace, string(du.UID), common.LabelDataUploadUID); err != nil {
 		logger.Error(err, "Failed to cleanup rebound PVC and PV", "pvc", reboundPVCName)
 		// Continue - don't block completion on cleanup failures
 	}
@@ -1571,8 +1571,10 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		CheckpointName:           checkpointName,
 		BackupType:               backupType,
 		VeleroBackupName:         getVeleroBackupName(du.Labels),
-		DataUploadName:           du.Name,
-		DataUploadUID:            string(du.UID),
+		ResourceName:             du.Name,
+		ResourceUID:              string(du.UID),
+		UIDLabelKey:              common.LabelDataUploadUID,
+		NameAnnotationKey:        common.AnnotationDataUploadName,
 		VMBName:                  vmb.Name,
 		VMBTName:                 vmbtName,
 		SourcePVCName:            "", // overridden by handlePrepared with the rebound PVC name
