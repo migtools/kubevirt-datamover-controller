@@ -18,7 +18,7 @@ limitations under the License.
 // the kubevirt-datamover-controller and kubevirt-datamover-plugin.
 package common
 
-// Annotation keys for DataUpload resources
+// Annotation keys for DataUpload and DataDownload resources
 const (
 	// AnnotationVMName is the annotation key for the source VirtualMachine name.
 	// This annotation is set on the DataUpload/DataDownload by the plugin to identify

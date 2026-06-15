@@ -1415,7 +1415,11 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logge
 // getBackupStorageLocationForDU is a convenience wrapper around getBackupStorageLocation
 // that extracts the BSL name from a DataUpload.
 func (r *KubeVirtDataUploadReconciler) getBackupStorageLocationForDU(ctx context.Context, du *velerov2alpha1.DataUpload) (*velerov1.BackupStorageLocation, error) {
-	return getBackupStorageLocation(ctx, r.Client, du.Spec.BackupStorageLocation, r.OADPNamespace, du.Namespace)
+	bsl, err := getBackupStorageLocation(ctx, r.Client, du.Spec.BackupStorageLocation, r.OADPNamespace, du.Namespace)
+	if err != nil {
+		return nil, fmt.Errorf("DataUpload %s/%s: %w", du.Namespace, du.Name, err)
+	}
+	return bsl, nil
 }
 
 // findVMBForDataUpload finds the unique VirtualMachineBackup associated with a DataUpload.
