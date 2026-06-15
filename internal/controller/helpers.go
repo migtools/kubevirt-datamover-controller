@@ -98,6 +98,9 @@ func extractPodFailureMessage(pod *corev1.Pod) string {
 		if cs.State.Terminated != nil && cs.State.Terminated.Message != "" {
 			return cs.State.Terminated.Message
 		}
+		if cs.State.Terminated != nil && cs.State.Terminated.Reason != "" {
+			return cs.State.Terminated.Reason
+		}
 	}
 
 	for _, cond := range pod.Status.Conditions {
