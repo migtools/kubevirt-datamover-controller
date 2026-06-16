@@ -128,9 +128,8 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 		VMName:                   os.Getenv(EnvVMName),
 		VMNamespace:              os.Getenv(EnvVMNamespace),
 		CheckpointName:           os.Getenv(EnvCheckpointName),
-		BackupType:               os.Getenv(EnvBackupType),
-		ExpectedBackupType:       os.Getenv(EnvExpectedBackupType),
-		VeleroBackupName:         os.Getenv(EnvVeleroBackupName),
+		BackupType:       os.Getenv(EnvBackupType),
+		VeleroBackupName: os.Getenv(EnvVeleroBackupName),
 		DataUploadName:           os.Getenv(EnvDataUploadName),
 		DataUploadUID:            os.Getenv(EnvDataUploadUID),
 		VMBName:                  os.Getenv(EnvVMBName),
@@ -344,20 +343,6 @@ func updateVMIndex(
 				result.LatestCheckpoint, latestCP.ID)
 		}
 		checkpoint.Parent = result.LatestCheckpoint
-	}
-
-	// If this is an unexpected full backup (controller expected incremental but
-	// virt-controller performed full — e.g., VM lost its libvirt checkpoint),
-	// mark all existing entries as superseded. They remain for existing Velero
-	// backup references but are no longer part of the active chain.
-	if strings.ToLower(config.BackupType) == BackupTypeFull &&
-		strings.ToLower(config.ExpectedBackupType) == BackupTypeIncremental &&
-		len(vmIndex.Checkpoints) > 0 {
-		logger.Info("Unexpected full backup detected (expected incremental), marking existing chain as superseded",
-			"existingCheckpoints", len(vmIndex.Checkpoints))
-		for i := range vmIndex.Checkpoints {
-			vmIndex.Checkpoints[i].Superseded = true
-		}
 	}
 
 	// Append new checkpoint (avoid duplicates)
