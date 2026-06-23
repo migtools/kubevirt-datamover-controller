@@ -772,7 +772,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	// This catches the case where the controller allowed incremental but
 	// virt-controller performed a full backup (e.g., VM lost its libvirt checkpoint).
 	expectedBackupType := du.Annotations[common.AnnotationExpectedBackupType]
-	if expectedBackupType != "" && expectedBackupType != backupType {
+	if expectedBackupType != "" && !strings.EqualFold(expectedBackupType, backupType) {
 		logger.Info("Backup type mismatch detected: VM may have lost its libvirt checkpoint",
 			"expected", expectedBackupType,
 			"actual", backupType)
