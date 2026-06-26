@@ -129,6 +129,7 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 		VMNamespace:              os.Getenv(EnvVMNamespace),
 		CheckpointName:           os.Getenv(EnvCheckpointName),
 		BackupType:               os.Getenv(EnvBackupType),
+		ExpectedBackupType:       os.Getenv(EnvExpectedBackupType),
 		VeleroBackupName:         os.Getenv(EnvVeleroBackupName),
 		DataUploadName:           os.Getenv(EnvDataUploadName),
 		DataUploadUID:            os.Getenv(EnvDataUploadUID),
@@ -324,8 +325,25 @@ func updateVMIndex(
 		VMBTObjectPath: archived.VMBTObjectPath,
 	}
 
+	// Detect a backup type mismatch: the controller expected an incremental
+	// backup but virt-controller actually performed a full one (for example the
+	// VM was restarted and lost its libvirt checkpoint). In that case the data
+	// uploaded to S3 is a standalone full image, so the index entry must record
+	// it as a full backup with no parent pointer. Otherwise restore would try to
+	// walk a parent chain that does not apply to this image.
+	mismatchToFull := strings.ToLower(config.ExpectedBackupType) == BackupTypeIncremental &&
+		strings.ToLower(config.BackupType) == BackupTypeFull
+	if mismatchToFull {
+		logger.Info("Backup type mismatch detected; recording checkpoint as a full backup",
+			"expected", config.ExpectedBackupType,
+			"actual", config.BackupType,
+			"checkpoint", checkpoint.ID)
+		checkpoint.Type = BackupTypeFull
+		checkpoint.Parent = ""
+	}
+
 	// For incremental backups, validate the S3 chain and set parent checkpoint
-	if strings.ToLower(config.BackupType) == BackupTypeIncremental && len(vmIndex.Checkpoints) > 0 {
+	if !mismatchToFull && strings.ToLower(config.BackupType) == BackupTypeIncremental && len(vmIndex.Checkpoints) > 0 {
 		latestCP := vmIndex.Checkpoints[len(vmIndex.Checkpoints)-1]
 		result, err := validateCheckpointChain(ctx, store, config.BSLBucket, vmIndex.Checkpoints, latestCP.ID)
 		if err != nil {
