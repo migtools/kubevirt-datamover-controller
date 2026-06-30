@@ -350,6 +350,22 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 			}
 		}
 
+		// Step 3c: Record expected backup type for mismatch detection.
+		// This annotation lets handlePrepared() compare the actual VMB result
+		// against what the controller intended, and the datamover pod can
+		// reconcile the S3 index if they differ (e.g., VM lost checkpoint).
+		if checkpointLookup != nil {
+			expectedType := uploader.BackupTypeFull
+			if !forceFullBackup && checkpointLookup.Found && checkpointLookup.IsChainValid {
+				expectedType = uploader.BackupTypeIncremental
+			}
+			du.Annotations[common.AnnotationExpectedBackupType] = expectedType
+			if err := r.Update(ctx, du); err != nil {
+				logger.Info("Failed to set expected backup type annotation, will retry",
+					"reason", err.Error())
+			}
+		}
+
 		// Step 4: Create VirtualMachineBackup
 		var created bool
 		vmb, created, err = r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmRef.Namespace, forceFullBackup)
@@ -750,6 +766,16 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	backupType := "full"
 	if vmb.Status != nil && vmb.Status.Type != "" {
 		backupType = string(vmb.Status.Type)
+	}
+
+	// Detect mismatch between expected and actual backup type.
+	// This catches the case where the controller allowed incremental but
+	// virt-controller performed a full backup (e.g., VM lost its libvirt checkpoint).
+	expectedBackupType := du.Annotations[common.AnnotationExpectedBackupType]
+	if expectedBackupType != "" && !strings.EqualFold(expectedBackupType, backupType) {
+		logger.Info("Backup type mismatch detected: VM may have lost its libvirt checkpoint",
+			"expected", expectedBackupType,
+			"actual", backupType)
 	}
 
 	// Get checkpoint name from VMB status
