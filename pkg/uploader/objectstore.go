@@ -381,8 +381,7 @@ func InitObjectStore(cfg *common.ObjectStoreConfig) (velero.ObjectStore, error) 
 	case "gcp":
 		return NewGCPObjectStore(configMap)
 	case "azure":
-		// TODO: Implement Azure Blob Storage support (issue #11)
-		return nil, fmt.Errorf("azure object store not yet implemented")
+		return NewAzureObjectStore(configMap)
 	default:
 		// Try S3-compatible for unknown providers
 		return NewS3ObjectStore(configMap)
