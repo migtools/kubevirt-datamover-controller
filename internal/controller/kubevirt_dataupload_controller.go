@@ -443,14 +443,22 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 	}
 
 	if doneCond != nil && doneCond.Status == corev1.ConditionTrue {
-		// Done=True can mean "finished with error" — KubeVirt sets Done=True + Reason=Failed
-		// when the backup fails (e.g., "No space left on device"). Check Progressing condition.
+		// Done=True can mean "finished with error" — KubeVirt sets Done=True together with
+		// Progressing=False when the backup fails (e.g., "No space left on device"), but the
+		// Reason/Message is a descriptive string like "Backup has failed: <details>" rather than
+		// the literal "Failed". Detect failure via a case-insensitive "failed" substring match on
+		// the Progressing (or Done) condition's Reason/Message so real failures aren't treated as
+		// success.
 		if progressingCond != nil && progressingCond.Status == corev1.ConditionFalse &&
-			progressingCond.Reason == "Failed" {
+			(conditionIndicatesFailure(progressingCond) || conditionIndicatesFailure(doneCond)) {
+			failureMessage := progressingCond.Message
+			if failureMessage == "" {
+				failureMessage = doneCond.Message
+			}
 			logger.Error(nil, "VirtualMachineBackup failed (Done=True with failure)",
-				"vmb", vmb.Name, "reason", progressingCond.Reason, "message", progressingCond.Message)
+				"vmb", vmb.Name, "reason", progressingCond.Reason, "message", failureMessage)
 			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
-				fmt.Sprintf("VMBackup failed: %s", progressingCond.Message)); err != nil {
+				fmt.Sprintf("VMBackup failed: %s", failureMessage)); err != nil {
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{}, nil
@@ -512,6 +520,17 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 	// No Done condition yet, or backup still running - requeue
 	logger.Info("VirtualMachineBackup in progress, requeuing")
 	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+}
+
+// conditionIndicatesFailure reports whether a VirtualMachineBackup condition's Reason or Message
+// signals a failure. KubeVirt emits descriptive strings such as "Backup has failed: <details>"
+// rather than a fixed "Failed" reason, so we match a case-insensitive "failed" substring.
+func conditionIndicatesFailure(cond *kubevirtbackupv1alpha1.Condition) bool {
+	if cond == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(cond.Reason), "failed") ||
+		strings.Contains(strings.ToLower(cond.Message), "failed")
 }
 
 // resolveBackupMode determines whether to force a full backup or allow incremental.

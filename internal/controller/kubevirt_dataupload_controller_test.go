@@ -684,6 +684,25 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 			expectRequeue: false,
 		},
 		{
+			name: "VMB Done True with descriptive failure reason transitions to Failed",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:    kubevirtbackupv1alpha1.ConditionProgressing,
+					Status:  corev1.ConditionFalse,
+					Reason:  "Backup has failed: No space left on device",
+					Message: "Backup has failed: No space left on device",
+				},
+				{
+					Type:    kubevirtbackupv1alpha1.ConditionDone,
+					Status:  corev1.ConditionTrue,
+					Reason:  "Backup has failed: No space left on device",
+					Message: "Backup has failed: No space left on device",
+				},
+			},
+			expectedPhase: velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue: false,
+		},
+		{
 			name: "VMB Done False and Progressing False transitions to Failed",
 			vmbConditions: []kubevirtbackupv1alpha1.Condition{
 				{
