@@ -152,7 +152,7 @@ func NewPodLogCollector(clientset kubernetes.Interface, tailLines int64) func(ct
 		if err != nil {
 			return "", fmt.Errorf("failed to stream pod logs: %w", err)
 		}
-		defer stream.Close()
+		defer func() { _ = stream.Close() }()
 		data, err := io.ReadAll(stream)
 		if err != nil {
 			return "", fmt.Errorf("failed to read pod logs: %w", err)
