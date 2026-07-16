@@ -18,15 +18,15 @@ limitations under the License.
 // the kubevirt-datamover-controller and kubevirt-datamover-plugin.
 package common
 
-// Annotation keys for DataUpload resources
+// Annotation keys for DataUpload and DataDownload resources
 const (
 	// AnnotationVMName is the annotation key for the source VirtualMachine name.
-	// This annotation is set on the DataUpload by the plugin to identify
-	// which VM should be backed up.
+	// This annotation is set on the DataUpload/DataDownload by the plugin to identify
+	// which VM should be backed up or restored.
 	AnnotationVMName = "kubevirt-datamover.io/vm-name"
 
 	// AnnotationVMNamespace is the annotation key for the source VirtualMachine namespace.
-	// If not set, the controller will use the DataUpload's source namespace.
+	// If not set, the controller will use the DataUpload/DataDownload's source namespace.
 	AnnotationVMNamespace = "kubevirt-datamover.io/vm-namespace"
 
 	// AnnotationOperationID is the annotation for tracking async backup/restore operations.
@@ -58,6 +58,10 @@ const (
 	// AnnotationDataUploadName is the annotation key for the DataUpload name.
 	// Used on VMB, VMBT, and PVC resources to track ownership.
 	AnnotationDataUploadName = "velero.io/dataupload-name"
+
+	// AnnotationDataDownloadName is the annotation key for the DataDownload name.
+	// Used on PVC and pod resources to track ownership during restore.
+	AnnotationDataDownloadName = "velero.io/datadownload-name"
 )
 
 // Annotation keys for VirtualMachine resources
@@ -78,6 +82,11 @@ const (
 	// Used for precise ownership tracking and label-based lookups.
 	LabelDataUploadUID = "velero.io/dataupload-uid"
 
+	// LabelDataDownloadUID is the label key for the DataDownload UID.
+	// UIDs are always 36 characters, safe for label values.
+	// Used for precise ownership tracking and label-based lookups during restore.
+	LabelDataDownloadUID = "velero.io/datadownload-uid"
+
 	// LabelVMNameHash is the label key for a hashed VM name on VMBTs.
 	// VM names can exceed the 63-char label limit, so we store a 16-char
 	// hex hash for label-based lookups and the full name in an annotation.
@@ -88,21 +97,45 @@ const (
 
 	// LabelVeleroBackupName is the label key for the Velero backup name.
 	LabelVeleroBackupName = "velero.io/backup-name"
+
+	// LabelVeleroRestoreName is the label key for the Velero restore name.
+	LabelVeleroRestoreName = "velero.io/restore-name"
 )
 
 // Naming conventions for resources
 const (
-	// DatamoverPodNamePrefix is the prefix for datamover pod names.
+	// DatamoverPodNamePrefix is the prefix for datamover upload pod names.
 	DatamoverPodNamePrefix = "kubevirt-dm-"
 
-	// TempPVCNamePrefix is the prefix for temporary PVC names.
+	// DownloaderPodNamePrefix is the prefix for datamover download pod names.
+	DownloaderPodNamePrefix = "kubevirt-dm-dl-"
+
+	// TempPVCNamePrefix is the prefix for temporary backup PVC names.
 	TempPVCNamePrefix = "kubevirt-backup-"
+
+	// ScratchPVCNamePrefix is the prefix for temporary scratch PVCs used during restore
+	// to hold downloaded qcow2 files before chain reconstruction.
+	ScratchPVCNamePrefix = "kubevirt-restore-scratch-"
+
+	// TargetPVCNamePrefix is the prefix for restored disk PVCs.
+	TargetPVCNamePrefix = "kubevirt-restore-"
 
 	// ReboundPVCNamePrefix is the prefix for PVCs created in OADP namespace after PV rebinding.
 	ReboundPVCNamePrefix = "kubevirt-dm-pvc-"
 
 	// VMBackupNamePrefix is the prefix for VirtualMachineBackup names.
 	VMBackupNamePrefix = "vmb-"
+)
+
+// Pod type values used with LabelDatamoverPod.
+// These match OperationMode values in the pod builder so label selectors
+// and pod builder stay consistent.
+const (
+	// PodTypeUpload identifies a datamover pod running the upload (backup) path.
+	PodTypeUpload = "upload"
+
+	// PodTypeDownload identifies a datamover pod running the download (restore) path.
+	PodTypeDownload = "download"
 )
 
 // DataMover identifier
@@ -154,6 +187,35 @@ const (
 //
 //   InProgress -> Completed:
 //     - Plugin monitors datamover pod progress
+//     - Transitions to Completed when data transfer finishes
+//
+//   Any -> Failed:
+//     - Any phase can transition to Failed on errors
+//
+//   InProgress -> Canceling -> Canceled:
+//     - Cancellation support (handles user-initiated cancel requests)
+//
+// DataDownload Phase Transitions (for documentation):
+//
+// The kubevirt-datamover-controller handles the following phase transitions
+// for DataDownload CRs:
+//
+//   New -> Accepted:
+//     - Controller validates VM annotations and BSL accessibility
+//     - Transitions to Accepted if valid, Failed if missing
+//
+//   Accepted -> Prepared:
+//     - Controller reads backup manifest from BSL to get checkpoint chain
+//     - Creates scratch PVC for downloaded qcow2 files
+//     - Transitions to Prepared when ready
+//
+//   Prepared -> InProgress:
+//     - Controller launches downloader pod to download and reconstruct disk
+//     - Pod downloads checkpoint chain, runs qemu-img to flatten to raw
+//
+//   InProgress -> Completed:
+//     - Controller monitors downloader pod progress
+//     - Provisions target PVC with restored disk data
 //     - Transitions to Completed when data transfer finishes
 //
 //   Any -> Failed:

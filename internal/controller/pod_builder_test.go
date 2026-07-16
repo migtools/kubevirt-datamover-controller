@@ -50,8 +50,8 @@ func TestBuildDatamoverPod(t *testing.T) {
 				CheckpointName:       "checkpoint-001",
 				BackupType:           "full",
 				VeleroBackupName:     "backup-001",
-				DataUploadName:       "test-du",
-				DataUploadUID:        "uid-12345",
+				ResourceName:         "test-du",
+				ResourceUID:          "uid-12345",
 				VMBName:              "vmb-test-du",
 				SourcePVCName:        "kubevirt-backup-test-du",
 			},
@@ -65,8 +65,8 @@ func TestBuildDatamoverPod(t *testing.T) {
 				}
 
 				// Verify labels
-				if pod.Labels[common.LabelDatamoverPod] != "uploader" {
-					t.Errorf("label %s = %q, want %q", common.LabelDatamoverPod, pod.Labels[common.LabelDatamoverPod], "uploader")
+				if pod.Labels[common.LabelDatamoverPod] != "upload" {
+					t.Errorf("label %s = %q, want %q", common.LabelDatamoverPod, pod.Labels[common.LabelDatamoverPod], "upload")
 				}
 				if pod.Labels[common.LabelDataUploadUID] != "uid-12345" {
 					t.Errorf("label %s = %q, want %q", common.LabelDataUploadUID, pod.Labels[common.LabelDataUploadUID], "uid-12345")
@@ -88,8 +88,8 @@ func TestBuildDatamoverPod(t *testing.T) {
 					t.Fatalf("expected 1 container, got %d", len(pod.Spec.Containers))
 				}
 				container := pod.Spec.Containers[0]
-				if container.Name != "uploader" {
-					t.Errorf("container name = %q, want %q", container.Name, "uploader")
+				if container.Name != "upload" {
+					t.Errorf("container name = %q, want %q", container.Name, "upload")
 				}
 				if container.Image != "quay.io/test/datamover:latest" {
 					t.Errorf("container image = %q, want %q", container.Image, "quay.io/test/datamover:latest")
@@ -98,6 +98,41 @@ func TestBuildDatamoverPod(t *testing.T) {
 				// Verify command
 				if len(container.Command) != 2 || container.Command[0] != "/manager" || container.Command[1] != "upload" {
 					t.Errorf("container command = %v, want [/manager upload]", container.Command)
+				}
+			},
+		},
+		{
+			name: "download mode sets correct label, container name, and command",
+			config: &DatamoverPodConfig{
+				OperationMode:        OperationModeDownload,
+				Name:                 "test-dl",
+				Namespace:            "test-ns",
+				Image:                "quay.io/test/datamover:latest",
+				ImagePullPolicy:      corev1.PullAlways,
+				ResourceName:         "test-dd",
+				ResourceUID:          "uid-dl-123",
+				UIDLabelKey:          common.LabelDataDownloadUID,
+				NameAnnotationKey:    common.AnnotationDataDownloadName,
+				CredentialSecretName: "cloud-credentials",
+				CredentialSecretKey:  "cloud",
+				SourcePVCName:        "restore-scratch-pvc",
+			},
+			validate: func(t *testing.T, pod *corev1.Pod) {
+				if pod.Labels[common.LabelDatamoverPod] != "download" {
+					t.Errorf("label %s = %q, want %q", common.LabelDatamoverPod, pod.Labels[common.LabelDatamoverPod], "download")
+				}
+				if pod.Labels[common.LabelDataDownloadUID] != "uid-dl-123" {
+					t.Errorf("label %s = %q, want %q", common.LabelDataDownloadUID, pod.Labels[common.LabelDataDownloadUID], "uid-dl-123")
+				}
+				if pod.Annotations[common.AnnotationDataDownloadName] != "test-dd" {
+					t.Errorf("annotation %s = %q, want %q", common.AnnotationDataDownloadName, pod.Annotations[common.AnnotationDataDownloadName], "test-dd")
+				}
+				container := pod.Spec.Containers[0]
+				if container.Name != "download" {
+					t.Errorf("container name = %q, want %q", container.Name, "download")
+				}
+				if len(container.Command) != 2 || container.Command[0] != "/manager" || container.Command[1] != "download" {
+					t.Errorf("container command = %v, want [/manager download]", container.Command)
 				}
 			},
 		},
@@ -122,8 +157,8 @@ func TestBuildDatamoverPod(t *testing.T) {
 				CheckpointName:           "cp-001",
 				BackupType:               "incremental",
 				VeleroBackupName:         "velero-backup",
-				DataUploadName:           "du-001",
-				DataUploadUID:            "uid-001",
+				ResourceName:             "du-001",
+				ResourceUID:              "uid-001",
 				VMBName:                  "vmb-001",
 				SourcePVCName:            "pvc-001",
 			},
@@ -279,8 +314,8 @@ func TestBuildDatamoverPod(t *testing.T) {
 				Name:                 "test-pod",
 				Namespace:            "default",
 				Image:                "test-image",
-				DataUploadName:       "du-001",
-				DataUploadUID:        "uid-001",
+				ResourceName:         "du-001",
+				ResourceUID:          "uid-001",
 				CredentialSecretName: "secret",
 				CredentialSecretKey:  "key",
 				SourcePVCName:        "pvc",
@@ -298,7 +333,7 @@ func TestBuildDatamoverPod(t *testing.T) {
 					t.Errorf("another-label = %q, want %q", pod.Labels["another-label"], "another-value")
 				}
 				// Check default labels are still present
-				if pod.Labels[common.LabelDatamoverPod] != "uploader" {
+				if pod.Labels[common.LabelDatamoverPod] != "upload" {
 					t.Errorf("default label missing: %s", common.LabelDatamoverPod)
 				}
 			},

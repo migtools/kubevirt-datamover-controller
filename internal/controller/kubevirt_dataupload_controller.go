@@ -254,7 +254,7 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	// BSL must be in Available phase — if it's not, fail immediately rather than
 	// creating resources (PVC, VMBT, VMB) that will be wasted.
 	if du.Spec.BackupStorageLocation != "" {
-		bslObj, err := r.getBackupStorageLocation(ctx, du)
+		bslObj, err := r.getBackupStorageLocationForDU(ctx, du)
 		if err != nil {
 			logger.Error(err, "BackupStorageLocation not accessible")
 			if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
@@ -590,7 +590,7 @@ func (r *KubeVirtDataUploadReconciler) validateBSLCheckpoint(ctx context.Context
 	forceFullBackup := false
 
 	var checkpointLookup *uploader.CheckpointLookupResult
-	bsl, bslErr := r.getBackupStorageLocation(ctx, du)
+	bsl, bslErr := r.getBackupStorageLocationForDU(ctx, du)
 	if bslErr != nil {
 		// BSL lookup failure is non-fatal. Validation will be retried on the
 		// next reconcile.
@@ -692,7 +692,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	// This prevents leaving PV in a bad state if these checks fail
 
 	// Get BackupStorageLocation
-	bsl, err := r.getBackupStorageLocation(ctx, du)
+	bsl, err := r.getBackupStorageLocationForDU(ctx, du)
 	if err != nil {
 		logger.Error(err, "Failed to get BackupStorageLocation")
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Failed to get BSL: %v", err)); err != nil {
@@ -741,7 +741,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 			"sourceNamespace", vmRef.Namespace,
 			"targetNamespace", podNamespace)
 
-		rebindResult, err := r.rebindPVToNamespace(ctx, logger, sourcePVCName, vmRef.Namespace, podNamespace, du.Name, string(du.UID))
+		rebindResult, err := rebindPVToNamespace(ctx, r.Client, logger, sourcePVCName, vmRef.Namespace, podNamespace, du.Name, string(du.UID), common.LabelDataUploadUID, common.AnnotationDataUploadName)
 		if err != nil {
 			// Fail without retry: PV rebind is a multi-step operation (delete PVC, patch PV, create new PVC).
 			// If it fails partway through, automatic retries could leave resources in an inconsistent state.
@@ -903,24 +903,10 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 
 // cleanupDatamoverResources cleans up resources created during the datamover process
 func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, podNamespace string) {
-	// Delete the datamover pod
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(podNamespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
-		logger.Error(err, "Failed to list datamover pods for cleanup")
-	} else {
-		for i := range podList.Items {
-			pod := &podList.Items[i]
-			if err := r.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
-				logger.Error(err, "Failed to delete datamover pod", "pod", pod.Name)
-			} else {
-				logger.Info("Deleted datamover pod", "pod", pod.Name)
-			}
-		}
-	}
+	cleanupPodsByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), podNamespace, logger)
 
-	// Delete the rebound PVC and PV
 	reboundPVCName := common.SafeResourceName(common.ReboundPVCNamePrefix, du.Name)
-	if err := r.cleanupReboundPVCAndPV(ctx, logger, reboundPVCName, podNamespace, string(du.UID)); err != nil {
+	if err := cleanupReboundPVCAndPV(ctx, r.Client, logger, reboundPVCName, podNamespace, string(du.UID), common.LabelDataUploadUID); err != nil {
 		logger.Error(err, "Failed to cleanup rebound PVC and PV", "pvc", reboundPVCName)
 		// Continue - don't block completion on cleanup failures
 	}
@@ -1218,15 +1204,6 @@ func (r *KubeVirtDataUploadReconciler) calculateBackupPVCSize(ctx context.Contex
 	return defaultSize, nil
 }
 
-// addOverhead returns qty increased by the given percentage.
-// For example, addOverhead(30Gi, 20) returns 36Gi.
-func addOverhead(qty resource.Quantity, percent int64) resource.Quantity {
-	base := qty.Value()
-	overhead := base * percent / 100
-	result := resource.NewQuantity(base+overhead, resource.BinarySI)
-	return *result
-}
-
 // prepareVMBackupTracker returns an existing on-cluster VirtualMachineBackupTracker
 // for the VM if one exists, or creates a new one (restoring LatestCheckpoint from
 // S3 if available). The VMBT is left on-cluster between backups so KubeVirt can
@@ -1252,7 +1229,7 @@ func (r *KubeVirtDataUploadReconciler) prepareVMBackupTracker(ctx context.Contex
 	// This is non-fatal: if BSL is unreachable or no VMBT exists yet (first backup),
 	// we create a fresh VMBT without a checkpoint.
 	var archivedVMBT *kubevirtbackupv1alpha1.VirtualMachineBackupTracker
-	bsl, bslErr := r.getBackupStorageLocation(ctx, du)
+	bsl, bslErr := r.getBackupStorageLocationForDU(ctx, du)
 	if bslErr != nil {
 		logger.Info("BSL not available for VMBT lookup, creating fresh VMBT",
 			"reason", bslErr.Error())
@@ -1435,25 +1412,13 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logge
 	return vmb, true, nil
 }
 
-// getBackupStorageLocation fetches the BSL referenced by the DataUpload
-func (r *KubeVirtDataUploadReconciler) getBackupStorageLocation(ctx context.Context, du *velerov2alpha1.DataUpload) (*velerov1.BackupStorageLocation, error) {
-	bslName := du.Spec.BackupStorageLocation
-	if bslName == "" {
-		return nil, fmt.Errorf("DataUpload %s has no BackupStorageLocation specified", du.Name)
+// getBackupStorageLocationForDU is a convenience wrapper around getBackupStorageLocation
+// that extracts the BSL name from a DataUpload.
+func (r *KubeVirtDataUploadReconciler) getBackupStorageLocationForDU(ctx context.Context, du *velerov2alpha1.DataUpload) (*velerov1.BackupStorageLocation, error) {
+	bsl, err := getBackupStorageLocation(ctx, r.Client, du.Spec.BackupStorageLocation, r.OADPNamespace, du.Namespace)
+	if err != nil {
+		return nil, fmt.Errorf("DataUpload %s/%s: %w", du.Namespace, du.Name, err)
 	}
-
-	// BSL is in the OADP namespace (where Velero runs)
-	namespace := r.OADPNamespace
-	if namespace == "" {
-		// Fall back to the DataUpload's namespace
-		namespace = du.Namespace
-	}
-
-	bsl := &velerov1.BackupStorageLocation{}
-	if err := r.Get(ctx, types.NamespacedName{Name: bslName, Namespace: namespace}, bsl); err != nil {
-		return nil, fmt.Errorf("failed to get BackupStorageLocation %s/%s: %w", namespace, bslName, err)
-	}
-
 	return bsl, nil
 }
 
@@ -1559,24 +1524,6 @@ func (r *KubeVirtDataUploadReconciler) hasOlderActiveDUForVM(ctx context.Context
 	return false, "", nil
 }
 
-// getVeleroBackupName extracts the Velero backup name from DataUpload labels
-func getVeleroBackupName(du *velerov2alpha1.DataUpload) string {
-	if du.Labels == nil {
-		return ""
-	}
-	return du.Labels[common.LabelVeleroBackupName]
-}
-
-// safeGenerateNamePrefix truncates a GenerateName prefix so that the final
-// name (prefix + 5 random chars) does not exceed maxNameLen.
-func safeGenerateNamePrefix(prefix string, maxNameLen int) string {
-	maxPrefix := max(maxNameLen-k8sGenerateNameRandomLen, 1)
-	if len(prefix) > maxPrefix {
-		prefix = prefix[:maxPrefix]
-	}
-	return prefix
-}
-
 // buildDatamoverPodConfig assembles the configuration for the datamover pod
 func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 	du *velerov2alpha1.DataUpload,
@@ -1608,6 +1555,7 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 	}
 
 	return &DatamoverPodConfig{
+		OperationMode:            OperationModeUpload,
 		Name:                     du.Name, // Used as a prefix for GenerateName
 		Namespace:                vmRef.Namespace,
 		Image:                    image,
@@ -1626,43 +1574,16 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		VMNamespace:              vmRef.Namespace,
 		CheckpointName:           checkpointName,
 		BackupType:               backupType,
-		VeleroBackupName:         getVeleroBackupName(du),
-		DataUploadName:           du.Name,
-		DataUploadUID:            string(du.UID),
+		VeleroBackupName:         getVeleroBackupName(du.Labels),
+		ResourceName:             du.Name,
+		ResourceUID:              string(du.UID),
+		UIDLabelKey:              common.LabelDataUploadUID,
+		NameAnnotationKey:        common.AnnotationDataUploadName,
 		VMBName:                  vmb.Name,
 		VMBTName:                 vmbtName,
 		SourcePVCName:            "", // overridden by handlePrepared with the rebound PVC name
 		Labels:                   make(map[string]string),
 	}, nil
-}
-
-// extractPodFailureMessage extracts the failure message from a failed pod
-func extractPodFailureMessage(pod *corev1.Pod) string {
-	// Check container statuses for termination message
-	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.State.Terminated != nil && cs.State.Terminated.Message != "" {
-			return cs.State.Terminated.Message
-		}
-		if cs.State.Terminated != nil && cs.State.Terminated.Reason != "" {
-			return cs.State.Terminated.Reason
-		}
-	}
-
-	// Check init container statuses
-	for _, cs := range pod.Status.InitContainerStatuses {
-		if cs.State.Terminated != nil && cs.State.Terminated.Message != "" {
-			return cs.State.Terminated.Message
-		}
-	}
-
-	// Fall back to pod conditions
-	for _, cond := range pod.Status.Conditions {
-		if cond.Status == corev1.ConditionFalse && cond.Message != "" {
-			return cond.Message
-		}
-	}
-
-	return "unknown error"
 }
 
 // lookupCheckpointFromBSL reads the VM's checkpoint index from the BSL and returns
@@ -1684,15 +1605,5 @@ func (r *KubeVirtDataUploadReconciler) lookupCheckpointFromBSL(ctx context.Conte
 
 // findPodForDataUpload finds the unique datamover pod associated with a DataUpload.
 func (r *KubeVirtDataUploadReconciler) findPodForDataUpload(ctx context.Context, du *velerov2alpha1.DataUpload, namespace string) (*corev1.Pod, error) {
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
-		return nil, err
-	}
-	if len(podList.Items) == 0 {
-		return nil, nil
-	}
-	if len(podList.Items) > 1 {
-		return nil, fmt.Errorf("found multiple datamover pods for DataUpload %s", du.Name)
-	}
-	return &podList.Items[0], nil
+	return findPodByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), namespace)
 }

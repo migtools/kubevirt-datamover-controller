@@ -2077,7 +2077,7 @@ func TestGetVeleroBackupName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := getVeleroBackupName(tt.du)
+			result := getVeleroBackupName(tt.du.Labels)
 			if result != tt.expected {
 				t.Errorf("getVeleroBackupName() = %q, want %q", result, tt.expected)
 			}
@@ -2410,7 +2410,7 @@ func TestGetBackupStorageLocation(t *testing.T) {
 			},
 			bsl:           nil,
 			expectError:   true,
-			errorContains: "no BackupStorageLocation specified",
+			errorContains: "no BackupStorageLocation name specified",
 		},
 	}
 
@@ -2427,7 +2427,7 @@ func TestGetBackupStorageLocation(t *testing.T) {
 				OADPNamespace: "openshift-adp",
 			}
 
-			bsl, err := r.getBackupStorageLocation(context.Background(), tt.du)
+			bsl, err := r.getBackupStorageLocationForDU(context.Background(), tt.du)
 
 			if tt.expectError {
 				if err == nil {
