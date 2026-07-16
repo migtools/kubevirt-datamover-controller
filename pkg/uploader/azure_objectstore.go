@@ -29,7 +29,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
-	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
 )
@@ -44,11 +44,11 @@ var _ velero.ObjectStore = (*AzureObjectStore)(nil)
 
 // AzureObjectStore implements velero.ObjectStore for Microsoft Azure Blob Storage.
 type AzureObjectStore struct {
-	client     *azblob.Client
-	sharedKey  *azblob.SharedKeyCredential
-	bucket     string
-	prefix     string
-	blockSize  int
+	client    *azblob.Client
+	sharedKey *azblob.SharedKeyCredential
+	bucket    string
+	prefix    string
+	blockSize int
 }
 
 // NewAzureObjectStore creates a new AzureObjectStore from a config map.
@@ -140,8 +140,19 @@ func (a *AzureObjectStore) PutObject(bucket, key string, body io.Reader) error {
 		if n > 0 {
 			// blockID needs to be the same length for all blocks, so use a fixed width.
 			blockID := fmt.Sprintf("%08d", len(blockIDs))
-			
-			_, putErr := blobClient.StageBlock(context.Background(), blockID, bytes.NewReader(block[0:n]), nil)
+
+			br := bytes.NewReader(block[0:n])
+
+			// Wrap *bytes.Reader into an io.ReadSeekCloser
+			var rsc io.ReadSeekCloser = struct {
+				*bytes.Reader
+				io.Closer
+			}{
+				Reader: br,
+				Closer: io.NopCloser(nil),
+			}
+
+			_, putErr := blobClient.StageBlock(context.Background(), blockID, rsc, nil)
 			if putErr != nil {
 				return fmt.Errorf("error putting block %s: %w", blockID, putErr)
 			}
@@ -167,12 +178,12 @@ func (a *AzureObjectStore) PutObject(bucket, key string, body io.Reader) error {
 // GetObject retrieves an object from Azure Blob Storage.
 func (a *AzureObjectStore) GetObject(bucket, key string) (io.ReadCloser, error) {
 	fullKey := a.fullKey(key)
-	
+
 	res, err := a.client.DownloadStream(context.Background(), bucket, fullKey, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get object %s: %w", key, err)
 	}
-	
+
 	return res.Body, nil
 }
 
@@ -180,28 +191,28 @@ func (a *AzureObjectStore) GetObject(bucket, key string) (io.ReadCloser, error) 
 func (a *AzureObjectStore) ObjectExists(bucket, key string) (bool, error) {
 	fullKey := a.fullKey(key)
 	blobClient := a.client.ServiceClient().NewContainerClient(bucket).NewBlockBlobClient(fullKey)
-	
+
 	_, err := blobClient.GetProperties(context.Background(), nil)
 	if err == nil {
 		return true, nil
 	}
-	
+
 	if bloberror.HasCode(err, bloberror.ContainerNotFound, bloberror.BlobNotFound) {
 		return false, nil
 	}
-	
+
 	return false, fmt.Errorf("failed to check object existence %s: %w", key, err)
 }
 
 // DeleteObject removes an object from Azure Blob Storage.
 func (a *AzureObjectStore) DeleteObject(bucket, key string) error {
 	fullKey := a.fullKey(key)
-	
+
 	_, err := a.client.DeleteBlob(context.Background(), bucket, fullKey, nil)
 	if err != nil {
 		return fmt.Errorf("failed to delete object %s: %w", key, err)
 	}
-	
+
 	return nil
 }
 
@@ -209,11 +220,11 @@ func (a *AzureObjectStore) DeleteObject(bucket, key string) error {
 func (a *AzureObjectStore) ListCommonPrefixes(bucket, prefix, delimiter string) ([]string, error) {
 	fullPrefix := a.fullKey(prefix)
 	var prefixes []string
-	
-	pager := a.client.NewListBlobsHierarchyPager(bucket, delimiter, &azblob.ListBlobsHierarchyOptions{
+
+	pager := a.client.ServiceClient().NewContainerClient(bucket).NewListBlobsHierarchyPager(delimiter, &container.ListBlobsHierarchyOptions{
 		Prefix: &fullPrefix,
 	})
-	
+
 	for pager.More() {
 		page, err := pager.NextPage(context.Background())
 		if err != nil {
@@ -225,7 +236,7 @@ func (a *AzureObjectStore) ListCommonPrefixes(bucket, prefix, delimiter string) 
 			}
 		}
 	}
-	
+
 	return prefixes, nil
 }
 
@@ -233,11 +244,11 @@ func (a *AzureObjectStore) ListCommonPrefixes(bucket, prefix, delimiter string) 
 func (a *AzureObjectStore) ListObjects(bucket, prefix string) ([]string, error) {
 	fullPrefix := a.fullKey(prefix)
 	var keys []string
-	
+
 	pager := a.client.NewListBlobsFlatPager(bucket, &azblob.ListBlobsFlatOptions{
 		Prefix: &fullPrefix,
 	})
-	
+
 	for pager.More() {
 		page, err := pager.NextPage(context.Background())
 		if err != nil {
@@ -249,7 +260,7 @@ func (a *AzureObjectStore) ListObjects(bucket, prefix string) ([]string, error) 
 			}
 		}
 	}
-	
+
 	return keys, nil
 }
 
@@ -260,7 +271,7 @@ func (a *AzureObjectStore) CreateSignedURL(bucket, key string, ttl time.Duration
 	}
 
 	fullKey := a.fullKey(key)
-	
+
 	sasQueryParams, err := sas.BlobSignatureValues{
 		Protocol:      sas.ProtocolHTTPS,
 		StartTime:     time.Now().UTC().Add(-10 * time.Minute),
@@ -269,7 +280,7 @@ func (a *AzureObjectStore) CreateSignedURL(bucket, key string, ttl time.Duration
 		ContainerName: bucket,
 		BlobName:      fullKey,
 	}.SignWithSharedKey(a.sharedKey)
-	
+
 	if err != nil {
 		return "", fmt.Errorf("failed to sign SAS URL: %w", err)
 	}
