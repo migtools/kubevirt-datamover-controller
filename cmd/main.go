@@ -32,6 +32,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
@@ -226,6 +227,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	kubeClient, err := kubernetes.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to create kubernetes clientset")
+		os.Exit(1)
+	}
+
 	// Setup KubeVirt DataUpload controller
 	if err = (&controller.KubeVirtDataUploadReconciler{
 		Client:                   mgr.GetClient(),
@@ -236,6 +243,7 @@ func main() {
 		DatamoverImagePullPolicy: corev1.PullPolicy(datamoverImagePullPolicy),
 		MaxIncrementalBackups:    maxIncrementalBackups,
 		OADPNamespace:            oadpNamespace,
+		PodLogCollector:          controller.NewPodLogCollector(kubeClient, 100),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "KubeVirtDataUpload")
 		os.Exit(1)

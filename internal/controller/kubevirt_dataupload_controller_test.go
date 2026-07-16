@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -7103,6 +7104,183 @@ func TestGetEffectiveMaxIncrementalBackups(t *testing.T) {
 
 			if result != tt.expectedMax {
 				t.Errorf("getEffectiveMaxIncrementalBackups() = %d, want %d", result, tt.expectedMax)
+			}
+		})
+	}
+}
+
+func TestEmitPodLogs(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "datamover-test-pod",
+			Namespace: "openshift-adp",
+		},
+	}
+
+	tests := []struct {
+		name            string
+		collector       func(ctx context.Context, podName, podNamespace string) (string, error)
+		expectLogs      bool
+		expectedLines   int
+		expectCollected bool
+	}{
+		{
+			name:            "nil collector skips log collection",
+			collector:       nil,
+			expectLogs:      false,
+			expectCollected: false,
+		},
+		{
+			name: "collector error logs warning and continues",
+			collector: func(ctx context.Context, podName, podNamespace string) (string, error) {
+				return "", fmt.Errorf("connection refused")
+			},
+			expectLogs:      false,
+			expectCollected: true,
+		},
+		{
+			name: "empty log output emits nothing",
+			collector: func(ctx context.Context, podName, podNamespace string) (string, error) {
+				return "", nil
+			},
+			expectLogs:      false,
+			expectCollected: true,
+		},
+		{
+			name: "multi-line output emits each line",
+			collector: func(ctx context.Context, podName, podNamespace string) (string, error) {
+				return "uploading snapshot\nprogress: 100%\ncompleted\n", nil
+			},
+			expectLogs:      true,
+			expectedLines:   3,
+			expectCollected: true,
+		},
+		{
+			name: "single line without trailing newline",
+			collector: func(ctx context.Context, podName, podNamespace string) (string, error) {
+				return "done", nil
+			},
+			expectLogs:      true,
+			expectedLines:   1,
+			expectCollected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logBuf bytes.Buffer
+			logger := funcr.New(func(prefix, args string) {
+				logBuf.WriteString(args + "\n")
+			}, funcr.Options{})
+
+			r := &KubeVirtDataUploadReconciler{
+				PodLogCollector: tt.collector,
+			}
+
+			r.emitPodLogs(context.Background(), logger, pod)
+
+			hasLogs := strings.Contains(logBuf.String(), "Datamover pod log")
+			if hasLogs != tt.expectLogs {
+				t.Errorf("expected logs=%v, got logs=%v, output: %s", tt.expectLogs, hasLogs, logBuf.String())
+			}
+
+			if tt.expectLogs {
+				lineCount := strings.Count(logBuf.String(), "Datamover pod log")
+				if lineCount != tt.expectedLines {
+					t.Errorf("expected %d log lines, got %d", tt.expectedLines, lineCount)
+				}
+			}
+		})
+	}
+}
+
+func TestHandleInProgress_PodLogCollectionFailureDoesNotBlock(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	tests := []struct {
+		name          string
+		podPhase      corev1.PodPhase
+		expectedPhase velerov2alpha1.DataUploadPhase
+	}{
+		{
+			name:          "log failure does not block PodSucceeded",
+			podPhase:      corev1.PodSucceeded,
+			expectedPhase: velerov2alpha1.DataUploadPhaseCompleted,
+		},
+		{
+			name:          "log failure does not block PodFailed",
+			podPhase:      corev1.PodFailed,
+			expectedPhase: velerov2alpha1.DataUploadPhaseFailed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			du := &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					UID:       types.UID("test-uid-log-fail"),
+					Annotations: map[string]string{
+						common.AnnotationVMName:      "test-vm",
+						common.AnnotationVMNamespace: "test-ns",
+					},
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					DataMover: common.DataMoverKubeVirt,
+				},
+				Status: velerov2alpha1.DataUploadStatus{
+					Phase: velerov2alpha1.DataUploadPhaseInProgress,
+				},
+			}
+
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      common.DatamoverPodNamePrefix + du.Name,
+					Namespace: "openshift-adp",
+					Labels: map[string]string{
+						common.LabelDataUploadUID: string(du.UID),
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: tt.podPhase,
+				},
+			}
+
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(du, pod).
+				Build()
+
+			r := &KubeVirtDataUploadReconciler{
+				Client:        fakeClient,
+				Scheme:        scheme,
+				Log:           logr.Discard(),
+				OADPNamespace: "openshift-adp",
+				PodLogCollector: func(ctx context.Context, podName, podNamespace string) (string, error) {
+					return "", fmt.Errorf("simulated log collection failure")
+				},
+			}
+
+			result, err := r.handleInProgress(context.Background(), logr.Discard(), du)
+			if err != nil {
+				t.Fatalf("handleInProgress should not fail when log collection fails: %v", err)
+			}
+			if result.RequeueAfter != 0 {
+				t.Errorf("expected no requeue, got RequeueAfter=%v", result.RequeueAfter)
+			}
+
+			updatedDU := &velerov2alpha1.DataUpload{}
+			if err := fakeClient.Get(context.Background(), types.NamespacedName{
+				Name:      du.Name,
+				Namespace: du.Namespace,
+			}, updatedDU); err != nil {
+				t.Fatalf("failed to get updated DataUpload: %v", err)
+			}
+			if updatedDU.Status.Phase != tt.expectedPhase {
+				t.Errorf("expected phase=%s, got phase=%s", tt.expectedPhase, updatedDU.Status.Phase)
 			}
 		})
 	}

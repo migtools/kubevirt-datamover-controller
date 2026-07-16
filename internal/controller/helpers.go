@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/go-logr/logr"
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -26,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
@@ -137,4 +139,24 @@ func getVeleroBackupName(labels map[string]string) string {
 		return ""
 	}
 	return labels[common.LabelVeleroBackupName]
+}
+
+// NewPodLogCollector returns a PodLogCollector function that reads the last
+// tailLines of log output from a pod using the Kubernetes API.
+func NewPodLogCollector(clientset kubernetes.Interface, tailLines int64) func(ctx context.Context, podName, podNamespace string) (string, error) {
+	return func(ctx context.Context, podName, podNamespace string) (string, error) {
+		opts := &corev1.PodLogOptions{
+			TailLines: &tailLines,
+		}
+		stream, err := clientset.CoreV1().Pods(podNamespace).GetLogs(podName, opts).Stream(ctx)
+		if err != nil {
+			return "", fmt.Errorf("failed to stream pod logs: %w", err)
+		}
+		defer func() { _ = stream.Close() }()
+		data, err := io.ReadAll(stream)
+		if err != nil {
+			return "", fmt.Errorf("failed to read pod logs: %w", err)
+		}
+		return string(data), nil
+	}
 }

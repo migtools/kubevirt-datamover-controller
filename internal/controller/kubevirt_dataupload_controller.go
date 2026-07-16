@@ -101,6 +101,10 @@ type KubeVirtDataUploadReconciler struct {
 	// ObjectStoreFactory creates an ObjectStore from an UploaderConfig.
 	// Defaults to uploader.InitObjectStore if nil. Override in tests to inject mocks.
 	ObjectStoreFactory func(cfg *uploader.UploaderConfig) (velero.ObjectStore, error)
+
+	// PodLogCollector reads logs from a completed datamover pod.
+	// If nil, pod log collection is skipped. Override in tests to inject mocks.
+	PodLogCollector func(ctx context.Context, podName, podNamespace string) (string, error)
 }
 
 // +kubebuilder:rbac:groups=velero.io,resources=datauploads,verbs=get;list;watch;update;patch
@@ -113,6 +117,7 @@ type KubeVirtDataUploadReconciler struct {
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines,verbs=get;list;watch
 
@@ -871,6 +876,8 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 	case corev1.PodSucceeded:
 		logger.Info("Datamover pod completed successfully", "pod", pod.Name)
 
+		r.emitPodLogs(ctx, logger, pod)
+
 		// Cleanup resources
 		r.cleanupDatamoverResources(ctx, logger, du, podNamespace)
 
@@ -882,6 +889,8 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 	case corev1.PodFailed:
 		failureMessage := extractPodFailureMessage(pod)
 		logger.Error(nil, "Datamover pod failed", "pod", pod.Name, "message", failureMessage)
+
+		r.emitPodLogs(ctx, logger, pod)
 
 		// Skip cleanup on failure to preserve resources for debugging.
 		// Resources (pod, rebound PVC/PV) can be manually cleaned up after investigation.
@@ -898,6 +907,31 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 	default:
 		logger.Info("Datamover pod in unknown phase", "pod", pod.Name, "phase", pod.Status.Phase)
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+	}
+}
+
+// emitPodLogs collects logs from a completed datamover pod and emits them
+// through the controller's logger. Failures are logged as warnings and
+// never block the reconcile loop.
+func (r *KubeVirtDataUploadReconciler) emitPodLogs(ctx context.Context, logger logr.Logger, pod *corev1.Pod) {
+	if r.PodLogCollector == nil {
+		return
+	}
+	logs, err := r.PodLogCollector(ctx, pod.Name, pod.Namespace)
+	if err != nil {
+		logger.Info("Warning: failed to collect datamover pod logs", "pod", pod.Name, "error", err)
+		return
+	}
+	if logs == "" {
+		return
+	}
+	lines := strings.Split(strings.TrimRight(logs, "\n"), "\n")
+	for i, line := range lines {
+		logger.Info("Datamover pod log",
+			"source", "datamover-pod",
+			"pod", pod.Name,
+			"line", i+1,
+			"message", line)
 	}
 }
 
