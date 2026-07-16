@@ -3,6 +3,8 @@ module github.com/migtools/kubevirt-datamover-controller
 go 1.26.0
 
 require (
+	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.22.0
+	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.7.0
 	github.com/aws/aws-sdk-go-v2 v1.42.1
 	github.com/aws/aws-sdk-go-v2/config v1.32.30
 	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.3.3
@@ -28,6 +30,7 @@ replace github.com/vmware-tanzu/velero/pkg/apis => github.com/openshift/velero/p
 
 require (
 	cel.dev/expr v0.25.1 // indirect
+	github.com/Azure/azure-sdk-for-go/sdk/internal v1.12.0 // indirect
 	github.com/Masterminds/semver/v3 v3.5.0 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.14 // indirect
