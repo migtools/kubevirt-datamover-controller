@@ -110,7 +110,7 @@ func TestAzureObjectStoreInit(t *testing.T) {
 			config: map[string]string{
 				"bucket":          "test-bucket",
 				"storageAccount":  "testaccount",
-				"credentialsData": "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey,
+				"credentialsData": "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey + "\n",
 			},
 			expectError: false,
 		},
@@ -156,7 +156,7 @@ func TestAzureObjectStoreInit(t *testing.T) {
 
 func TestInitObjectStoreAzure(t *testing.T) {
 	validDummyKey := base64.StdEncoding.EncodeToString([]byte("dummy-key-data"))
-	credData := "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey
+	credData := "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey + "\n"
 
 	cfg := &UploaderConfig{
 		BSLProvider:     "azure",
