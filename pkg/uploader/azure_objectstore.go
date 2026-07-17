@@ -83,7 +83,7 @@ func (a *AzureObjectStore) Init(configMap map[string]string) error {
 	// variables to get the storage account name and key, similar to how Velero does it.
 	// For this implementation, we'll extract them from the config map directly.
 	accountName := configMap["storageAccount"]
-	accountKey := configMap["storageAccountKey"]
+	accountKey := configMap["storageAccountKeyEnvVar"]
 
 	// Fallback to parsing credentialsData if provided (e.g., from BSL secret)
 	if credData := configMap["credentialsData"]; credData != "" && accountName == "" {
@@ -94,7 +94,7 @@ func (a *AzureObjectStore) Init(configMap map[string]string) error {
 		accountName = os.Getenv("AZURE_STORAGE_ACCOUNT")
 	}
 	if accountKey == "" {
-		accountKey = os.Getenv("AZURE_STORAGE_KEY")
+		accountKey = os.Getenv("AZURE_STORAGE_ACCOUNT_ACCESS_KEY")
 	}
 
 	if accountName == "" || accountKey == "" {
