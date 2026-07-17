@@ -448,14 +448,22 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 	}
 
 	if doneCond != nil && doneCond.Status == corev1.ConditionTrue {
-		// Done=True can mean "finished with error" — KubeVirt sets Done=True + Reason=Failed
-		// when the backup fails (e.g., "No space left on device"). Check Progressing condition.
-		if progressingCond != nil && progressingCond.Status == corev1.ConditionFalse &&
-			progressingCond.Reason == "Failed" {
+		// Done=True can mean "finished with error" — KubeVirt sets Done=True together with
+		// Progressing=False when the backup fails (e.g., "No space left on device"), but the
+		// Reason is a descriptive string like "Backup has failed: <details>" rather than the
+		// literal "Failed". Detect failure via a case-insensitive "failed" substring match on
+		// either condition, and take the failure detail from whichever condition actually
+		// carries it — never from a condition just because it happens to have non-empty text.
+		var progressingCandidate *kubevirtbackupv1alpha1.Condition
+		if progressingCond != nil && progressingCond.Status == corev1.ConditionFalse {
+			progressingCandidate = progressingCond
+		}
+		if conditionIndicatesFailure(progressingCandidate) || conditionIndicatesFailure(doneCond) {
+			reason, failureMessage := pickFailureDetail(progressingCandidate, doneCond)
 			logger.Error(nil, "VirtualMachineBackup failed (Done=True with failure)",
-				"vmb", vmb.Name, "reason", progressingCond.Reason, "message", progressingCond.Message)
+				"vmb", vmb.Name, "reason", reason, "message", failureMessage)
 			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
-				fmt.Sprintf("VMBackup failed: %s", progressingCond.Message)); err != nil {
+				fmt.Sprintf("VMBackup failed: %s", failureMessage)); err != nil {
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{}, nil
@@ -476,9 +484,13 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 	if doneCond != nil && doneCond.Status == corev1.ConditionFalse {
 		if progressingCond != nil && progressingCond.Status == corev1.ConditionFalse {
 			// Progressing=False + Done=False → actual failure
-			logger.Error(nil, "VirtualMachineBackup failed", "reason", doneCond.Reason, "message", doneCond.Message)
+			reason, failureMessage := pickFailureDetail(doneCond, progressingCond)
+			if failureMessage == "" {
+				failureMessage = fmt.Sprintf("VirtualMachineBackup %s failed (Done=False, Progressing=False) with no failure detail reported", vmb.Name)
+			}
+			logger.Error(nil, "VirtualMachineBackup failed", "reason", reason, "message", failureMessage)
 			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
-				fmt.Sprintf("VMBackup failed: %s", doneCond.Message)); err != nil {
+				fmt.Sprintf("VMBackup failed: %s", failureMessage)); err != nil {
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{}, nil
@@ -517,6 +529,49 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 	// No Done condition yet, or backup still running - requeue
 	logger.Info("VirtualMachineBackup in progress, requeuing")
 	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+}
+
+// conditionIndicatesFailure reports whether a VirtualMachineBackup condition's Reason or Message
+// signals a failure. KubeVirt emits descriptive strings such as "Backup has failed: <details>"
+// rather than a fixed "Failed" reason, so we match a case-insensitive "failed" substring.
+func conditionIndicatesFailure(cond *kubevirtbackupv1alpha1.Condition) bool {
+	if cond == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(cond.Reason), "failed") ||
+		strings.Contains(strings.ToLower(cond.Message), "failed")
+}
+
+// vmBackupConditionDetail extracts a human-readable failure detail from a VirtualMachineBackup
+// condition. KubeVirt's CBT backup controller never populates Message on Done/Progressing/
+// Initializing conditions — only Reason carries the descriptive text (e.g. "Backup has failed:
+// No space left on device") — so Reason is used whenever Message is empty.
+func vmBackupConditionDetail(cond *kubevirtbackupv1alpha1.Condition) string {
+	if cond == nil {
+		return ""
+	}
+	if cond.Message != "" {
+		return cond.Message
+	}
+	return cond.Reason
+}
+
+// pickFailureDetail returns the Reason/detail pair from whichever of the two conditions
+// actually indicates a failure (preferring the first argument on a tie), so a neutral
+// status reason on one condition never overrides the real failure detail on the other.
+// Falls back to any non-empty text if neither condition's text matches "failed".
+func pickFailureDetail(preferred, other *kubevirtbackupv1alpha1.Condition) (reason, detail string) {
+	for _, cond := range []*kubevirtbackupv1alpha1.Condition{preferred, other} {
+		if conditionIndicatesFailure(cond) {
+			return cond.Reason, vmBackupConditionDetail(cond)
+		}
+	}
+	for _, cond := range []*kubevirtbackupv1alpha1.Condition{preferred, other} {
+		if cond != nil && vmBackupConditionDetail(cond) != "" {
+			return cond.Reason, vmBackupConditionDetail(cond)
+		}
+	}
+	return "", ""
 }
 
 // resolveBackupMode determines whether to force a full backup or allow incremental.

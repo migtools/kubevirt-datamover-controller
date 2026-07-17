@@ -642,11 +642,12 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 
 	tests := []struct {
-		name          string
-		vmbConditions []kubevirtbackupv1alpha1.Condition
-		expectedPhase velerov2alpha1.DataUploadPhase
-		expectRequeue bool
-		skipVMBT      bool // when true, do not create the VMBT (simulates deleted VMBT)
+		name                    string
+		vmbConditions           []kubevirtbackupv1alpha1.Condition
+		expectedPhase           velerov2alpha1.DataUploadPhase
+		expectRequeue           bool
+		skipVMBT                bool   // when true, do not create the VMBT (simulates deleted VMBT)
+		expectedMessageContains string // when set, DataUpload's failure message must contain this
 	}{
 		{
 			name: "VMB Done True transitions to Prepared",
@@ -681,8 +682,66 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 					Message: "Backup has failed: No space left on device",
 				},
 			},
-			expectedPhase: velerov2alpha1.DataUploadPhaseFailed,
-			expectRequeue: false,
+			expectedPhase:           velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue:           false,
+			expectedMessageContains: "No space left on device",
+		},
+		{
+			name: "VMB Done True with failure detail only on Done (neutral Progressing reason) transitions to Failed",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionFalse,
+					Reason: "NotProgressing",
+				},
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionDone,
+					Status: corev1.ConditionTrue,
+					Reason: "Backup has failed: No space left on device",
+				},
+			},
+			expectedPhase:           velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue:           false,
+			expectedMessageContains: "No space left on device",
+		},
+		{
+			// Real KubeVirt (v1.8.4) never populates Message on these conditions — only Reason
+			// carries the wrapped detail. This case reflects that: Message left empty.
+			name: "VMB Done True with descriptive failure reason transitions to Failed",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionFalse,
+					Reason: "Backup has failed: No space left on device",
+				},
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionDone,
+					Status: corev1.ConditionTrue,
+					Reason: "Backup has failed: No space left on device",
+				},
+			},
+			expectedPhase:           velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue:           false,
+			expectedMessageContains: "No space left on device",
+		},
+		{
+			// Same as above but for the Done=False + Progressing=False failure branch.
+			name: "VMB Done False and Progressing False with descriptive reason (no Message) transitions to Failed",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionFalse,
+					Reason: "Backup has failed: VMI was deleted during backup",
+				},
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionDone,
+					Status: corev1.ConditionFalse,
+					Reason: "Backup has failed: VMI was deleted during backup",
+				},
+			},
+			expectedPhase:           velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue:           false,
+			expectedMessageContains: "VMI was deleted during backup",
 		},
 		{
 			name: "VMB Done False and Progressing False transitions to Failed",
@@ -699,8 +758,9 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 					Message: "VM backup failed due to an error",
 				},
 			},
-			expectedPhase: velerov2alpha1.DataUploadPhaseFailed,
-			expectRequeue: false,
+			expectedPhase:           velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue:           false,
+			expectedMessageContains: "VM backup failed due to an error",
 		},
 		{
 			name: "VMB Done False and Progressing True requeues (backup still running)",
@@ -953,6 +1013,10 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 
 			if updatedDU.Status.Phase != tt.expectedPhase {
 				t.Errorf("expected phase=%s, got phase=%s", tt.expectedPhase, updatedDU.Status.Phase)
+			}
+
+			if tt.expectedMessageContains != "" && !strings.Contains(updatedDU.Status.Message, tt.expectedMessageContains) {
+				t.Errorf("expected message to contain %q, got message=%q", tt.expectedMessageContains, updatedDU.Status.Message)
 			}
 		})
 	}
