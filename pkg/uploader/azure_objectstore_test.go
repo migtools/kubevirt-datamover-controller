@@ -108,8 +108,8 @@ func TestAzureObjectStoreInit(t *testing.T) {
 		{
 			name: "valid credentials in config",
 			config: map[string]string{
-				"bucket":         "test-bucket",
-				"storageAccount": "testaccount",
+				"bucket":          "test-bucket",
+				"storageAccount":  "testaccount",
 				"credentialsData": "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey,
 			},
 			expectError: false,
