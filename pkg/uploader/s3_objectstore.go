@@ -33,7 +33,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
@@ -45,7 +45,7 @@ var _ velero.ObjectStore = (*S3ObjectStore)(nil)
 // S3ObjectStore implements velero.ObjectStore for AWS S3 and S3-compatible storage.
 type S3ObjectStore struct {
 	client   *s3.Client
-	uploader *manager.Uploader
+	uploader *transfermanager.Client
 	bucket   string
 	prefix   string
 }
@@ -156,7 +156,9 @@ func (s *S3ObjectStore) Init(configMap map[string]string) error {
 			o.UsePathStyle = true
 		}
 	})
-	s.uploader = manager.NewUploader(s.client)
+	s.uploader = transfermanager.New(s.client, func(o *transfermanager.Options) {
+		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+	})
 
 	return nil
 }
@@ -172,7 +174,7 @@ func (s *S3ObjectStore) fullKey(key string) string {
 // PutObject uploads an object to S3.
 // Implements velero.ObjectStore.PutObject().
 func (s *S3ObjectStore) PutObject(bucket, key string, body io.Reader) error {
-	_, err := s.uploader.Upload(context.Background(), &s3.PutObjectInput{
+	_, err := s.uploader.UploadObject(context.Background(), &transfermanager.UploadObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(s.fullKey(key)),
 		Body:   body,
