@@ -93,7 +93,7 @@ func (a *AzureObjectStore) Init(configMap map[string]string) error {
 	}
 
 	logger := logrus.New()
-	
+
 	client, sharedKey, err := azure.NewStorageClient(logger, configMap)
 	if err != nil {
 		return fmt.Errorf("failed to create Azure storage client: %w", err)
