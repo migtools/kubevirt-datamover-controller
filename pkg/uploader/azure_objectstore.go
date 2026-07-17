@@ -31,7 +31,9 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
+	"github.com/sirupsen/logrus"
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	"github.com/vmware-tanzu/velero/pkg/util/azure"
 )
 
 const (
@@ -67,7 +69,7 @@ func NewAzureObjectStore(configMap map[string]string) (*AzureObjectStore, error)
 }
 
 // Init initializes the ObjectStore with the provided config.
-// Expected config keys: bucket, prefix, storageAccount, storageAccountKey (or via credentialsData).
+// Expected config keys: bucket, prefix, storageAccount, credentialsFile, credentialsData.
 func (a *AzureObjectStore) Init(configMap map[string]string) error {
 	bucket := configMap["bucket"]
 	prefix := configMap["prefix"]
@@ -79,40 +81,25 @@ func (a *AzureObjectStore) Init(configMap map[string]string) error {
 	a.bucket = bucket
 	a.prefix = prefix
 
-	// In a real implementation, you would parse the credentialsData or environment
-	// variables to get the storage account name and key, similar to how Velero does it.
-	// For this implementation, we'll extract them from the config map directly.
-	accountName := configMap["storageAccount"]
-	accountKey := configMap["storageAccountKeyEnvVar"]
-
-	// Fallback to parsing credentialsData if provided (e.g., from BSL secret)
-	if credData := configMap["credentialsData"]; credData != "" && accountName == "" {
-		accountName, accountKey = parseAzureCredentials([]byte(credData))
+	// If credentialsData is provided but no credentialsFile, write it to a temp file
+	// so Velero's azure.NewStorageClient can read it.
+	if credData := configMap["credentialsData"]; credData != "" && configMap["credentialsFile"] == "" {
+		tmpFile, err := writeCredentialsToTempFile([]byte(credData))
+		if err != nil {
+			return fmt.Errorf("failed to write credentials to temp file: %w", err)
+		}
+		defer func() { _ = os.Remove(tmpFile) }()
+		configMap["credentialsFile"] = tmpFile
 	}
 
-	if accountName == "" {
-		accountName = os.Getenv("AZURE_STORAGE_ACCOUNT")
-	}
-	if accountKey == "" {
-		accountKey = os.Getenv("AZURE_STORAGE_ACCOUNT_ACCESS_KEY")
-	}
-
-	if accountName == "" || accountKey == "" {
-		return fmt.Errorf("storageAccount and storageAccountKey are required")
-	}
-
-	cred, err := azblob.NewSharedKeyCredential(accountName, accountKey)
+	logger := logrus.New()
+	
+	client, sharedKey, err := azure.NewStorageClient(logger, configMap)
 	if err != nil {
-		return fmt.Errorf("failed to create Azure shared key credential: %w", err)
-	}
-	a.sharedKey = cred
-
-	serviceURL := fmt.Sprintf("https://%s.blob.core.windows.net/", accountName)
-	client, err := azblob.NewClientWithSharedKeyCredential(serviceURL, cred, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create Azure blob client: %w", err)
+		return fmt.Errorf("failed to create Azure storage client: %w", err)
 	}
 	a.client = client
+	a.sharedKey = sharedKey
 
 	return nil
 }
@@ -315,20 +302,4 @@ func (a *AzureObjectStore) GetObjectBytes(key string) ([]byte, error) {
 	defer func() { _ = reader.Close() }()
 
 	return io.ReadAll(reader)
-}
-
-// parseAzureCredentials is a simple helper to extract AZURE_STORAGE_ACCOUNT and AZURE_STORAGE_KEY
-// from a credentials file format (e.g., INI or env file format).
-func parseAzureCredentials(data []byte) (string, string) {
-	var account, key string
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "AZURE_STORAGE_ACCOUNT=") {
-			account = strings.TrimPrefix(line, "AZURE_STORAGE_ACCOUNT=")
-		} else if strings.HasPrefix(line, "AZURE_STORAGE_KEY=") {
-			key = strings.TrimPrefix(line, "AZURE_STORAGE_KEY=")
-		}
-	}
-	return account, key
 }

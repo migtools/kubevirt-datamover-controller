@@ -78,54 +78,7 @@ func TestAzureObjectStoreFullKey(t *testing.T) {
 	}
 }
 
-func TestParseAzureCredentials(t *testing.T) {
-	tests := []struct {
-		name            string
-		data            string
-		expectedAccount string
-		expectedKey     string
-	}{
-		{
-			name:            "standard format",
-			data:            "AZURE_STORAGE_ACCOUNT=myaccount\nAZURE_STORAGE_KEY=mykey\n",
-			expectedAccount: "myaccount",
-			expectedKey:     "mykey",
-		},
-		{
-			name:            "with spaces and extra lines",
-			data:            "\n  AZURE_STORAGE_ACCOUNT=myaccount  \n\n  AZURE_STORAGE_KEY=mykey  \n",
-			expectedAccount: "myaccount",
-			expectedKey:     "mykey",
-		},
-		{
-			name:            "missing key",
-			data:            "AZURE_STORAGE_ACCOUNT=myaccount\n",
-			expectedAccount: "myaccount",
-			expectedKey:     "",
-		},
-		{
-			name:            "empty",
-			data:            "",
-			expectedAccount: "",
-			expectedKey:     "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			account, key := parseAzureCredentials([]byte(tt.data))
-			if account != tt.expectedAccount {
-				t.Errorf("account = %q, want %q", account, tt.expectedAccount)
-			}
-			if key != tt.expectedKey {
-				t.Errorf("key = %q, want %q", key, tt.expectedKey)
-			}
-		})
-	}
-}
-
 func TestAzureObjectStoreInit(t *testing.T) {
-	// azblob requires the key to be a valid base64 string
 	validDummyKey := base64.StdEncoding.EncodeToString([]byte("dummy-key-data"))
 
 	tests := []struct {
@@ -150,43 +103,26 @@ func TestAzureObjectStoreInit(t *testing.T) {
 				"bucket": "test-bucket",
 			},
 			expectError: true,
-			errorMsg:    "storageAccount and storageAccountKey are required",
+			errorMsg:    "storageAccount is required",
 		},
 		{
 			name: "valid credentials in config",
 			config: map[string]string{
-				"bucket":            "test-bucket",
-				"storageAccount":    "testaccount",
-				"storageAccountKey": validDummyKey,
-			},
-			expectError: false,
-		},
-		{
-			name: "valid credentials in credentialsData",
-			config: map[string]string{
-				"bucket":          "test-bucket",
-				"credentialsData": "AZURE_STORAGE_ACCOUNT=testaccount\nAZURE_STORAGE_KEY=" + validDummyKey,
+				"bucket":         "test-bucket",
+				"storageAccount": "testaccount",
+				"credentialsData": "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey,
 			},
 			expectError: false,
 		},
 		{
 			name: "valid credentials in env vars",
 			config: map[string]string{
-				"bucket": "test-bucket",
+				"bucket":         "test-bucket",
+				"storageAccount": "testaccount",
 			},
 			envAccount:  "testaccount",
 			envKey:      validDummyKey,
 			expectError: false,
-		},
-		{
-			name: "invalid base64 key",
-			config: map[string]string{
-				"bucket":            "test-bucket",
-				"storageAccount":    "testaccount",
-				"storageAccountKey": "not-base64-!@#$",
-			},
-			expectError: true,
-			errorMsg:    "failed to create Azure shared key credential",
 		},
 	}
 
@@ -198,8 +134,8 @@ func TestAzureObjectStoreInit(t *testing.T) {
 				defer os.Unsetenv("AZURE_STORAGE_ACCOUNT")
 			}
 			if tt.envKey != "" {
-				os.Setenv("AZURE_STORAGE_KEY", tt.envKey)
-				defer os.Unsetenv("AZURE_STORAGE_KEY")
+				os.Setenv("AZURE_STORAGE_ACCOUNT_ACCESS_KEY", tt.envKey)
+				defer os.Unsetenv("AZURE_STORAGE_ACCOUNT_ACCESS_KEY")
 			}
 
 			store := &AzureObjectStore{}
@@ -220,13 +156,17 @@ func TestAzureObjectStoreInit(t *testing.T) {
 
 func TestInitObjectStoreAzure(t *testing.T) {
 	validDummyKey := base64.StdEncoding.EncodeToString([]byte("dummy-key-data"))
-	credData := "AZURE_STORAGE_ACCOUNT=testaccount\nAZURE_STORAGE_KEY=" + validDummyKey
+	credData := "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey
 
 	cfg := &UploaderConfig{
 		BSLProvider:     "azure",
 		BSLBucket:       "test-bucket",
 		CredentialsData: []byte(credData),
 	}
+
+	// Set the storage account in the environment so Velero's util can find it
+	os.Setenv("AZURE_STORAGE_ACCOUNT", "testaccount")
+	defer os.Unsetenv("AZURE_STORAGE_ACCOUNT")
 
 	store, err := InitObjectStore(cfg)
 	if err != nil {
