@@ -366,6 +366,18 @@ func InitObjectStore(cfg *UploaderConfig) (velero.ObjectStore, error) {
 	if cfg.BSLCACert != "" {
 		configMap["caCert"] = cfg.BSLCACert
 	}
+	if cfg.BSLResourceGroup != "" {
+		configMap["resourceGroup"] = cfg.BSLResourceGroup
+	}
+	if cfg.BSLStorageAccount != "" {
+		configMap["storageAccount"] = cfg.BSLStorageAccount
+	}
+	if cfg.BSLSubscriptionID != "" {
+		configMap["subscriptionId"] = cfg.BSLSubscriptionID
+	}
+	if cfg.BSLUseAAD {
+		configMap["useAAD"] = "true"
+	}
 
 	switch strings.ToLower(cfg.BSLProvider) {
 	case "aws":
@@ -399,6 +411,12 @@ type BSLConfig struct {
 	S3ForcePathStyle      bool
 	InsecureSkipTLSVerify bool
 	CACert                string
+
+	// Azure-specific storage provider settings
+	ResourceGroup  string
+	StorageAccount string
+	SubscriptionID string
+	UseAAD         bool
 }
 
 // ExtractBSLConfig extracts and validates common BSL configuration fields.
@@ -426,12 +444,20 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 	s3ForcePathStyle := false
 	insecureSkipTLSVerify := false
 	caCert := ""
+	resourceGroup := ""
+	storageAccount := ""
+	subscriptionID := ""
+	useAAD := false
 	if bsl.Spec.Config != nil {
 		region = bsl.Spec.Config["region"]
 		s3URL = bsl.Spec.Config["s3Url"]
 		s3ForcePathStyle = strings.EqualFold(bsl.Spec.Config["s3ForcePathStyle"], "true")
 		insecureSkipTLSVerify = strings.EqualFold(bsl.Spec.Config["insecureSkipTLSVerify"], "true")
 		caCert = bsl.Spec.Config["caCert"]
+		resourceGroup = bsl.Spec.Config["resourceGroup"]
+		storageAccount = bsl.Spec.Config["storageAccount"]
+		subscriptionID = bsl.Spec.Config["subscriptionId"]
+		useAAD = strings.EqualFold(bsl.Spec.Config["useAAD"], "true")
 	}
 
 	credName := ""
@@ -454,6 +480,10 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 		S3ForcePathStyle:      s3ForcePathStyle,
 		InsecureSkipTLSVerify: insecureSkipTLSVerify,
 		CACert:                caCert,
+		ResourceGroup:         resourceGroup,
+		StorageAccount:        storageAccount,
+		SubscriptionID:        subscriptionID,
+		UseAAD:                useAAD,
 	}, nil
 }
 
@@ -493,6 +523,10 @@ func InitObjectStoreFromBSL(
 		BSLS3ForcePathStyle:      cfg.S3ForcePathStyle,
 		BSLInsecureSkipTLSVerify: cfg.InsecureSkipTLSVerify,
 		BSLCACert:                cfg.CACert,
+		BSLResourceGroup:         cfg.ResourceGroup,
+		BSLStorageAccount:        cfg.StorageAccount,
+		BSLSubscriptionID:        cfg.SubscriptionID,
+		BSLUseAAD:                cfg.UseAAD,
 		CredentialsData:          credData,
 	})
 	if err != nil {

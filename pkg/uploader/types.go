@@ -128,6 +128,12 @@ type UploaderConfig struct {
 	BSLInsecureSkipTLSVerify bool   // Skip TLS certificate verification
 	BSLCACert                string // PEM-encoded custom CA certificate
 
+	// Azure-specific storage provider settings
+	BSLResourceGroup  string
+	BSLStorageAccount string
+	BSLSubscriptionID string
+	BSLUseAAD         bool
+
 	// CredentialsData holds raw credential content (INI-style).
 	// Used by the controller to pass credentials from K8s Secrets directly
 	// without writing to a temp file. Takes precedence over CredentialsFile.
