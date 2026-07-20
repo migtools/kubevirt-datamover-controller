@@ -66,10 +66,11 @@ type DatamoverPodConfig struct {
 	BSLKMSKeyName     string
 
 	// Azure-specific storage provider settings
-	BSLResourceGroup  string
-	BSLStorageAccount string
-	BSLSubscriptionID string
-	BSLUseAAD         string
+	BSLResourceGroup           string
+	BSLStorageAccount          string
+	BSLStorageAccountKeyEnvVar string
+	BSLSubscriptionID          string
+	BSLUseAAD                  string
 
 	// Credentials
 	CredentialSecretName string
@@ -142,6 +143,7 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 		{Name: common.EnvBSLKMSKeyName, Value: config.BSLKMSKeyName},
 		{Name: common.EnvBSLResourceGroup, Value: config.BSLResourceGroup},
 		{Name: common.EnvBSLStorageAccount, Value: config.BSLStorageAccount},
+		{Name: common.EnvBSLStorageAccountKeyEnvVar, Value: config.BSLStorageAccountKeyEnvVar},
 		{Name: common.EnvBSLSubscriptionID, Value: config.BSLSubscriptionID},
 		{Name: common.EnvBSLUseAAD, Value: config.BSLUseAAD},
 		{Name: common.EnvCredentialsFile, Value: common.DefaultCredentialsPath},

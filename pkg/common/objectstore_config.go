@@ -39,10 +39,11 @@ type ObjectStoreConfig struct {
 	BSLKMSKeyName     string // Cloud KMS key for server-side encryption
 
 	// Azure-specific storage provider settings
-	BSLResourceGroup  string
-	BSLStorageAccount string
-	BSLSubscriptionID string
-	BSLUseAAD         bool
+	BSLResourceGroup           string
+	BSLStorageAccount          string
+	BSLStorageAccountKeyEnvVar string
+	BSLSubscriptionID          string
+	BSLUseAAD                  bool
 
 	// CredentialsData holds raw credential content (INI-style).
 	// Used by the controller to pass credentials from K8s Secrets directly
