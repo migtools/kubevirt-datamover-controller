@@ -374,6 +374,18 @@ func InitObjectStore(cfg *common.ObjectStoreConfig) (velero.ObjectStore, error) 
 	if cfg.BSLKMSKeyName != "" {
 		configMap["kmsKeyName"] = cfg.BSLKMSKeyName
 	}
+	if cfg.BSLResourceGroup != "" {
+		configMap["resourceGroup"] = cfg.BSLResourceGroup
+	}
+	if cfg.BSLStorageAccount != "" {
+		configMap["storageAccount"] = cfg.BSLStorageAccount
+	}
+	if cfg.BSLSubscriptionID != "" {
+		configMap["subscriptionId"] = cfg.BSLSubscriptionID
+	}
+	if cfg.BSLUseAAD {
+		configMap["useAAD"] = "true"
+	}
 
 	switch strings.ToLower(cfg.BSLProvider) {
 	case "aws":
@@ -410,6 +422,12 @@ type BSLConfig struct {
 	// GCP-specific storage provider settings
 	ServiceAccount string
 	KMSKeyName     string
+
+	// Azure-specific storage provider settings
+	ResourceGroup  string
+	StorageAccount string
+	SubscriptionID string
+	UseAAD         bool
 }
 
 // ExtractBSLConfig extracts and validates common BSL configuration fields.
@@ -439,6 +457,10 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 	caCert := ""
 	serviceAccount := ""
 	kmsKeyName := ""
+	resourceGroup := ""
+	storageAccount := ""
+	subscriptionID := ""
+	useAAD := false
 	if bsl.Spec.Config != nil {
 		region = bsl.Spec.Config["region"]
 		s3URL = bsl.Spec.Config["s3Url"]
@@ -447,6 +469,10 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 		caCert = bsl.Spec.Config["caCert"]
 		serviceAccount = bsl.Spec.Config["serviceAccount"]
 		kmsKeyName = bsl.Spec.Config["kmsKeyName"]
+		resourceGroup = bsl.Spec.Config["resourceGroup"]
+		storageAccount = bsl.Spec.Config["storageAccount"]
+		subscriptionID = bsl.Spec.Config["subscriptionId"]
+		useAAD = strings.EqualFold(bsl.Spec.Config["useAAD"], "true")
 	}
 
 	credName := ""
@@ -471,6 +497,10 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 		CACert:                caCert,
 		ServiceAccount:        serviceAccount,
 		KMSKeyName:            kmsKeyName,
+		ResourceGroup:         resourceGroup,
+		StorageAccount:        storageAccount,
+		SubscriptionID:        subscriptionID,
+		UseAAD:                useAAD,
 	}, nil
 }
 
@@ -512,6 +542,10 @@ func InitObjectStoreFromBSL(
 		BSLCACert:                cfg.CACert,
 		BSLServiceAccount:        cfg.ServiceAccount,
 		BSLKMSKeyName:            cfg.KMSKeyName,
+		BSLResourceGroup:         cfg.ResourceGroup,
+		BSLStorageAccount:        cfg.StorageAccount,
+		BSLSubscriptionID:        cfg.SubscriptionID,
+		BSLUseAAD:                cfg.UseAAD,
 		CredentialsData:          credData,
 	})
 	if err != nil {
