@@ -476,7 +476,7 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhasePrepared,
 			fmt.Sprintf("VMBackup completed (type=%s)", vmb.Status.Type)); err != nil {
-				return ctrl.Result{}, err
+			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 	}
