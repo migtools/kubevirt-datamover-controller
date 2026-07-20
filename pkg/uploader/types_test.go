@@ -306,6 +306,10 @@ func TestEnvironmentVariableConstants(t *testing.T) {
 		"EnvVMBName":                  "KUBEVIRT_DM_VMB_NAME",
 		"common.EnvBSLServiceAccount": "KUBEVIRT_DM_BSL_SERVICE_ACCOUNT",
 		"common.EnvBSLKMSKeyName":     "KUBEVIRT_DM_BSL_KMS_KEY_NAME",
+		"common.EnvBSLResourceGroup":  "KUBEVIRT_DM_BSL_RESOURCE_GROUP",
+		"common.EnvBSLStorageAccount": "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT",
+		"common.EnvBSLSubscriptionID": "KUBEVIRT_DM_BSL_SUBSCRIPTION_ID",
+		"common.EnvBSLUseAAD":         "KUBEVIRT_DM_BSL_USE_AAD",
 	}
 
 	// Just checking they're defined and have expected prefix
@@ -329,6 +333,10 @@ func TestEnvironmentVariableConstants(t *testing.T) {
 		{"EnvVMBName", EnvVMBName},
 		{"common.EnvBSLServiceAccount", common.EnvBSLServiceAccount},
 		{"common.EnvBSLKMSKeyName", common.EnvBSLKMSKeyName},
+		{"common.EnvBSLResourceGroup", EnvBSLResourceGroup},
+		{"common.EnvBSLStorageAccount", EnvBSLStorageAccount},
+		{"common.EnvBSLSubscriptionID", EnvBSLSubscriptionID},
+		{"common.EnvBSLUseAAD", EnvBSLUseAAD},
 	}
 
 	for _, ev := range envVarsToCheck {
