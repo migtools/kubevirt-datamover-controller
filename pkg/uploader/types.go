@@ -100,6 +100,12 @@ const (
 	EnvBSLS3ForcePathStyle      = "KUBEVIRT_DM_BSL_S3_FORCE_PATH_STYLE"
 	EnvBSLInsecureSkipTLSVerify = "KUBEVIRT_DM_BSL_INSECURE_SKIP_TLS_VERIFY"
 	EnvBSLCACert                = "KUBEVIRT_DM_BSL_CA_CERT"
+
+	// Azure-specific storage provider settings
+	EnvBSLResourceGroup  = "KUBEVIRT_DM_BSL_RESOURCE_GROUP"
+	EnvBSLStorageAccount = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT"
+	EnvBSLSubscriptionID = "KUBEVIRT_DM_BSL_SUBSCRIPTION_ID"
+	EnvBSLUseAAD         = "KUBEVIRT_DM_BSL_USE_AAD"
 )
 
 // Default paths and values
