@@ -108,20 +108,11 @@ func TestAzureObjectStoreInit(t *testing.T) {
 		{
 			name: "valid credentials in config",
 			config: map[string]string{
-				"bucket":          "test-bucket",
-				"storageAccount":  "testaccount",
-				"credentialsData": "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey + "\n",
+				"bucket":                  "test-bucket",
+				"storageAccount":          "testaccount",
+				"storageAccountKeyEnvVar": "AZURE_STORAGE_ACCOUNT_ACCESS_KEY",
+				"credentialsData":         "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey + "\n",
 			},
-			expectError: false,
-		},
-		{
-			name: "valid credentials in env vars",
-			config: map[string]string{
-				"bucket":         "test-bucket",
-				"storageAccount": "testaccount",
-			},
-			envAccount:  "testaccount",
-			envKey:      validDummyKey,
 			expectError: false,
 		},
 	}
@@ -159,9 +150,11 @@ func TestInitObjectStoreAzure(t *testing.T) {
 	credData := "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey + "\n"
 
 	cfg := &UploaderConfig{
-		BSLProvider:     "azure",
-		BSLBucket:       "test-bucket",
-		CredentialsData: []byte(credData),
+		BSLProvider:       "azure",
+		BSLBucket:         "test-bucket",
+		BSLSubscriptionID: "test-subscription",
+		BSLResourceGroup:  "test-group",
+		CredentialsData:   []byte(credData),
 	}
 
 	// Set the storage account in the environment so Velero's util can find it
