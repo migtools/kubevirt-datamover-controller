@@ -90,10 +90,6 @@ func (a *AzureObjectStore) Init(configMap map[string]string) error {
 		}
 		defer func() { _ = os.Remove(tmpFile) }()
 		configMap["credentialsFile"] = tmpFile
-
-		// For compatibility with older Velero versions that only check the env var
-		os.Setenv("AZURE_CREDENTIALS_FILE", tmpFile)
-		defer os.Unsetenv("AZURE_CREDENTIALS_FILE")
 	}
 
 	// Velero's azure.NewStorageClient requires storageAccount in the config map.
