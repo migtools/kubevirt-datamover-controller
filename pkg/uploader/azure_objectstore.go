@@ -101,7 +101,6 @@ func (a *AzureObjectStore) Init(configMap map[string]string) error {
 		configMap["storageAccount"] = os.Getenv("AZURE_STORAGE_ACCOUNT")
 	}
 
-
 	logger := logrus.New()
 
 	client, sharedKey, err := azure.NewStorageClient(logger, configMap)
