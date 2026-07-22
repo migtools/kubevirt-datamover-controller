@@ -36,11 +36,13 @@ const (
 	EnvBSLKMSKeyName     = "KUBEVIRT_DM_BSL_KMS_KEY_NAME"
 
 	// Azure-specific storage provider settings
-	EnvBSLResourceGroup           = "KUBEVIRT_DM_BSL_RESOURCE_GROUP"
-	EnvBSLStorageAccount          = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT"
-	EnvBSLStorageAccountKeyEnvVar = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT_KEY_ENV_VAR"
-	EnvBSLSubscriptionID          = "KUBEVIRT_DM_BSL_SUBSCRIPTION_ID"
-	EnvBSLUseAAD                  = "KUBEVIRT_DM_BSL_USE_AAD"
+	EnvBSLResourceGroup               = "KUBEVIRT_DM_BSL_RESOURCE_GROUP"
+	EnvBSLStorageAccount              = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT"
+	EnvBSLStorageAccountKeyEnvVar     = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT_KEY_ENV_VAR"
+	EnvBSLStorageAccountURI           = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT_URI"
+	EnvBSLSubscriptionID              = "KUBEVIRT_DM_BSL_SUBSCRIPTION_ID"
+	EnvBSLUseAAD                      = "KUBEVIRT_DM_BSL_USE_AAD"
+	EnvBSLActiveDirectoryAuthorityURI = "KUBEVIRT_DM_BSL_ACTIVE_DIRECTORY_AUTHORITY_URI"
 )
 
 // DefaultCredentialsPath is the credentials file path used when neither the
