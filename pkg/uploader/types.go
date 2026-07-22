@@ -102,11 +102,13 @@ const (
 	EnvBSLCACert                = "KUBEVIRT_DM_BSL_CA_CERT"
 
 	// Azure-specific storage provider settings
-	EnvBSLResourceGroup           = "KUBEVIRT_DM_BSL_RESOURCE_GROUP"
-	EnvBSLStorageAccount          = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT"
-	EnvBSLStorageAccountKeyEnvVar = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT_KEY_ENV_VAR"
-	EnvBSLSubscriptionID          = "KUBEVIRT_DM_BSL_SUBSCRIPTION_ID"
-	EnvBSLUseAAD                  = "KUBEVIRT_DM_BSL_USE_AAD"
+	EnvBSLResourceGroup               = "KUBEVIRT_DM_BSL_RESOURCE_GROUP"
+	EnvBSLStorageAccount              = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT"
+	EnvBSLStorageAccountKeyEnvVar     = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT_KEY_ENV_VAR"
+	EnvBSLStorageAccountURI           = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT_URI"
+	EnvBSLSubscriptionID              = "KUBEVIRT_DM_BSL_SUBSCRIPTION_ID"
+	EnvBSLUseAAD                      = "KUBEVIRT_DM_BSL_USE_AAD"
+	EnvBSLActiveDirectoryAuthorityURI = "KUBEVIRT_DM_BSL_ACTIVE_DIRECTORY_AUTHORITY_URI"
 )
 
 // Default paths and values
@@ -136,11 +138,13 @@ type UploaderConfig struct {
 	BSLCACert                string // PEM-encoded custom CA certificate
 
 	// Azure-specific storage provider settings
-	BSLResourceGroup           string
-	BSLStorageAccount          string
-	BSLStorageAccountKeyEnvVar string
-	BSLSubscriptionID          string
-	BSLUseAAD                  bool
+	BSLResourceGroup               string
+	BSLStorageAccount              string
+	BSLStorageAccountKeyEnvVar     string
+	BSLStorageAccountURI           string
+	BSLSubscriptionID              string
+	BSLUseAAD                      bool
+	BSLActiveDirectoryAuthorityURI string
 
 	// CredentialsData holds raw credential content (INI-style).
 	// Used by the controller to pass credentials from K8s Secrets directly
