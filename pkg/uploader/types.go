@@ -75,15 +75,15 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/resource"
+
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 )
 
-// Environment variable names for uploader configuration
+// Environment variable names for uploader configuration.
+// BSL/credentials env vars are shared with the downloader — see pkg/common.Env*
+// for the canonical definitions and their values, referenced directly at
+// call sites instead of re-exported here.
 const (
-	EnvBSLProvider      = "KUBEVIRT_DM_BSL_PROVIDER"
-	EnvBSLBucket        = "KUBEVIRT_DM_BSL_BUCKET"
-	EnvBSLPrefix        = "KUBEVIRT_DM_BSL_PREFIX"
-	EnvBSLRegion        = "KUBEVIRT_DM_BSL_REGION"
-	EnvCredentialsFile  = "KUBEVIRT_DM_CREDENTIALS_FILE"
 	EnvVMName           = "KUBEVIRT_DM_VM_NAME"
 	EnvVMNamespace      = "KUBEVIRT_DM_VM_NAMESPACE"
 	EnvCheckpointName   = "KUBEVIRT_DM_CHECKPOINT_NAME"
@@ -94,22 +94,11 @@ const (
 	EnvDataUploadUID    = "KUBEVIRT_DM_DATAUPLOAD_UID"
 	EnvVMBName          = "KUBEVIRT_DM_VMB_NAME"
 	EnvVMBTName         = "KUBEVIRT_DM_VMBT_NAME"
-
-	// S3-compatible storage provider settings
-	EnvBSLS3URL                 = "KUBEVIRT_DM_BSL_S3_URL"
-	EnvBSLS3ForcePathStyle      = "KUBEVIRT_DM_BSL_S3_FORCE_PATH_STYLE"
-	EnvBSLInsecureSkipTLSVerify = "KUBEVIRT_DM_BSL_INSECURE_SKIP_TLS_VERIFY"
-	EnvBSLCACert                = "KUBEVIRT_DM_BSL_CA_CERT"
-
-	// GCP-specific storage provider settings
-	EnvBSLServiceAccount = "KUBEVIRT_DM_BSL_SERVICE_ACCOUNT"
-	EnvBSLKMSKeyName     = "KUBEVIRT_DM_BSL_KMS_KEY_NAME"
 )
 
 // Default paths and values
 const (
-	DefaultSourcePVCPath   = "/backup-data"
-	DefaultCredentialsPath = "/credentials/cloud"
+	DefaultSourcePVCPath = "/backup-data"
 )
 
 // Backup type values
@@ -120,30 +109,9 @@ const (
 
 // UploaderConfig holds configuration loaded from environment variables.
 type UploaderConfig struct {
-	// BSL configuration
-	BSLProvider string
-	BSLBucket   string
-	BSLPrefix   string
-	BSLRegion   string
-
-	// S3-compatible storage provider settings
-	BSLS3URL                 string // Custom S3 endpoint URL (e.g., "https://minio.example.com")
-	BSLS3ForcePathStyle      bool   // Use path-style URLs (required by most S3-compatible stores)
-	BSLInsecureSkipTLSVerify bool   // Skip TLS certificate verification
-	BSLCACert                string // PEM-encoded custom CA certificate
-
-	// GCP-specific storage provider settings
-	BSLServiceAccount string // GCP service account email for compute engine signing
-	BSLKMSKeyName     string // Cloud KMS key for server-side encryption
-
-	// CredentialsData holds raw credential content (INI-style).
-	// Used by the controller to pass credentials from K8s Secrets directly
-	// without writing to a temp file. Takes precedence over CredentialsFile.
-	CredentialsData []byte
-
-	// CredentialsFile is the path to a credentials file on disk.
-	// Used by the datamover pod where credentials are volume-mounted.
-	CredentialsFile string
+	// ObjectStoreConfig holds BSL/object-store connection settings, shared
+	// with DownloaderConfig so object-store init code isn't duplicated.
+	common.ObjectStoreConfig
 
 	// VM context
 	VMName      string

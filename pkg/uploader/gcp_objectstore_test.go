@@ -25,6 +25,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 )
 
 func TestGCPObjectStoreFullKey(t *testing.T) {
@@ -199,7 +201,7 @@ func TestInitObjectStoreGCP(t *testing.T) {
 		t.Fatalf("failed to write credentials file: %v", err)
 	}
 
-	cfg := &UploaderConfig{
+	cfg := &common.ObjectStoreConfig{
 		BSLProvider:     "gcp",
 		BSLBucket:       "test-bucket",
 		CredentialsFile: credFile,
@@ -221,7 +223,7 @@ func TestInitObjectStoreGCP(t *testing.T) {
 func TestInitObjectStoreGCPWithCredentialsData(t *testing.T) {
 	saJSON := generateTestGCPServiceAccountJSON(t)
 
-	cfg := &UploaderConfig{
+	cfg := &common.ObjectStoreConfig{
 		BSLProvider:     "gcp",
 		BSLBucket:       "test-bucket",
 		CredentialsData: saJSON,

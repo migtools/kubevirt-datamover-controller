@@ -1,0 +1,232 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package downloader
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/go-logr/logr"
+
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
+)
+
+// Run is the main entrypoint for the downloader.
+func Run(ctx context.Context, logger logr.Logger) error {
+	logger.Info("Starting kubevirt datamover downloader")
+
+	config, err := LoadConfigFromEnv()
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	logger.Info("Config loaded",
+		"vm", config.VMNamespace+"/"+config.VMName,
+		"backup", config.VeleroBackupName,
+		"targetVolume", config.TargetVolume)
+
+	if err := prepareTargetDir(config.TargetPath); err != nil {
+		return err
+	}
+	if err := prepareDir(config.ScratchPath); err != nil {
+		return fmt.Errorf("failed to prepare scratch dir: %w", err)
+	}
+
+	store, err := uploader.InitObjectStore(&config.ObjectStoreConfig)
+	if err != nil {
+		return fmt.Errorf("failed to initialize object store: %w", err)
+	}
+
+	logger.Info("Object store initialized", "bucket", config.BSLBucket, "prefix", config.BSLPrefix)
+
+	manifest, found, err := uploader.GetVMBackupManifest(
+		store, config.VMNamespace, config.VMName, config.VeleroBackupName, config.BSLBucket, logger,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to get VM backup manifest: %w", err)
+	}
+	if !found {
+		return fmt.Errorf("no backup manifest found for VM %s/%s in backup %s",
+			config.VMNamespace, config.VMName, config.VeleroBackupName)
+	}
+	if len(manifest.CheckpointChain) == 0 {
+		return fmt.Errorf("backup manifest for VM %s/%s in backup %s has an empty checkpoint chain",
+			config.VMNamespace, config.VMName, config.VeleroBackupName)
+	}
+
+	vmIndex, found, err := uploader.GetVMIndex(store, config.VMNamespace, config.VMName, config.BSLBucket, logger)
+	if err != nil {
+		return fmt.Errorf("failed to get VM index: %w", err)
+	}
+	if !found {
+		return fmt.Errorf("no VM index found for VM %s/%s", config.VMNamespace, config.VMName)
+	}
+
+	files, err := resolveCheckpointFiles(
+		config.VMNamespace, config.VMName, manifest.CheckpointChain, vmIndex, config.TargetVolume)
+	if err != nil {
+		return fmt.Errorf("failed to resolve checkpoint chain: %w", err)
+	}
+
+	logger.Info("Resolved checkpoint chain", "checkpoints", len(files))
+
+	localPaths, err := downloadCheckpointFiles(ctx, store, config.BSLBucket, files, config.ScratchPath)
+	if err != nil {
+		return fmt.Errorf("failed to download checkpoint files: %w", err)
+	}
+
+	logger.Info("Downloaded checkpoint files", "count", len(localPaths))
+	defer func() {
+		for _, path := range localPaths {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				logger.Error(err, "Failed to remove downloaded checkpoint file", "path", path)
+			}
+		}
+	}()
+
+	if err := rebaseChain(ctx, localPaths); err != nil {
+		return fmt.Errorf("failed to rebase checkpoint chain: %w", err)
+	}
+
+	tip := localPaths[len(localPaths)-1]
+	tmpFile, err := os.CreateTemp(filepath.Dir(config.TargetPath), "."+filepath.Base(config.TargetPath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary target: %w", err)
+	}
+	tmpTargetPath := tmpFile.Name()
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpTargetPath)
+		return fmt.Errorf("failed to create temporary target: %w", err)
+	}
+	// Best-effort: after a successful rename below this is already gone, so
+	// the removal here is a no-op that only matters on the error paths.
+	defer func() { _ = os.Remove(tmpTargetPath) }()
+
+	if err := flattenToRaw(ctx, tip, tmpTargetPath); err != nil {
+		return fmt.Errorf("failed to flatten checkpoint chain to raw: %w", err)
+	}
+	if err := os.Rename(tmpTargetPath, config.TargetPath); err != nil {
+		return fmt.Errorf("failed to publish restored disk image: %w", err)
+	}
+
+	logger.Info("Download completed successfully", "target", config.TargetPath)
+
+	return nil
+}
+
+// prepareTargetDir ensures the target file's parent directory exists and is
+// restricted to owner-only access.
+func prepareTargetDir(targetPath string) error {
+	if !filepath.IsAbs(targetPath) {
+		return fmt.Errorf("target path %q must be an absolute path", targetPath)
+	}
+	if err := prepareDir(filepath.Dir(targetPath)); err != nil {
+		return fmt.Errorf("failed to prepare target dir for %q: %w", targetPath, err)
+	}
+	return nil
+}
+
+// prepareDir ensures dir exists and is restricted to owner-only access.
+// os.MkdirAll alone won't tighten permissions on a directory that already
+// existed (e.g. a pre-mounted /restore-data or /scratch), so a permissive
+// pre-existing directory is chmod'd explicitly. Refuses to operate on the
+// filesystem root, since chmod'ing "/" to 0700 would lock the pod itself out
+// of most of its own filesystem.
+func prepareDir(dir string) error {
+	if dir == "/" {
+		return fmt.Errorf("path %q must not resolve to the filesystem root", dir)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("failed to create dir %q: %w", dir, err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("failed to harden dir %q permissions: %w", dir, err)
+	}
+	return nil
+}
+
+// LoadConfigFromEnv parses environment variables into DownloaderConfig.
+func LoadConfigFromEnv() (*DownloaderConfig, error) {
+	config := &DownloaderConfig{
+		ObjectStoreConfig: common.ObjectStoreConfig{
+			BSLProvider:              os.Getenv(common.EnvBSLProvider),
+			BSLBucket:                os.Getenv(common.EnvBSLBucket),
+			BSLPrefix:                os.Getenv(common.EnvBSLPrefix),
+			BSLRegion:                os.Getenv(common.EnvBSLRegion),
+			BSLS3URL:                 os.Getenv(common.EnvBSLS3URL),
+			BSLS3ForcePathStyle:      strings.EqualFold(os.Getenv(common.EnvBSLS3ForcePathStyle), "true"),
+			BSLInsecureSkipTLSVerify: strings.EqualFold(os.Getenv(common.EnvBSLInsecureSkipTLSVerify), "true"),
+			BSLCACert:                os.Getenv(common.EnvBSLCACert),
+			CredentialsFile:          os.Getenv(common.EnvCredentialsFile),
+		},
+		VMName:           os.Getenv(EnvVMName),
+		VMNamespace:      os.Getenv(EnvVMNamespace),
+		VeleroBackupName: os.Getenv(EnvVeleroBackupName),
+		DataDownloadName: os.Getenv(EnvDataDownloadName),
+		DataDownloadUID:  os.Getenv(EnvDataDownloadUID),
+		TargetVolume:     os.Getenv(EnvTargetVolume),
+		TargetPath:       os.Getenv(EnvTargetPath),
+		ScratchPath:      os.Getenv(EnvScratchPath),
+	}
+
+	if config.TargetPath == "" {
+		config.TargetPath = DefaultTargetPath
+	}
+	if !filepath.IsAbs(config.TargetPath) {
+		return nil, fmt.Errorf("%s must be an absolute path", EnvTargetPath)
+	}
+	if filepath.Dir(config.TargetPath) == "/" {
+		return nil, fmt.Errorf("%s must not resolve to the filesystem root", EnvTargetPath)
+	}
+	if config.ScratchPath == "" {
+		config.ScratchPath = DefaultScratchPath
+	}
+	if !filepath.IsAbs(config.ScratchPath) {
+		return nil, fmt.Errorf("%s must be an absolute path", EnvScratchPath)
+	}
+	if config.ScratchPath == "/" {
+		return nil, fmt.Errorf("%s must not resolve to the filesystem root", EnvScratchPath)
+	}
+	if config.CredentialsFile == "" {
+		config.CredentialsFile = common.DefaultCredentialsPath
+	}
+
+	if config.BSLProvider == "" {
+		return nil, fmt.Errorf("%s is required", common.EnvBSLProvider)
+	}
+	if config.BSLBucket == "" {
+		return nil, fmt.Errorf("%s is required", common.EnvBSLBucket)
+	}
+	if config.VMName == "" {
+		return nil, fmt.Errorf("%s is required", EnvVMName)
+	}
+	if config.VMNamespace == "" {
+		return nil, fmt.Errorf("%s is required", EnvVMNamespace)
+	}
+	if config.VeleroBackupName == "" {
+		return nil, fmt.Errorf("%s is required", EnvVeleroBackupName)
+	}
+	if config.TargetVolume == "" {
+		return nil, fmt.Errorf("%s is required", EnvTargetVolume)
+	}
+
+	return config, nil
+}

@@ -124,17 +124,17 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 
 	// Build environment variables
 	envVars := []corev1.EnvVar{
-		{Name: uploader.EnvBSLProvider, Value: config.BSLProvider},
-		{Name: uploader.EnvBSLBucket, Value: config.BSLBucket},
-		{Name: uploader.EnvBSLPrefix, Value: config.BSLPrefix},
-		{Name: uploader.EnvBSLRegion, Value: config.BSLRegion},
-		{Name: uploader.EnvBSLS3URL, Value: config.BSLS3URL},
-		{Name: uploader.EnvBSLS3ForcePathStyle, Value: config.BSLS3ForcePathStyle},
-		{Name: uploader.EnvBSLInsecureSkipTLSVerify, Value: config.BSLInsecureSkipTLSVerify},
-		{Name: uploader.EnvBSLCACert, Value: config.BSLCACert},
-		{Name: uploader.EnvBSLServiceAccount, Value: config.BSLServiceAccount},
-		{Name: uploader.EnvBSLKMSKeyName, Value: config.BSLKMSKeyName},
-		{Name: uploader.EnvCredentialsFile, Value: uploader.DefaultCredentialsPath},
+		{Name: common.EnvBSLProvider, Value: config.BSLProvider},
+		{Name: common.EnvBSLBucket, Value: config.BSLBucket},
+		{Name: common.EnvBSLPrefix, Value: config.BSLPrefix},
+		{Name: common.EnvBSLRegion, Value: config.BSLRegion},
+		{Name: common.EnvBSLS3URL, Value: config.BSLS3URL},
+		{Name: common.EnvBSLS3ForcePathStyle, Value: config.BSLS3ForcePathStyle},
+		{Name: common.EnvBSLInsecureSkipTLSVerify, Value: config.BSLInsecureSkipTLSVerify},
+		{Name: common.EnvBSLCACert, Value: config.BSLCACert},
+		{Name: common.EnvBSLServiceAccount, Value: config.BSLServiceAccount},
+		{Name: common.EnvBSLKMSKeyName, Value: config.BSLKMSKeyName},
+		{Name: common.EnvCredentialsFile, Value: common.DefaultCredentialsPath},
 		{Name: uploader.EnvVMName, Value: config.VMName},
 		{Name: uploader.EnvVMNamespace, Value: config.VMNamespace},
 		{Name: uploader.EnvCheckpointName, Value: config.CheckpointName},
@@ -210,7 +210,7 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 				},
 				{
 					// Mount BSL credentials secret. The secret key (from BSL config) is mounted
-					// to a fixed path "/credentials/cloud" that matches uploader.DefaultCredentialsPath.
+					// to a fixed path "/credentials/cloud" that matches common.DefaultCredentialsPath.
 					// This is simpler than Velero's dynamic path approach since we control both ends.
 					Name: "cloud-credentials",
 					VolumeSource: corev1.VolumeSource{
@@ -219,7 +219,7 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 							Items: []corev1.KeyToPath{
 								{
 									Key:  config.CredentialSecretKey,
-									Path: "cloud", // Fixed filename, matches uploader.DefaultCredentialsPath
+									Path: "cloud", // Fixed filename, matches common.DefaultCredentialsPath
 								},
 							},
 						},

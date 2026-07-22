@@ -334,7 +334,9 @@ func DeleteQCOW(store velero.ObjectStore, ns, name, checkpoint, qcowName, bucket
 // InitObjectStore creates an ObjectStore based on the provider type.
 // Credentials and S3-compatible settings are passed through the config map
 // to Init(), which handles temp file creation for in-memory credentials.
-func InitObjectStore(cfg *UploaderConfig) (velero.ObjectStore, error) {
+// Takes *common.ObjectStoreConfig (not the fuller UploaderConfig) so both
+// the uploader and downloader runtimes can share this initialization logic.
+func InitObjectStore(cfg *common.ObjectStoreConfig) (velero.ObjectStore, error) {
 	if cfg.BSLProvider == "" {
 		return nil, fmt.Errorf("BSL provider is required but was empty")
 	}
@@ -480,7 +482,7 @@ func InitObjectStoreFromBSL(
 	k8sClient client.Client,
 	oadpNamespace string,
 	bsl *velerov1.BackupStorageLocation,
-	factory func(c *UploaderConfig) (velero.ObjectStore, error),
+	factory func(c *common.ObjectStoreConfig) (velero.ObjectStore, error),
 ) (velero.ObjectStore, *BSLConfig, error) {
 	cfg, err := ExtractBSLConfig(bsl)
 	if err != nil {
@@ -500,7 +502,7 @@ func InitObjectStoreFromBSL(
 		factory = InitObjectStore
 	}
 
-	store, err := factory(&UploaderConfig{
+	store, err := factory(&common.ObjectStoreConfig{
 		BSLProvider:              cfg.Provider,
 		BSLBucket:                cfg.Bucket,
 		BSLPrefix:                cfg.Prefix,
