@@ -150,11 +150,12 @@ func TestInitObjectStoreAzure(t *testing.T) {
 	credData := "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey + "\n"
 
 	cfg := &UploaderConfig{
-		BSLProvider:       "azure",
-		BSLBucket:         "test-bucket",
-		BSLSubscriptionID: "test-subscription",
-		BSLResourceGroup:  "test-group",
-		CredentialsData:   []byte(credData),
+		BSLProvider:                "azure",
+		BSLBucket:                  "test-bucket",
+		BSLSubscriptionID:          "test-subscription",
+		BSLResourceGroup:           "test-group",
+		BSLStorageAccountKeyEnvVar: "AZURE_STORAGE_ACCOUNT_ACCESS_KEY",
+		CredentialsData:            []byte(credData),
 	}
 
 	// Set the storage account in the environment so Velero's util can find it
