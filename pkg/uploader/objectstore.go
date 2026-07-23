@@ -35,6 +35,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+const configValueTrue = "true"
+
 // PutObjectBytes uploads bytes to a velero.ObjectStore.
 func PutObjectBytes(store velero.ObjectStore, bucket, key string, data []byte) error {
 	return store.PutObject(bucket, key, bytes.NewReader(data))
@@ -358,10 +360,10 @@ func InitObjectStore(cfg *UploaderConfig) (velero.ObjectStore, error) {
 		configMap["s3Url"] = cfg.BSLS3URL
 	}
 	if cfg.BSLS3ForcePathStyle {
-		configMap["s3ForcePathStyle"] = "true"
+		configMap["s3ForcePathStyle"] = configValueTrue
 	}
 	if cfg.BSLInsecureSkipTLSVerify {
-		configMap["insecureSkipTLSVerify"] = "true"
+		configMap["insecureSkipTLSVerify"] = configValueTrue
 	}
 	if cfg.BSLCACert != "" {
 		configMap["caCert"] = cfg.BSLCACert
@@ -382,7 +384,7 @@ func InitObjectStore(cfg *UploaderConfig) (velero.ObjectStore, error) {
 		configMap["subscriptionId"] = cfg.BSLSubscriptionID
 	}
 	if cfg.BSLUseAAD {
-		configMap["useAAD"] = "true"
+		configMap["useAAD"] = configValueTrue
 	}
 	if cfg.BSLActiveDirectoryAuthorityURI != "" {
 		configMap["activeDirectoryAuthorityURI"] = cfg.BSLActiveDirectoryAuthorityURI

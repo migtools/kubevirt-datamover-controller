@@ -18,11 +18,10 @@ package uploader
 
 import (
 	"encoding/base64"
-	"os"
 	"testing"
 )
 
-func TestAzureObjectStoreFullKey(t *testing.T) {
+func TestAzureObjectStoreFullKey(t *testing.T) { //nolint:dupl
 	tests := []struct {
 		name     string
 		prefix   string
@@ -121,12 +120,10 @@ func TestAzureObjectStoreInit(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Setup env vars if needed
 			if tt.envAccount != "" {
-				os.Setenv("AZURE_STORAGE_ACCOUNT", tt.envAccount)
-				defer os.Unsetenv("AZURE_STORAGE_ACCOUNT")
+				t.Setenv("AZURE_STORAGE_ACCOUNT", tt.envAccount)
 			}
 			if tt.envKey != "" {
-				os.Setenv("AZURE_STORAGE_ACCOUNT_ACCESS_KEY", tt.envKey)
-				defer os.Unsetenv("AZURE_STORAGE_ACCOUNT_ACCESS_KEY")
+				t.Setenv("AZURE_STORAGE_ACCOUNT_ACCESS_KEY", tt.envKey)
 			}
 
 			store := &AzureObjectStore{}
@@ -159,8 +156,7 @@ func TestInitObjectStoreAzure(t *testing.T) {
 	}
 
 	// Set the storage account in the environment so Velero's util can find it
-	os.Setenv("AZURE_STORAGE_ACCOUNT", "testaccount")
-	defer os.Unsetenv("AZURE_STORAGE_ACCOUNT")
+	t.Setenv("AZURE_STORAGE_ACCOUNT", "testaccount")
 
 	store, err := InitObjectStore(cfg)
 	if err != nil {

@@ -31,7 +31,7 @@ import (
 	"time"
 )
 
-func TestS3ObjectStoreFullKey(t *testing.T) {
+func TestS3ObjectStoreFullKey(t *testing.T) { //nolint:dupl
 	tests := []struct {
 		name     string
 		prefix   string
