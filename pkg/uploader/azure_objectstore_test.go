@@ -111,7 +111,8 @@ func TestAzureObjectStoreInit(t *testing.T) {
 				"storageAccount":          "testaccount",
 				"storageAccountKeyEnvVar": "AZURE_STORAGE_ACCOUNT_ACCESS_KEY",
 				// Provide both keys to satisfy different Velero versions
-				"credentialsData": "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey + "\nAZURE_STORAGE_KEY=" + validDummyKey + "\n",
+				"credentialsData": "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey +
+					"\nAZURE_STORAGE_KEY=" + validDummyKey + "\n",
 			},
 			expectError: false,
 		},

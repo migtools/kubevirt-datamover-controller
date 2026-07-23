@@ -355,15 +355,17 @@ func InitObjectStore(cfg *common.ObjectStoreConfig) (velero.ObjectStore, error) 
 		configMap["credentialsFile"] = cfg.CredentialsFile
 	}
 
+	const trueStr = "true"
+
 	// S3-compatible storage settings
 	if cfg.BSLS3URL != "" {
 		configMap["s3Url"] = cfg.BSLS3URL
 	}
 	if cfg.BSLS3ForcePathStyle {
-		configMap["s3ForcePathStyle"] = "true"
+		configMap["s3ForcePathStyle"] = trueStr
 	}
 	if cfg.BSLInsecureSkipTLSVerify {
-		configMap["insecureSkipTLSVerify"] = "true"
+		configMap["insecureSkipTLSVerify"] = trueStr
 	}
 	if cfg.BSLCACert != "" {
 		configMap["caCert"] = cfg.BSLCACert
@@ -390,7 +392,7 @@ func InitObjectStore(cfg *common.ObjectStoreConfig) (velero.ObjectStore, error) 
 		configMap["subscriptionId"] = cfg.BSLSubscriptionID
 	}
 	if cfg.BSLUseAAD {
-		configMap["useAAD"] = "true"
+		configMap["useAAD"] = trueStr
 	}
 	if cfg.BSLActiveDirectoryAuthorityURI != "" {
 		configMap["activeDirectoryAuthorityURI"] = cfg.BSLActiveDirectoryAuthorityURI

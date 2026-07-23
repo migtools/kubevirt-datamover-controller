@@ -223,7 +223,8 @@ func (a *AzureObjectStore) ListCommonPrefixes(bucket, prefix, delimiter string) 
 	fullPrefix := a.fullKey(prefix)
 	var prefixes []string
 
-	pager := a.client.ServiceClient().NewContainerClient(bucket).NewListBlobsHierarchyPager(delimiter, &container.ListBlobsHierarchyOptions{
+	containerClient := a.client.ServiceClient().NewContainerClient(bucket)
+	pager := containerClient.NewListBlobsHierarchyPager(delimiter, &container.ListBlobsHierarchyOptions{
 		Prefix: &fullPrefix,
 	})
 
