@@ -18,7 +18,6 @@ package uploader
 
 import (
 	"encoding/base64"
-	"os"
 	"testing"
 )
 
@@ -111,7 +110,8 @@ func TestAzureObjectStoreInit(t *testing.T) {
 				"bucket":                  "test-bucket",
 				"storageAccount":          "testaccount",
 				"storageAccountKeyEnvVar": "AZURE_STORAGE_ACCOUNT_ACCESS_KEY",
-				"credentialsData":         "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey + "\n",
+				// Provide both keys to satisfy different Velero versions
+				"credentialsData": "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey + "\nAZURE_STORAGE_KEY=" + validDummyKey + "\n",
 			},
 			expectError: false,
 		},
@@ -121,12 +121,10 @@ func TestAzureObjectStoreInit(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Setup env vars if needed
 			if tt.envAccount != "" {
-				os.Setenv("AZURE_STORAGE_ACCOUNT", tt.envAccount)
-				defer os.Unsetenv("AZURE_STORAGE_ACCOUNT")
+				t.Setenv("AZURE_STORAGE_ACCOUNT", tt.envAccount)
 			}
 			if tt.envKey != "" {
-				os.Setenv("AZURE_STORAGE_ACCOUNT_ACCESS_KEY", tt.envKey)
-				defer os.Unsetenv("AZURE_STORAGE_ACCOUNT_ACCESS_KEY")
+				t.Setenv("AZURE_STORAGE_ACCOUNT_ACCESS_KEY", tt.envKey)
 			}
 
 			store := &AzureObjectStore{}
@@ -147,20 +145,19 @@ func TestAzureObjectStoreInit(t *testing.T) {
 
 func TestInitObjectStoreAzure(t *testing.T) {
 	validDummyKey := base64.StdEncoding.EncodeToString([]byte("dummy-key-data"))
-	credData := "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey + "\n"
+	// Provide both keys to satisfy different Velero versions
+	credData := "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey + "\nAZURE_STORAGE_KEY=" + validDummyKey + "\n"
 
 	cfg := &UploaderConfig{
-		BSLProvider:                "azure",
-		BSLBucket:                  "test-bucket",
-		BSLSubscriptionID:          "test-subscription",
-		BSLResourceGroup:           "test-group",
-		BSLStorageAccountKeyEnvVar: "AZURE_STORAGE_ACCOUNT_ACCESS_KEY",
-		CredentialsData:            []byte(credData),
+		BSLProvider:       "azure",
+		BSLBucket:         "test-bucket",
+		BSLSubscriptionID: "test-subscription",
+		BSLResourceGroup:  "test-group",
+		CredentialsData:   []byte(credData),
 	}
 
 	// Set the storage account in the environment so Velero's util can find it
-	os.Setenv("AZURE_STORAGE_ACCOUNT", "testaccount")
-	defer os.Unsetenv("AZURE_STORAGE_ACCOUNT")
+	t.Setenv("AZURE_STORAGE_ACCOUNT", "testaccount")
 
 	store, err := InitObjectStore(cfg)
 	if err != nil {

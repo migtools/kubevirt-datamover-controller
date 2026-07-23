@@ -90,11 +90,20 @@ func (a *AzureObjectStore) Init(configMap map[string]string) error {
 		}
 		defer func() { _ = os.Remove(tmpFile) }()
 		configMap["credentialsFile"] = tmpFile
+
+		// For compatibility with older Velero versions that only check the env var
+		_ = os.Setenv("AZURE_CREDENTIALS_FILE", tmpFile)
+		defer func() { _ = os.Unsetenv("AZURE_CREDENTIALS_FILE") }()
 	}
 
 	// Velero's azure.NewStorageClient requires storageAccount in the config map.
 	if configMap["storageAccount"] == "" {
 		configMap["storageAccount"] = os.Getenv("AZURE_STORAGE_ACCOUNT")
+	}
+
+	// Tell Velero which key in the credentials file contains the access key
+	if configMap["storageAccountKeyEnvVar"] == "" {
+		configMap["storageAccountKeyEnvVar"] = "AZURE_STORAGE_ACCOUNT_ACCESS_KEY"
 	}
 
 	logger := logrus.New()
@@ -117,6 +126,14 @@ func (a *AzureObjectStore) fullKey(key string) string {
 	return strings.TrimSuffix(a.prefix, "/") + "/" + strings.TrimPrefix(key, "/")
 }
 
+type nopReadSeekCloser struct {
+	io.ReadSeeker
+}
+
+func (n nopReadSeekCloser) Close() error {
+	return nil
+}
+
 // PutObject uploads an object to Azure Blob Storage using chunked upload.
 func (a *AzureObjectStore) PutObject(bucket, key string, body io.Reader) error {
 	fullKey := a.fullKey(key)
@@ -135,14 +152,7 @@ func (a *AzureObjectStore) PutObject(bucket, key string, body io.Reader) error {
 
 			br := bytes.NewReader(block[0:n])
 
-			// Wrap *bytes.Reader into an io.ReadSeekCloser
-			var rsc io.ReadSeekCloser = struct {
-				*bytes.Reader
-				io.Closer
-			}{
-				Reader: br,
-				Closer: io.NopCloser(nil),
-			}
+			rsc := nopReadSeekCloser{ReadSeeker: br}
 
 			_, putErr := blobClient.StageBlock(context.Background(), blockID, rsc, nil)
 			if putErr != nil {
