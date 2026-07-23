@@ -26,7 +26,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
@@ -279,7 +278,7 @@ func (a *AzureObjectStore) CreateSignedURL(bucket, key string, ttl time.Duration
 		Protocol:      sas.ProtocolHTTPS,
 		StartTime:     time.Now().UTC().Add(-10 * time.Minute),
 		ExpiryTime:    time.Now().UTC().Add(ttl),
-		Permissions:   to.Ptr(sas.BlobPermissions{Read: true}).String(),
+		Permissions:   (&sas.BlobPermissions{Read: true}).String(),
 		ContainerName: bucket,
 		BlobName:      fullKey,
 	}.SignWithSharedKey(a.sharedKey)

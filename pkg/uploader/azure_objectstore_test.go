@@ -21,6 +21,7 @@ import (
 	"testing"
 )
 
+//nolint:dupl // Test structure is identical to S3ObjectStore
 func TestAzureObjectStoreFullKey(t *testing.T) {
 	tests := []struct {
 		name     string
