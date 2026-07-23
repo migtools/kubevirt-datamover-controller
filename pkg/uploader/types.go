@@ -100,6 +100,15 @@ const (
 	EnvBSLS3ForcePathStyle      = "KUBEVIRT_DM_BSL_S3_FORCE_PATH_STYLE"
 	EnvBSLInsecureSkipTLSVerify = "KUBEVIRT_DM_BSL_INSECURE_SKIP_TLS_VERIFY"
 	EnvBSLCACert                = "KUBEVIRT_DM_BSL_CA_CERT"
+
+	// Azure-specific storage provider settings
+	EnvBSLResourceGroup               = "KUBEVIRT_DM_BSL_RESOURCE_GROUP"
+	EnvBSLStorageAccount              = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT"
+	EnvBSLStorageAccountKeyEnvVar     = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT_KEY_ENV_VAR"
+	EnvBSLStorageAccountURI           = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT_URI"
+	EnvBSLSubscriptionID              = "KUBEVIRT_DM_BSL_SUBSCRIPTION_ID"
+	EnvBSLUseAAD                      = "KUBEVIRT_DM_BSL_USE_AAD"
+	EnvBSLActiveDirectoryAuthorityURI = "KUBEVIRT_DM_BSL_ACTIVE_DIRECTORY_AUTHORITY_URI"
 )
 
 // Default paths and values
@@ -127,6 +136,15 @@ type UploaderConfig struct {
 	BSLS3ForcePathStyle      bool   // Use path-style URLs (required by most S3-compatible stores)
 	BSLInsecureSkipTLSVerify bool   // Skip TLS certificate verification
 	BSLCACert                string // PEM-encoded custom CA certificate
+
+	// Azure-specific storage provider settings
+	BSLResourceGroup               string
+	BSLStorageAccount              string
+	BSLStorageAccountKeyEnvVar     string
+	BSLStorageAccountURI           string
+	BSLSubscriptionID              string
+	BSLUseAAD                      bool
+	BSLActiveDirectoryAuthorityURI string
 
 	// CredentialsData holds raw credential content (INI-style).
 	// Used by the controller to pass credentials from K8s Secrets directly
