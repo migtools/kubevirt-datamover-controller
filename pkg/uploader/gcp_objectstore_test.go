@@ -28,51 +28,7 @@ import (
 )
 
 func TestGCPObjectStoreFullKey(t *testing.T) {
-	tests := []struct {
-		name     string
-		prefix   string
-		key      string
-		expected string
-	}{
-		{
-			name:     "no prefix",
-			prefix:   "",
-			key:      "some/path/file.json",
-			expected: "some/path/file.json",
-		},
-		{
-			name:     "with prefix no trailing slash",
-			prefix:   "backups",
-			key:      "checkpoints/ns/vm/index.json",
-			expected: "backups/checkpoints/ns/vm/index.json",
-		},
-		{
-			name:     "with prefix with trailing slash",
-			prefix:   "backups/",
-			key:      "checkpoints/ns/vm/index.json",
-			expected: "backups/checkpoints/ns/vm/index.json",
-		},
-		{
-			name:     "key with leading slash",
-			prefix:   "backups",
-			key:      "/checkpoints/ns/vm/index.json",
-			expected: "backups/checkpoints/ns/vm/index.json",
-		},
-		{
-			name:     "both with slashes",
-			prefix:   "backups/",
-			key:      "/checkpoints/ns/vm/index.json",
-			expected: "backups/checkpoints/ns/vm/index.json",
-		},
-		{
-			name:     "nested prefix",
-			prefix:   "velero/backups",
-			key:      "file.json",
-			expected: "velero/backups/file.json",
-		},
-	}
-
-	for _, tt := range tests {
+	for _, tt := range fullKeyTestCases {
 		t.Run(tt.name, func(t *testing.T) {
 			store := &GCPObjectStore{prefix: tt.prefix}
 			result := store.fullKey(tt.key)
@@ -358,7 +314,8 @@ func generateTestGCPServiceAccountJSON(t *testing.T) []byte {
 		"auth_uri":                    "https://accounts.google.com/o/oauth2/auth",
 		"token_uri":                   "https://oauth2.googleapis.com/token",
 		"auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-		"client_x509_cert_url":        "https://www.googleapis.com/robot/v1/metadata/x509/test%40test-project.iam.gserviceaccount.com",
+		"client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/" +
+			"x509/test%40test-project.iam.gserviceaccount.com",
 	}
 
 	data, err := json.Marshal(saKey)

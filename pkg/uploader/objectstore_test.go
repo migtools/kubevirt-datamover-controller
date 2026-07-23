@@ -31,52 +31,54 @@ import (
 	"time"
 )
 
-func TestS3ObjectStoreFullKey(t *testing.T) {
-	tests := []struct {
-		name     string
-		prefix   string
-		key      string
-		expected string
-	}{
-		{
-			name:     "no prefix",
-			prefix:   "",
-			key:      "some/path/file.json",
-			expected: "some/path/file.json",
-		},
-		{
-			name:     "with prefix no trailing slash",
-			prefix:   "backups",
-			key:      "checkpoints/ns/vm/index.json",
-			expected: "backups/checkpoints/ns/vm/index.json",
-		},
-		{
-			name:     "with prefix with trailing slash",
-			prefix:   "backups/",
-			key:      "checkpoints/ns/vm/index.json",
-			expected: "backups/checkpoints/ns/vm/index.json",
-		},
-		{
-			name:     "key with leading slash",
-			prefix:   "backups",
-			key:      "/checkpoints/ns/vm/index.json",
-			expected: "backups/checkpoints/ns/vm/index.json",
-		},
-		{
-			name:     "both with slashes",
-			prefix:   "backups/",
-			key:      "/checkpoints/ns/vm/index.json",
-			expected: "backups/checkpoints/ns/vm/index.json",
-		},
-		{
-			name:     "nested prefix",
-			prefix:   "velero/backups",
-			key:      "file.json",
-			expected: "velero/backups/file.json",
-		},
-	}
+// fullKeyTestCases is shared across S3, GCP, and Azure fullKey tests
+// since the logic is identical for all providers.
+var fullKeyTestCases = []struct {
+	name     string
+	prefix   string
+	key      string
+	expected string
+}{
+	{
+		name:     "no prefix",
+		prefix:   "",
+		key:      "some/path/file.json",
+		expected: "some/path/file.json",
+	},
+	{
+		name:     "with prefix no trailing slash",
+		prefix:   "backups",
+		key:      "checkpoints/ns/vm/index.json",
+		expected: "backups/checkpoints/ns/vm/index.json",
+	},
+	{
+		name:     "with prefix with trailing slash",
+		prefix:   "backups/",
+		key:      "checkpoints/ns/vm/index.json",
+		expected: "backups/checkpoints/ns/vm/index.json",
+	},
+	{
+		name:     "key with leading slash",
+		prefix:   "backups",
+		key:      "/checkpoints/ns/vm/index.json",
+		expected: "backups/checkpoints/ns/vm/index.json",
+	},
+	{
+		name:     "both with slashes",
+		prefix:   "backups/",
+		key:      "/checkpoints/ns/vm/index.json",
+		expected: "backups/checkpoints/ns/vm/index.json",
+	},
+	{
+		name:     "nested prefix",
+		prefix:   "velero/backups",
+		key:      "file.json",
+		expected: "velero/backups/file.json",
+	},
+}
 
-	for _, tt := range tests {
+func TestS3ObjectStoreFullKey(t *testing.T) {
+	for _, tt := range fullKeyTestCases {
 		t.Run(tt.name, func(t *testing.T) {
 			store := &S3ObjectStore{prefix: tt.prefix}
 			result := store.fullKey(tt.key)

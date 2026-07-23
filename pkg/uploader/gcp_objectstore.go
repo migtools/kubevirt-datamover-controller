@@ -77,7 +77,7 @@ const (
 
 // getCredAccountType extracts the "type" field from a GCP credentials JSON.
 func getCredAccountType(credJSON []byte) (credAccountType, error) {
-	var f map[string]interface{}
+	var f map[string]any
 	if err := json.Unmarshal(credJSON, &f); err != nil {
 		return "", fmt.Errorf("failed to parse credentials JSON: %w", err)
 	}
@@ -122,20 +122,24 @@ func (g *GCPObjectStore) Init(configMap map[string]string) error {
 			return fmt.Errorf("error reading credentials file %s: %w", credFile, err)
 		}
 
+		//nolint:staticcheck // credentials from trusted K8s secrets
 		creds, err = google.CredentialsFromJSON(ctx, b)
 		if err != nil {
 			return fmt.Errorf("error parsing credentials file: %w", err)
 		}
 
+		//nolint:staticcheck // matching Velero GCP plugin pattern
 		clientOptions = append(clientOptions, option.WithCredentialsFile(credFile))
 	} else if credData := configMap["credentialsData"]; credData != "" {
 		credBytes := []byte(credData)
 
+		//nolint:staticcheck // credentials from trusted K8s secrets
 		creds, err = google.CredentialsFromJSON(ctx, credBytes)
 		if err != nil {
 			return fmt.Errorf("error parsing credentials data: %w", err)
 		}
 
+		//nolint:staticcheck // matching Velero GCP plugin pattern
 		clientOptions = append(clientOptions, option.WithCredentialsJSON(credBytes))
 	} else {
 		creds, err = google.FindDefaultCredentials(ctx, storage.ScopeReadWrite)
@@ -341,7 +345,9 @@ func (g *GCPObjectStore) ListObjects(bucket, prefix string) ([]string, error) {
 // Returns an error for external_account (WIF) credentials.
 func (g *GCPObjectStore) CreateSignedURL(bucket, key string, ttl time.Duration) (string, error) {
 	if g.googleAccessID == "" {
-		return "", fmt.Errorf("GoogleAccessID is empty, cannot create signed URL (external_account credentials are not supported)")
+		return "", fmt.Errorf(
+			"GoogleAccessID is empty, cannot create signed URL (external_account credentials are not supported)",
+		)
 	}
 
 	options := storage.SignedURLOptions{
