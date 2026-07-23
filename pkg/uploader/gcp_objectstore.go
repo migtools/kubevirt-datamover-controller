@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -260,7 +261,7 @@ func (g *GCPObjectStore) GetObject(bucket, key string) (io.ReadCloser, error) {
 func (g *GCPObjectStore) ObjectExists(bucket, key string) (bool, error) {
 	_, err := g.client.Bucket(bucket).Object(g.fullKey(key)).Attrs(context.Background())
 	if err != nil {
-		if err == storage.ErrObjectNotExist {
+		if errors.Is(err, storage.ErrObjectNotExist) {
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to check object existence %s: %w", key, err)
