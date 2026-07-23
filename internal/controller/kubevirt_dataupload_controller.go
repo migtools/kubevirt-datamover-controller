@@ -1657,6 +1657,8 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		BSLS3ForcePathStyle:      strconv.FormatBool(cfg.S3ForcePathStyle),
 		BSLInsecureSkipTLSVerify: strconv.FormatBool(cfg.InsecureSkipTLSVerify),
 		BSLCACert:                cfg.CACert,
+		BSLServiceAccount:        cfg.ServiceAccount,
+		BSLKMSKeyName:            cfg.KMSKeyName,
 		CredentialSecretName:     cfg.CredentialName,
 		CredentialSecretKey:      cfg.CredentialKey,
 		VMName:                   vmRef.Name,

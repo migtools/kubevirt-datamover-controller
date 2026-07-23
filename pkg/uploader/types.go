@@ -100,6 +100,10 @@ const (
 	EnvBSLS3ForcePathStyle      = "KUBEVIRT_DM_BSL_S3_FORCE_PATH_STYLE"
 	EnvBSLInsecureSkipTLSVerify = "KUBEVIRT_DM_BSL_INSECURE_SKIP_TLS_VERIFY"
 	EnvBSLCACert                = "KUBEVIRT_DM_BSL_CA_CERT"
+
+	// GCP-specific storage provider settings
+	EnvBSLServiceAccount = "KUBEVIRT_DM_BSL_SERVICE_ACCOUNT"
+	EnvBSLKMSKeyName     = "KUBEVIRT_DM_BSL_KMS_KEY_NAME"
 )
 
 // Default paths and values
@@ -127,6 +131,10 @@ type UploaderConfig struct {
 	BSLS3ForcePathStyle      bool   // Use path-style URLs (required by most S3-compatible stores)
 	BSLInsecureSkipTLSVerify bool   // Skip TLS certificate verification
 	BSLCACert                string // PEM-encoded custom CA certificate
+
+	// GCP-specific storage provider settings
+	BSLServiceAccount string // GCP service account email for compute engine signing
+	BSLKMSKeyName     string // Cloud KMS key for server-side encryption
 
 	// CredentialsData holds raw credential content (INI-style).
 	// Used by the controller to pass credentials from K8s Secrets directly

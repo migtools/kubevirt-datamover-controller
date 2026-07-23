@@ -366,13 +366,18 @@ func InitObjectStore(cfg *UploaderConfig) (velero.ObjectStore, error) {
 	if cfg.BSLCACert != "" {
 		configMap["caCert"] = cfg.BSLCACert
 	}
+	if cfg.BSLServiceAccount != "" {
+		configMap["serviceAccount"] = cfg.BSLServiceAccount
+	}
+	if cfg.BSLKMSKeyName != "" {
+		configMap["kmsKeyName"] = cfg.BSLKMSKeyName
+	}
 
 	switch strings.ToLower(cfg.BSLProvider) {
 	case "aws":
 		return NewS3ObjectStore(configMap)
 	case "gcp":
-		// TODO: Implement GCP Cloud Storage support (issue #11)
-		return nil, fmt.Errorf("gcp object store not yet implemented")
+		return NewGCPObjectStore(configMap)
 	case "azure":
 		// TODO: Implement Azure Blob Storage support (issue #11)
 		return nil, fmt.Errorf("azure object store not yet implemented")
@@ -400,6 +405,10 @@ type BSLConfig struct {
 	S3ForcePathStyle      bool
 	InsecureSkipTLSVerify bool
 	CACert                string
+
+	// GCP-specific storage provider settings
+	ServiceAccount string
+	KMSKeyName     string
 }
 
 // ExtractBSLConfig extracts and validates common BSL configuration fields.
@@ -427,12 +436,16 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 	s3ForcePathStyle := false
 	insecureSkipTLSVerify := false
 	caCert := ""
+	serviceAccount := ""
+	kmsKeyName := ""
 	if bsl.Spec.Config != nil {
 		region = bsl.Spec.Config["region"]
 		s3URL = bsl.Spec.Config["s3Url"]
 		s3ForcePathStyle = strings.EqualFold(bsl.Spec.Config["s3ForcePathStyle"], "true")
 		insecureSkipTLSVerify = strings.EqualFold(bsl.Spec.Config["insecureSkipTLSVerify"], "true")
 		caCert = bsl.Spec.Config["caCert"]
+		serviceAccount = bsl.Spec.Config["serviceAccount"]
+		kmsKeyName = bsl.Spec.Config["kmsKeyName"]
 	}
 
 	credName := ""
@@ -455,6 +468,8 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 		S3ForcePathStyle:      s3ForcePathStyle,
 		InsecureSkipTLSVerify: insecureSkipTLSVerify,
 		CACert:                caCert,
+		ServiceAccount:        serviceAccount,
+		KMSKeyName:            kmsKeyName,
 	}, nil
 }
 
@@ -494,6 +509,8 @@ func InitObjectStoreFromBSL(
 		BSLS3ForcePathStyle:      cfg.S3ForcePathStyle,
 		BSLInsecureSkipTLSVerify: cfg.InsecureSkipTLSVerify,
 		BSLCACert:                cfg.CACert,
+		BSLServiceAccount:        cfg.ServiceAccount,
+		BSLKMSKeyName:            cfg.KMSKeyName,
 		CredentialsData:          credData,
 	})
 	if err != nil {

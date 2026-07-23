@@ -312,46 +312,15 @@ func TestInitObjectStoreWithCredentialsData(t *testing.T) {
 	}
 }
 
-func TestInitObjectStore(t *testing.T) {
-	tests := []struct {
-		name        string
-		provider    string
-		expectError bool
-		errorMsg    string
-	}{
-		{
-			name:        "gcp not implemented",
-			provider:    "gcp",
-			expectError: true,
-			errorMsg:    "GCP object store not yet implemented",
-		},
-		{
-			name:        "azure not implemented",
-			provider:    "azure",
-			expectError: true,
-			errorMsg:    "Azure object store not yet implemented",
-		},
+func TestInitObjectStoreAzureNotImplemented(t *testing.T) {
+	config := &UploaderConfig{
+		BSLProvider: "azure",
+		BSLBucket:   "test-bucket",
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			config := &UploaderConfig{
-				BSLProvider: tt.provider,
-				BSLBucket:   "test-bucket",
-			}
-
-			_, err := InitObjectStore(config)
-
-			if tt.expectError {
-				if err == nil {
-					t.Error("expected error but got none")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-			}
-		})
+	_, err := InitObjectStore(config)
+	if err == nil {
+		t.Error("expected error for azure provider, got none")
 	}
 }
 

@@ -301,7 +301,9 @@ func TestEnvironmentVariableConstants(t *testing.T) {
 		"EnvSourcePVCPath":    "KUBEVIRT_DM_SOURCE_PVC_PATH",
 		"EnvDataUploadName":   "KUBEVIRT_DM_DATAUPLOAD_NAME",
 		"EnvDataUploadUID":    "KUBEVIRT_DM_DATAUPLOAD_UID",
-		"EnvVMBName":          "KUBEVIRT_DM_VMB_NAME",
+		"EnvVMBName":           "KUBEVIRT_DM_VMB_NAME",
+		"EnvBSLServiceAccount": "KUBEVIRT_DM_BSL_SERVICE_ACCOUNT",
+		"EnvBSLKMSKeyName":     "KUBEVIRT_DM_BSL_KMS_KEY_NAME",
 	}
 
 	// Just checking they're defined and have expected prefix
@@ -323,6 +325,8 @@ func TestEnvironmentVariableConstants(t *testing.T) {
 		{"EnvDataUploadName", EnvDataUploadName},
 		{"EnvDataUploadUID", EnvDataUploadUID},
 		{"EnvVMBName", EnvVMBName},
+		{"EnvBSLServiceAccount", EnvBSLServiceAccount},
+		{"EnvBSLKMSKeyName", EnvBSLKMSKeyName},
 	}
 
 	for _, ev := range envVarsToCheck {
