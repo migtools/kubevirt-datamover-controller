@@ -647,7 +647,7 @@ func (r *KubeVirtDataUploadReconciler) getEffectiveMaxIncrementalBackups(ctx con
 // It does NOT modify VMBT status — ForceFullBackup on the VMB is the sole mechanism
 // for forcing full backups.
 func (r *KubeVirtDataUploadReconciler) validateBSLCheckpoint(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmRef *common.VMReference) (bool, *uploader.CheckpointLookupResult) {
-	forceFullBackup := false
+	forceFullBackup := true
 
 	var checkpointLookup *uploader.CheckpointLookupResult
 	bsl, bslErr := r.getBackupStorageLocationForDU(ctx, du)
@@ -671,27 +671,23 @@ func (r *KubeVirtDataUploadReconciler) validateBSLCheckpoint(ctx context.Context
 		}
 	}
 
-	// Determine whether to force full backup based on BSL validation result.
-	// Only act on definitive results (checkpointLookup != nil). If BSL was
-	// unreachable or lookup errored, checkpointLookup is nil and we skip
-	// (don't force full backup due to transient failures).
-	if checkpointLookup != nil && !checkpointLookup.IsChainValid {
-		// Chain is broken — force full backup via VMB.Spec.ForceFullBackup
-		logger.Info("BSL checkpoint chain is invalid, forcing full backup",
-			"message", checkpointLookup.Message)
-		forceFullBackup = true
-	} else if checkpointLookup != nil && checkpointLookup.Found && checkpointLookup.IsChainValid {
-		// Valid chain exists — allow incremental backup
+	// Default to full backup. Only allow incremental when BSL validation
+	// positively confirms a valid chain exists.
+	if checkpointLookup != nil && checkpointLookup.Found && checkpointLookup.IsChainValid {
+		forceFullBackup = false
 		logger.Info("BSL checkpoint chain is valid, allowing incremental backup",
 			"checkpoint", checkpointLookup.LatestCheckpoint,
 			"chainLength", checkpointLookup.ChainLength)
+	} else if checkpointLookup != nil && !checkpointLookup.IsChainValid {
+		// Chain is broken — force full backup via VMB.Spec.ForceFullBackup
+		logger.Info("BSL checkpoint chain is invalid, forcing full backup",
+			"message", checkpointLookup.Message)
 	} else if checkpointLookup != nil && !checkpointLookup.Found {
 		// No checkpoint found — first backup or all data deleted.
-		// ForceFullBackup not strictly needed (KubeVirt will do full anyway
-		// without a checkpoint), but set it for clarity.
+		// The default full-backup decision remains in effect (KubeVirt would
+		// also do a full backup without a checkpoint).
 		logger.Info("No valid checkpoint found in BSL, will perform full backup",
 			"message", checkpointLookup.Message)
-		forceFullBackup = true
 	}
 
 	// Mark BSL validation as done for this DataUpload to avoid redundant S3 queries.
