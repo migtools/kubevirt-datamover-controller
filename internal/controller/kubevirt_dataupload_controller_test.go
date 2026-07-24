@@ -5493,6 +5493,148 @@ func TestValidateBSLCheckpoint_ForceFullOnChainFallback(t *testing.T) {
 
 }
 
+func TestValidateBSLCheckpoint_ForcesFullBackupWhenBSLNotFound(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du-bsl-failure",
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	vmRef := &common.VMReference{Name: vmName, Namespace: vmNamespace}
+	forceFullBackup, checkpointLookup := r.validateBSLCheckpoint(context.Background(), logr.Discard(), du, vmRef)
+
+	if !forceFullBackup {
+		t.Error("expected forceFullBackup=true when BSL validation fails")
+	}
+
+	if checkpointLookup != nil {
+		t.Error("expected checkpointLookup=nil when BSL validation fails")
+	}
+}
+
+func TestValidateBSLCheckpoint_ForcesFullBackupWhenCheckpointLookupErrors(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du-bsl-lookup-error",
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-creds",
+			Namespace: vmNamespace,
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl, credSecret).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			return nil, fmt.Errorf("simulated object store initialization error")
+		},
+	}
+
+	vmRef := &common.VMReference{Name: vmName, Namespace: vmNamespace}
+	forceFullBackup, checkpointLookup := r.validateBSLCheckpoint(context.Background(), logr.Discard(), du, vmRef)
+
+	if !forceFullBackup {
+		t.Error("expected forceFullBackup=true when checkpoint lookup errors")
+	}
+
+	if checkpointLookup != nil {
+		t.Error("expected checkpointLookup=nil when checkpoint lookup errors")
+	}
+}
+
 func TestPrepareVMBackupTracker_FirstBackup(t *testing.T) {
 	// No S3 index exists → creates fresh VMBT with no LatestCheckpoint
 	scheme := runtime.NewScheme()
