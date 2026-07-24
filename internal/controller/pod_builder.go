@@ -61,6 +61,10 @@ type DatamoverPodConfig struct {
 	BSLInsecureSkipTLSVerify string
 	BSLCACert                string
 
+	// GCP-specific storage provider settings
+	BSLServiceAccount string
+	BSLKMSKeyName     string
+
 	// Credentials
 	CredentialSecretName string
 	CredentialSecretKey  string
@@ -128,6 +132,8 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 		{Name: uploader.EnvBSLS3ForcePathStyle, Value: config.BSLS3ForcePathStyle},
 		{Name: uploader.EnvBSLInsecureSkipTLSVerify, Value: config.BSLInsecureSkipTLSVerify},
 		{Name: uploader.EnvBSLCACert, Value: config.BSLCACert},
+		{Name: uploader.EnvBSLServiceAccount, Value: config.BSLServiceAccount},
+		{Name: uploader.EnvBSLKMSKeyName, Value: config.BSLKMSKeyName},
 		{Name: uploader.EnvCredentialsFile, Value: uploader.DefaultCredentialsPath},
 		{Name: uploader.EnvVMName, Value: config.VMName},
 		{Name: uploader.EnvVMNamespace, Value: config.VMNamespace},

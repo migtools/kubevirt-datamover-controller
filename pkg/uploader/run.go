@@ -124,6 +124,8 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 		BSLS3ForcePathStyle:      strings.EqualFold(os.Getenv(EnvBSLS3ForcePathStyle), "true"),
 		BSLInsecureSkipTLSVerify: strings.EqualFold(os.Getenv(EnvBSLInsecureSkipTLSVerify), "true"),
 		BSLCACert:                os.Getenv(EnvBSLCACert),
+		BSLServiceAccount:        os.Getenv(EnvBSLServiceAccount),
+		BSLKMSKeyName:            os.Getenv(EnvBSLKMSKeyName),
 		CredentialsFile:          os.Getenv(EnvCredentialsFile),
 		VMName:                   os.Getenv(EnvVMName),
 		VMNamespace:              os.Getenv(EnvVMNamespace),

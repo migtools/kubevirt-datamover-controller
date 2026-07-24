@@ -532,14 +532,21 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 }
 
 // conditionIndicatesFailure reports whether a VirtualMachineBackup condition's Reason or Message
-// signals a failure. KubeVirt emits descriptive strings such as "Backup has failed: <details>"
-// rather than a fixed "Failed" reason, so we match a case-insensitive "failed" substring.
+// signals a failure. KubeVirt uses "Completed VirtualMachineBackup" as a prefix for successful
+// backups (which may include warnings like "Failed freezing guest filesystem"), and patterns
+// like "Backup has failed: <details>" for actual failures. We treat a condition as success
+// when the reason starts with "Completed", even if a warning substring contains "failed".
 func conditionIndicatesFailure(cond *kubevirtbackupv1alpha1.Condition) bool {
 	if cond == nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(cond.Reason), "failed") ||
-		strings.Contains(strings.ToLower(cond.Message), "failed")
+	reason := strings.ToLower(cond.Reason)
+	message := strings.ToLower(cond.Message)
+	if strings.HasPrefix(reason, "completed") {
+		return false
+	}
+	return strings.Contains(reason, "failed") ||
+		strings.Contains(message, "failed")
 }
 
 // vmBackupConditionDetail extracts a human-readable failure detail from a VirtualMachineBackup
@@ -1653,6 +1660,8 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		BSLS3ForcePathStyle:      strconv.FormatBool(cfg.S3ForcePathStyle),
 		BSLInsecureSkipTLSVerify: strconv.FormatBool(cfg.InsecureSkipTLSVerify),
 		BSLCACert:                cfg.CACert,
+		BSLServiceAccount:        cfg.ServiceAccount,
+		BSLKMSKeyName:            cfg.KMSKeyName,
 		CredentialSecretName:     cfg.CredentialName,
 		CredentialSecretKey:      cfg.CredentialKey,
 		VMName:                   vmRef.Name,
