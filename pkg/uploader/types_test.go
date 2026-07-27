@@ -288,20 +288,22 @@ func TestCheckpointFileJSONSerialization(t *testing.T) {
 func TestEnvironmentVariableConstants(t *testing.T) {
 	// Verify environment variable names are correctly defined
 	expectedEnvVars := map[string]string{
-		"EnvBSLProvider":      "KUBEVIRT_DM_BSL_PROVIDER",
-		"EnvBSLBucket":        "KUBEVIRT_DM_BSL_BUCKET",
-		"EnvBSLPrefix":        "KUBEVIRT_DM_BSL_PREFIX",
-		"EnvBSLRegion":        "KUBEVIRT_DM_BSL_REGION",
-		"EnvCredentialsFile":  "KUBEVIRT_DM_CREDENTIALS_FILE",
-		"EnvVMName":           "KUBEVIRT_DM_VM_NAME",
-		"EnvVMNamespace":      "KUBEVIRT_DM_VM_NAMESPACE",
-		"EnvCheckpointName":   "KUBEVIRT_DM_CHECKPOINT_NAME",
-		"EnvBackupType":       "KUBEVIRT_DM_BACKUP_TYPE",
-		"EnvVeleroBackupName": "KUBEVIRT_DM_VELERO_BACKUP_NAME",
-		"EnvSourcePVCPath":    "KUBEVIRT_DM_SOURCE_PVC_PATH",
-		"EnvDataUploadName":   "KUBEVIRT_DM_DATAUPLOAD_NAME",
-		"EnvDataUploadUID":    "KUBEVIRT_DM_DATAUPLOAD_UID",
-		"EnvVMBName":          "KUBEVIRT_DM_VMB_NAME",
+		"EnvBSLProvider":       "KUBEVIRT_DM_BSL_PROVIDER",
+		"EnvBSLBucket":         "KUBEVIRT_DM_BSL_BUCKET",
+		"EnvBSLPrefix":         "KUBEVIRT_DM_BSL_PREFIX",
+		"EnvBSLRegion":         "KUBEVIRT_DM_BSL_REGION",
+		"EnvCredentialsFile":   "KUBEVIRT_DM_CREDENTIALS_FILE",
+		"EnvVMName":            "KUBEVIRT_DM_VM_NAME",
+		"EnvVMNamespace":       "KUBEVIRT_DM_VM_NAMESPACE",
+		"EnvCheckpointName":    "KUBEVIRT_DM_CHECKPOINT_NAME",
+		"EnvBackupType":        "KUBEVIRT_DM_BACKUP_TYPE",
+		"EnvVeleroBackupName":  "KUBEVIRT_DM_VELERO_BACKUP_NAME",
+		"EnvSourcePVCPath":     "KUBEVIRT_DM_SOURCE_PVC_PATH",
+		"EnvDataUploadName":    "KUBEVIRT_DM_DATAUPLOAD_NAME",
+		"EnvDataUploadUID":     "KUBEVIRT_DM_DATAUPLOAD_UID",
+		"EnvVMBName":           "KUBEVIRT_DM_VMB_NAME",
+		"EnvBSLServiceAccount": "KUBEVIRT_DM_BSL_SERVICE_ACCOUNT",
+		"EnvBSLKMSKeyName":     "KUBEVIRT_DM_BSL_KMS_KEY_NAME",
 	}
 
 	// Just checking they're defined and have expected prefix
@@ -323,6 +325,8 @@ func TestEnvironmentVariableConstants(t *testing.T) {
 		{"EnvDataUploadName", EnvDataUploadName},
 		{"EnvDataUploadUID", EnvDataUploadUID},
 		{"EnvVMBName", EnvVMBName},
+		{"EnvBSLServiceAccount", EnvBSLServiceAccount},
+		{"EnvBSLKMSKeyName", EnvBSLKMSKeyName},
 	}
 
 	for _, ev := range envVarsToCheck {

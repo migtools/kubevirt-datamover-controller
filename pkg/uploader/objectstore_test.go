@@ -31,52 +31,54 @@ import (
 	"time"
 )
 
-func TestS3ObjectStoreFullKey(t *testing.T) {
-	tests := []struct {
-		name     string
-		prefix   string
-		key      string
-		expected string
-	}{
-		{
-			name:     "no prefix",
-			prefix:   "",
-			key:      "some/path/file.json",
-			expected: "some/path/file.json",
-		},
-		{
-			name:     "with prefix no trailing slash",
-			prefix:   "backups",
-			key:      "checkpoints/ns/vm/index.json",
-			expected: "backups/checkpoints/ns/vm/index.json",
-		},
-		{
-			name:     "with prefix with trailing slash",
-			prefix:   "backups/",
-			key:      "checkpoints/ns/vm/index.json",
-			expected: "backups/checkpoints/ns/vm/index.json",
-		},
-		{
-			name:     "key with leading slash",
-			prefix:   "backups",
-			key:      "/checkpoints/ns/vm/index.json",
-			expected: "backups/checkpoints/ns/vm/index.json",
-		},
-		{
-			name:     "both with slashes",
-			prefix:   "backups/",
-			key:      "/checkpoints/ns/vm/index.json",
-			expected: "backups/checkpoints/ns/vm/index.json",
-		},
-		{
-			name:     "nested prefix",
-			prefix:   "velero/backups",
-			key:      "file.json",
-			expected: "velero/backups/file.json",
-		},
-	}
+// fullKeyTestCases is shared across S3, GCP, and Azure fullKey tests
+// since the logic is identical for all providers.
+var fullKeyTestCases = []struct {
+	name     string
+	prefix   string
+	key      string
+	expected string
+}{
+	{
+		name:     "no prefix",
+		prefix:   "",
+		key:      "some/path/file.json",
+		expected: "some/path/file.json",
+	},
+	{
+		name:     "with prefix no trailing slash",
+		prefix:   "backups",
+		key:      "checkpoints/ns/vm/index.json",
+		expected: "backups/checkpoints/ns/vm/index.json",
+	},
+	{
+		name:     "with prefix with trailing slash",
+		prefix:   "backups/",
+		key:      "checkpoints/ns/vm/index.json",
+		expected: "backups/checkpoints/ns/vm/index.json",
+	},
+	{
+		name:     "key with leading slash",
+		prefix:   "backups",
+		key:      "/checkpoints/ns/vm/index.json",
+		expected: "backups/checkpoints/ns/vm/index.json",
+	},
+	{
+		name:     "both with slashes",
+		prefix:   "backups/",
+		key:      "/checkpoints/ns/vm/index.json",
+		expected: "backups/checkpoints/ns/vm/index.json",
+	},
+	{
+		name:     "nested prefix",
+		prefix:   "velero/backups",
+		key:      "file.json",
+		expected: "velero/backups/file.json",
+	},
+}
 
-	for _, tt := range tests {
+func TestS3ObjectStoreFullKey(t *testing.T) {
+	for _, tt := range fullKeyTestCases {
 		t.Run(tt.name, func(t *testing.T) {
 			store := &S3ObjectStore{prefix: tt.prefix}
 			result := store.fullKey(tt.key)
@@ -312,46 +314,15 @@ func TestInitObjectStoreWithCredentialsData(t *testing.T) {
 	}
 }
 
-func TestInitObjectStore(t *testing.T) {
-	tests := []struct {
-		name        string
-		provider    string
-		expectError bool
-		errorMsg    string
-	}{
-		{
-			name:        "gcp not implemented",
-			provider:    "gcp",
-			expectError: true,
-			errorMsg:    "GCP object store not yet implemented",
-		},
-		{
-			name:        "azure not implemented",
-			provider:    "azure",
-			expectError: true,
-			errorMsg:    "Azure object store not yet implemented",
-		},
+func TestInitObjectStoreAzureNotImplemented(t *testing.T) {
+	config := &UploaderConfig{
+		BSLProvider: "azure",
+		BSLBucket:   "test-bucket",
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			config := &UploaderConfig{
-				BSLProvider: tt.provider,
-				BSLBucket:   "test-bucket",
-			}
-
-			_, err := InitObjectStore(config)
-
-			if tt.expectError {
-				if err == nil {
-					t.Error("expected error but got none")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-			}
-		})
+	_, err := InitObjectStore(config)
+	if err == nil {
+		t.Error("expected error for azure provider, got none")
 	}
 }
 
