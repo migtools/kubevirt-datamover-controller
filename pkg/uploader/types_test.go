@@ -336,13 +336,13 @@ func TestEnvironmentVariableConstants(t *testing.T) {
 		{"EnvVMBName", EnvVMBName},
 		{"common.EnvBSLServiceAccount", common.EnvBSLServiceAccount},
 		{"common.EnvBSLKMSKeyName", common.EnvBSLKMSKeyName},
-		{"common.EnvBSLResourceGroup", EnvBSLResourceGroup},
-		{"common.EnvBSLStorageAccount", EnvBSLStorageAccount},
-		{"common.EnvBSLStorageAccountKeyEnvVar", EnvBSLStorageAccountKeyEnvVar},
-		{"common.EnvBSLStorageAccountURI", EnvBSLStorageAccountURI},
-		{"common.EnvBSLSubscriptionID", EnvBSLSubscriptionID},
-		{"common.EnvBSLUseAAD", EnvBSLUseAAD},
-		{"common.EnvBSLActiveDirectoryAuthorityURI", EnvBSLActiveDirectoryAuthorityURI},
+		{"common.EnvBSLResourceGroup", common.EnvBSLResourceGroup},
+		{"common.EnvBSLStorageAccount", common.EnvBSLStorageAccount},
+		{"common.EnvBSLStorageAccountKeyEnvVar", common.EnvBSLStorageAccountKeyEnvVar},
+		{"common.EnvBSLStorageAccountURI", common.EnvBSLStorageAccountURI},
+		{"common.EnvBSLSubscriptionID", common.EnvBSLSubscriptionID},
+		{"common.EnvBSLUseAAD", common.EnvBSLUseAAD},
+		{"common.EnvBSLActiveDirectoryAuthorityURI", common.EnvBSLActiveDirectoryAuthorityURI},
 	}
 
 	for _, ev := range envVarsToCheck {

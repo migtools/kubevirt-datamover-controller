@@ -19,6 +19,8 @@ package uploader
 import (
 	"encoding/base64"
 	"testing"
+
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 )
 
 //nolint:dupl // Test structure is identical to S3ObjectStore
@@ -150,12 +152,14 @@ func TestInitObjectStoreAzure(t *testing.T) {
 	// Provide both keys to satisfy different Velero versions
 	credData := "AZURE_STORAGE_ACCOUNT_ACCESS_KEY=" + validDummyKey + "\nAZURE_STORAGE_KEY=" + validDummyKey + "\n"
 
-	cfg := &UploaderConfig{
-		BSLProvider:       "azure",
-		BSLBucket:         "test-bucket",
-		BSLSubscriptionID: "test-subscription",
-		BSLResourceGroup:  "test-group",
-		CredentialsData:   []byte(credData),
+	cfg := &common.ObjectStoreConfig{
+		BSLProvider:                "azure",
+		BSLBucket:                  "test-bucket",
+		BSLSubscriptionID:          "test-subscription",
+		BSLResourceGroup:           "test-group",
+		BSLStorageAccountKeyEnvVar: "AZURE_STORAGE_ACCOUNT_ACCESS_KEY",
+
+		CredentialsData: []byte(credData),
 	}
 
 	// Set the storage account in the environment so Velero's util can find it

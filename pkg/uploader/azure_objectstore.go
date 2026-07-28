@@ -100,11 +100,6 @@ func (a *AzureObjectStore) Init(configMap map[string]string) error {
 		configMap["storageAccount"] = os.Getenv("AZURE_STORAGE_ACCOUNT")
 	}
 
-	// Tell Velero which key in the credentials file contains the access key
-	if configMap["storageAccountKeyEnvVar"] == "" {
-		configMap["storageAccountKeyEnvVar"] = "AZURE_STORAGE_ACCOUNT_ACCESS_KEY"
-	}
-
 	logger := logrus.New()
 
 	client, sharedKey, err := azure.NewStorageClient(logger, configMap)

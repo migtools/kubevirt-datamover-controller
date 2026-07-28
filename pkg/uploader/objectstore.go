@@ -554,7 +554,7 @@ func InitObjectStoreFromBSL(
 		factory = InitObjectStore
 	}
 
-	store, err := factory(&UploaderConfig{
+	store, err := factory(&common.ObjectStoreConfig{
 		BSLProvider:                    cfg.Provider,
 		BSLBucket:                      cfg.Bucket,
 		BSLPrefix:                      cfg.Prefix,
