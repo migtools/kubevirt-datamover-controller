@@ -38,6 +38,15 @@ type ObjectStoreConfig struct {
 	BSLServiceAccount string // GCP service account email for compute engine signing
 	BSLKMSKeyName     string // Cloud KMS key for server-side encryption
 
+	// Azure-specific storage provider settings
+	BSLResourceGroup               string
+	BSLStorageAccount              string
+	BSLStorageAccountKeyEnvVar     string
+	BSLStorageAccountURI           string
+	BSLSubscriptionID              string
+	BSLUseAAD                      bool
+	BSLActiveDirectoryAuthorityURI string
+
 	// CredentialsData holds raw credential content (INI-style).
 	// Used by the controller to pass credentials from K8s Secrets directly
 	// without writing to a temp file. Takes precedence over CredentialsFile.
