@@ -26,6 +26,7 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -141,19 +142,19 @@ func TestExtractDiskName(t *testing.T) {
 func TestLoadConfigFromEnv(t *testing.T) {
 	// Save original env and restore after test
 	originalEnv := map[string]string{
-		EnvBSLBucket:                os.Getenv(EnvBSLBucket),
-		EnvVMName:                   os.Getenv(EnvVMName),
-		EnvVMNamespace:              os.Getenv(EnvVMNamespace),
-		EnvBSLProvider:              os.Getenv(EnvBSLProvider),
-		EnvBSLPrefix:                os.Getenv(EnvBSLPrefix),
-		EnvBSLRegion:                os.Getenv(EnvBSLRegion),
-		EnvBackupType:               os.Getenv(EnvBackupType),
-		EnvSourcePVCPath:            os.Getenv(EnvSourcePVCPath),
-		EnvCheckpointName:           os.Getenv(EnvCheckpointName),
-		EnvBSLS3URL:                 os.Getenv(EnvBSLS3URL),
-		EnvBSLS3ForcePathStyle:      os.Getenv(EnvBSLS3ForcePathStyle),
-		EnvBSLInsecureSkipTLSVerify: os.Getenv(EnvBSLInsecureSkipTLSVerify),
-		EnvBSLCACert:                os.Getenv(EnvBSLCACert),
+		common.EnvBSLBucket:                os.Getenv(common.EnvBSLBucket),
+		EnvVMName:                          os.Getenv(EnvVMName),
+		EnvVMNamespace:                     os.Getenv(EnvVMNamespace),
+		common.EnvBSLProvider:              os.Getenv(common.EnvBSLProvider),
+		common.EnvBSLPrefix:                os.Getenv(common.EnvBSLPrefix),
+		common.EnvBSLRegion:                os.Getenv(common.EnvBSLRegion),
+		EnvBackupType:                      os.Getenv(EnvBackupType),
+		EnvSourcePVCPath:                   os.Getenv(EnvSourcePVCPath),
+		EnvCheckpointName:                  os.Getenv(EnvCheckpointName),
+		common.EnvBSLS3URL:                 os.Getenv(common.EnvBSLS3URL),
+		common.EnvBSLS3ForcePathStyle:      os.Getenv(common.EnvBSLS3ForcePathStyle),
+		common.EnvBSLInsecureSkipTLSVerify: os.Getenv(common.EnvBSLInsecureSkipTLSVerify),
+		common.EnvBSLCACert:                os.Getenv(common.EnvBSLCACert),
 	}
 	defer func() {
 		for k, v := range originalEnv {
@@ -174,10 +175,10 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		{
 			name: "valid config with all required fields",
 			envVars: map[string]string{
-				EnvBSLBucket:      "test-bucket",
-				EnvVMName:         "test-vm",
-				EnvVMNamespace:    "test-ns",
-				EnvCheckpointName: "cp-001",
+				common.EnvBSLBucket: "test-bucket",
+				EnvVMName:           "test-vm",
+				EnvVMNamespace:      "test-ns",
+				EnvCheckpointName:   "cp-001",
 			},
 			expectError: false,
 			validate: func(t *testing.T, cfg *UploaderConfig) {
@@ -197,8 +198,8 @@ func TestLoadConfigFromEnv(t *testing.T) {
 				if cfg.SourcePVCPath != DefaultSourcePVCPath {
 					t.Errorf("SourcePVCPath = %q, want %q", cfg.SourcePVCPath, DefaultSourcePVCPath)
 				}
-				if cfg.CredentialsFile != DefaultCredentialsPath {
-					t.Errorf("CredentialsFile = %q, want %q", cfg.CredentialsFile, DefaultCredentialsPath)
+				if cfg.CredentialsFile != common.DefaultCredentialsPath {
+					t.Errorf("CredentialsFile = %q, want %q", cfg.CredentialsFile, common.DefaultCredentialsPath)
 				}
 				if cfg.BackupType != "full" {
 					t.Errorf("BackupType = %q, want %q", cfg.BackupType, "full")
@@ -217,49 +218,49 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		{
 			name: "missing vm name returns error",
 			envVars: map[string]string{
-				EnvBSLBucket:      "test-bucket",
-				EnvVMNamespace:    "test-ns",
-				EnvCheckpointName: "cp-001",
+				common.EnvBSLBucket: "test-bucket",
+				EnvVMNamespace:      "test-ns",
+				EnvCheckpointName:   "cp-001",
 			},
 			expectError: true,
 		},
 		{
 			name: "missing vm namespace returns error",
 			envVars: map[string]string{
-				EnvBSLBucket:      "test-bucket",
-				EnvVMName:         "test-vm",
-				EnvCheckpointName: "cp-001",
+				common.EnvBSLBucket: "test-bucket",
+				EnvVMName:           "test-vm",
+				EnvCheckpointName:   "cp-001",
 			},
 			expectError: true,
 		},
 		{
 			name: "missing checkpoint name returns error",
 			envVars: map[string]string{
-				EnvBSLBucket:   "test-bucket",
-				EnvVMName:      "test-vm",
-				EnvVMNamespace: "test-ns",
+				common.EnvBSLBucket: "test-bucket",
+				EnvVMName:           "test-vm",
+				EnvVMNamespace:      "test-ns",
 			},
 			expectError: true,
 		},
 		{
 			name: "invalid backup type returns error",
 			envVars: map[string]string{
-				EnvBSLBucket:      "test-bucket",
-				EnvVMName:         "test-vm",
-				EnvVMNamespace:    "test-ns",
-				EnvCheckpointName: "cp-001",
-				EnvBackupType:     "invalid",
+				common.EnvBSLBucket: "test-bucket",
+				EnvVMName:           "test-vm",
+				EnvVMNamespace:      "test-ns",
+				EnvCheckpointName:   "cp-001",
+				EnvBackupType:       "invalid",
 			},
 			expectError: true,
 		},
 		{
 			name: "custom source path is used",
 			envVars: map[string]string{
-				EnvBSLBucket:      "test-bucket",
-				EnvVMName:         "test-vm",
-				EnvVMNamespace:    "test-ns",
-				EnvCheckpointName: "cp-001",
-				EnvSourcePVCPath:  "/custom/path",
+				common.EnvBSLBucket: "test-bucket",
+				EnvVMName:           "test-vm",
+				EnvVMNamespace:      "test-ns",
+				EnvCheckpointName:   "cp-001",
+				EnvSourcePVCPath:    "/custom/path",
 			},
 			expectError: false,
 			validate: func(t *testing.T, cfg *UploaderConfig) {
@@ -271,11 +272,11 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		{
 			name: "backup type incremental is preserved",
 			envVars: map[string]string{
-				EnvBSLBucket:      "test-bucket",
-				EnvVMName:         "test-vm",
-				EnvVMNamespace:    "test-ns",
-				EnvCheckpointName: "cp-001",
-				EnvBackupType:     "incremental",
+				common.EnvBSLBucket: "test-bucket",
+				EnvVMName:           "test-vm",
+				EnvVMNamespace:      "test-ns",
+				EnvCheckpointName:   "cp-001",
+				EnvBackupType:       "incremental",
 			},
 			expectError: false,
 			validate: func(t *testing.T, cfg *UploaderConfig) {
@@ -287,14 +288,14 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		{
 			name: "S3-compatible settings are parsed",
 			envVars: map[string]string{
-				EnvBSLBucket:                "test-bucket",
-				EnvVMName:                   "test-vm",
-				EnvVMNamespace:              "test-ns",
-				EnvCheckpointName:           "cp-001",
-				EnvBSLS3URL:                 "https://minio.example.com",
-				EnvBSLS3ForcePathStyle:      "true",
-				EnvBSLInsecureSkipTLSVerify: "true",
-				EnvBSLCACert:                "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----",
+				common.EnvBSLBucket:                "test-bucket",
+				EnvVMName:                          "test-vm",
+				EnvVMNamespace:                     "test-ns",
+				EnvCheckpointName:                  "cp-001",
+				common.EnvBSLS3URL:                 "https://minio.example.com",
+				common.EnvBSLS3ForcePathStyle:      "true",
+				common.EnvBSLInsecureSkipTLSVerify: "true",
+				common.EnvBSLCACert:                "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----",
 			},
 			expectError: false,
 			validate: func(t *testing.T, cfg *UploaderConfig) {
@@ -315,10 +316,10 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		{
 			name: "S3-compatible booleans default to false when unset",
 			envVars: map[string]string{
-				EnvBSLBucket:      "test-bucket",
-				EnvVMName:         "test-vm",
-				EnvVMNamespace:    "test-ns",
-				EnvCheckpointName: "cp-001",
+				common.EnvBSLBucket: "test-bucket",
+				EnvVMName:           "test-vm",
+				EnvVMNamespace:      "test-ns",
+				EnvCheckpointName:   "cp-001",
 			},
 			expectError: false,
 			validate: func(t *testing.T, cfg *UploaderConfig) {
@@ -339,12 +340,12 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		{
 			name: "S3-compatible booleans reject non-true values",
 			envVars: map[string]string{
-				EnvBSLBucket:                "test-bucket",
-				EnvVMName:                   "test-vm",
-				EnvVMNamespace:              "test-ns",
-				EnvCheckpointName:           "cp-001",
-				EnvBSLS3ForcePathStyle:      "false",
-				EnvBSLInsecureSkipTLSVerify: "yes",
+				common.EnvBSLBucket:                "test-bucket",
+				EnvVMName:                          "test-vm",
+				EnvVMNamespace:                     "test-ns",
+				EnvCheckpointName:                  "cp-001",
+				common.EnvBSLS3ForcePathStyle:      "false",
+				common.EnvBSLInsecureSkipTLSVerify: "yes",
 			},
 			expectError: false,
 			validate: func(t *testing.T, cfg *UploaderConfig) {
@@ -400,7 +401,9 @@ func TestUpdateVMIndex(t *testing.T) {
 		{
 			name: "creates new index for full backup",
 			config: &UploaderConfig{
-				BSLBucket:        "test-bucket",
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
 				VMName:           "test-vm",
 				VMNamespace:      "test-ns",
 				CheckpointName:   "cp-001",
@@ -458,7 +461,9 @@ func TestUpdateVMIndex(t *testing.T) {
 		{
 			name: "updates existing index for incremental backup",
 			config: &UploaderConfig{
-				BSLBucket:        "test-bucket",
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
 				VMName:           "test-vm",
 				VMNamespace:      "test-ns",
 				CheckpointName:   "cp-002",
@@ -518,7 +523,9 @@ func TestUpdateVMIndex(t *testing.T) {
 		{
 			name: "incremental with mid-chain break returns error",
 			config: &UploaderConfig{
-				BSLBucket:        "test-bucket",
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
 				VMName:           "test-vm",
 				VMNamespace:      "test-ns",
 				CheckpointName:   "cp-004",
@@ -576,7 +583,9 @@ func TestUpdateVMIndex(t *testing.T) {
 		{
 			name: "incremental fails when no valid chain exists",
 			config: &UploaderConfig{
-				BSLBucket:        "test-bucket",
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
 				VMName:           "test-vm",
 				VMNamespace:      "test-ns",
 				CheckpointName:   "cp-002",
@@ -613,7 +622,9 @@ func TestUpdateVMIndex(t *testing.T) {
 		{
 			name: "deduplicates checkpoint if already exists",
 			config: &UploaderConfig{
-				BSLBucket:        "test-bucket",
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
 				VMName:           "test-vm",
 				VMNamespace:      "test-ns",
 				CheckpointName:   "cp-001",
@@ -926,7 +937,9 @@ func TestUpdateVMIndex_ReferencedByPropagation(t *testing.T) {
 		{
 			name: "incremental backup propagates referencedBy to parent (full)",
 			config: &UploaderConfig{
-				BSLBucket:        "test-bucket",
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
 				VMName:           "test-vm",
 				VMNamespace:      "test-ns",
 				CheckpointName:   "cp-002",
@@ -981,7 +994,9 @@ func TestUpdateVMIndex_ReferencedByPropagation(t *testing.T) {
 		{
 			name: "three-level chain propagates to all ancestors",
 			config: &UploaderConfig{
-				BSLBucket:        "test-bucket",
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
 				VMName:           "test-vm",
 				VMNamespace:      "test-ns",
 				CheckpointName:   "cp-003",
@@ -1050,7 +1065,9 @@ func TestUpdateVMIndex_ReferencedByPropagation(t *testing.T) {
 		{
 			name: "full backup does not propagate (no parent)",
 			config: &UploaderConfig{
-				BSLBucket:        "test-bucket",
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
 				VMName:           "test-vm",
 				VMNamespace:      "test-ns",
 				CheckpointName:   "cp-001",
@@ -1084,7 +1101,9 @@ func TestUpdateVMIndex_ReferencedByPropagation(t *testing.T) {
 		{
 			name: "dedup checkpoint merges referencedBy",
 			config: &UploaderConfig{
-				BSLBucket:        "test-bucket",
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
 				VMName:           "test-vm",
 				VMNamespace:      "test-ns",
 				CheckpointName:   "cp-001",
@@ -1130,7 +1149,9 @@ func TestUpdateVMIndex_ReferencedByPropagation(t *testing.T) {
 		{
 			name: "new full backup after broken chain does not propagate to old chain",
 			config: &UploaderConfig{
-				BSLBucket:        "test-bucket",
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
 				VMName:           "test-vm",
 				VMNamespace:      "test-ns",
 				CheckpointName:   "cp-004",
@@ -1322,7 +1343,9 @@ func TestUpdateVMIndex_DedupIncrementalPreservesParent(t *testing.T) {
 	}
 
 	config := &UploaderConfig{
-		BSLBucket:        "test-bucket",
+		ObjectStoreConfig: common.ObjectStoreConfig{
+			BSLBucket: "test-bucket",
+		},
 		VMName:           "test-vm",
 		VMNamespace:      "test-ns",
 		CheckpointName:   "cp-002",
@@ -1519,7 +1542,9 @@ func TestArchiveKubeResources(t *testing.T) {
 		{
 			name: "archives VMB and VMBT to checkpoint dir",
 			config: &UploaderConfig{
-				BSLBucket:      "test-bucket",
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
 				VMName:         "test-vm",
 				VMNamespace:    "test-ns",
 				CheckpointName: "cp-001",
@@ -1602,7 +1627,9 @@ func TestArchiveKubeResources(t *testing.T) {
 		{
 			name: "fails when VMB not found (fatal)",
 			config: &UploaderConfig{
-				BSLBucket:      "test-bucket",
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
 				VMName:         "test-vm",
 				VMNamespace:    "test-ns",
 				CheckpointName: "cp-001",
@@ -1629,7 +1656,9 @@ func TestArchiveKubeResources(t *testing.T) {
 		{
 			name: "reconstructs VMBT when not found in cluster",
 			config: &UploaderConfig{
-				BSLBucket:      "test-bucket",
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
 				VMName:         "test-vm",
 				VMNamespace:    "test-ns",
 				CheckpointName: "cp-001",
@@ -1679,7 +1708,9 @@ func TestArchiveKubeResources(t *testing.T) {
 		{
 			name: "handles empty VMBName and VMBTName",
 			config: &UploaderConfig{
-				BSLBucket:      "test-bucket",
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
 				VMName:         "test-vm",
 				VMNamespace:    "test-ns",
 				CheckpointName: "cp-001",

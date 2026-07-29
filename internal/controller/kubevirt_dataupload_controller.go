@@ -98,9 +98,9 @@ type KubeVirtDataUploadReconciler struct {
 	// before forcing a full backup. 0 means unlimited.
 	MaxIncrementalBackups int
 
-	// ObjectStoreFactory creates an ObjectStore from an UploaderConfig.
+	// ObjectStoreFactory creates an ObjectStore from an ObjectStoreConfig.
 	// Defaults to uploader.InitObjectStore if nil. Override in tests to inject mocks.
-	ObjectStoreFactory func(cfg *uploader.UploaderConfig) (velero.ObjectStore, error)
+	ObjectStoreFactory func(cfg *common.ObjectStoreConfig) (velero.ObjectStore, error)
 
 	// PodLogCollector reads logs from a completed datamover pod.
 	// If nil, pod log collection is skipped. Override in tests to inject mocks.

@@ -59,7 +59,7 @@ func Run(ctx context.Context, logger logr.Logger) error {
 		"type", config.BackupType)
 
 	// Initialize object store - returns velero.ObjectStore interface
-	store, err := InitObjectStore(config)
+	store, err := InitObjectStore(&config.ObjectStoreConfig)
 	if err != nil {
 		return fmt.Errorf("failed to initialize object store: %w", err)
 	}
@@ -116,27 +116,29 @@ func Run(ctx context.Context, logger logr.Logger) error {
 // LoadConfigFromEnv parses environment variables into UploaderConfig.
 func LoadConfigFromEnv() (*UploaderConfig, error) {
 	config := &UploaderConfig{
-		BSLProvider:              os.Getenv(EnvBSLProvider),
-		BSLBucket:                os.Getenv(EnvBSLBucket),
-		BSLPrefix:                os.Getenv(EnvBSLPrefix),
-		BSLRegion:                os.Getenv(EnvBSLRegion),
-		BSLS3URL:                 os.Getenv(EnvBSLS3URL),
-		BSLS3ForcePathStyle:      strings.EqualFold(os.Getenv(EnvBSLS3ForcePathStyle), "true"),
-		BSLInsecureSkipTLSVerify: strings.EqualFold(os.Getenv(EnvBSLInsecureSkipTLSVerify), "true"),
-		BSLCACert:                os.Getenv(EnvBSLCACert),
-		BSLServiceAccount:        os.Getenv(EnvBSLServiceAccount),
-		BSLKMSKeyName:            os.Getenv(EnvBSLKMSKeyName),
-		CredentialsFile:          os.Getenv(EnvCredentialsFile),
-		VMName:                   os.Getenv(EnvVMName),
-		VMNamespace:              os.Getenv(EnvVMNamespace),
-		CheckpointName:           os.Getenv(EnvCheckpointName),
-		BackupType:               os.Getenv(EnvBackupType),
-		VeleroBackupName:         os.Getenv(EnvVeleroBackupName),
-		DataUploadName:           os.Getenv(EnvDataUploadName),
-		DataUploadUID:            os.Getenv(EnvDataUploadUID),
-		VMBName:                  os.Getenv(EnvVMBName),
-		VMBTName:                 os.Getenv(EnvVMBTName),
-		SourcePVCPath:            os.Getenv(EnvSourcePVCPath),
+		ObjectStoreConfig: common.ObjectStoreConfig{
+			BSLProvider:              os.Getenv(common.EnvBSLProvider),
+			BSLBucket:                os.Getenv(common.EnvBSLBucket),
+			BSLPrefix:                os.Getenv(common.EnvBSLPrefix),
+			BSLRegion:                os.Getenv(common.EnvBSLRegion),
+			BSLS3URL:                 os.Getenv(common.EnvBSLS3URL),
+			BSLS3ForcePathStyle:      strings.EqualFold(os.Getenv(common.EnvBSLS3ForcePathStyle), "true"),
+			BSLInsecureSkipTLSVerify: strings.EqualFold(os.Getenv(common.EnvBSLInsecureSkipTLSVerify), "true"),
+			BSLCACert:                os.Getenv(common.EnvBSLCACert),
+			BSLServiceAccount:        os.Getenv(common.EnvBSLServiceAccount),
+			BSLKMSKeyName:            os.Getenv(common.EnvBSLKMSKeyName),
+			CredentialsFile:          os.Getenv(common.EnvCredentialsFile),
+		},
+		VMName:           os.Getenv(EnvVMName),
+		VMNamespace:      os.Getenv(EnvVMNamespace),
+		CheckpointName:   os.Getenv(EnvCheckpointName),
+		BackupType:       os.Getenv(EnvBackupType),
+		VeleroBackupName: os.Getenv(EnvVeleroBackupName),
+		DataUploadName:   os.Getenv(EnvDataUploadName),
+		DataUploadUID:    os.Getenv(EnvDataUploadUID),
+		VMBName:          os.Getenv(EnvVMBName),
+		VMBTName:         os.Getenv(EnvVMBTName),
+		SourcePVCPath:    os.Getenv(EnvSourcePVCPath),
 	}
 
 	// Apply defaults
@@ -144,7 +146,7 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 		config.SourcePVCPath = DefaultSourcePVCPath
 	}
 	if config.CredentialsFile == "" {
-		config.CredentialsFile = DefaultCredentialsPath
+		config.CredentialsFile = common.DefaultCredentialsPath
 	}
 	if config.BackupType == "" {
 		config.BackupType = "full"
@@ -155,7 +157,7 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 
 	// Validate required fields
 	if config.BSLBucket == "" {
-		return nil, fmt.Errorf("%s is required", EnvBSLBucket)
+		return nil, fmt.Errorf("%s is required", common.EnvBSLBucket)
 	}
 	if config.VMName == "" {
 		return nil, fmt.Errorf("%s is required", EnvVMName)

@@ -170,24 +170,24 @@ func TestBuildDatamoverPod(t *testing.T) {
 				}
 
 				expectedEnvs := map[string]string{
-					uploader.EnvBSLProvider:              "aws",
-					uploader.EnvBSLBucket:                "my-bucket",
-					uploader.EnvBSLPrefix:                "my-prefix",
-					uploader.EnvBSLRegion:                "eu-west-1",
-					uploader.EnvBSLS3URL:                 "https://minio.example.com",
-					uploader.EnvBSLS3ForcePathStyle:      "true",
-					uploader.EnvBSLInsecureSkipTLSVerify: "false",
-					uploader.EnvBSLCACert:                "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----",
-					uploader.EnvCredentialsFile:          uploader.DefaultCredentialsPath,
-					uploader.EnvVMName:                   "my-vm",
-					uploader.EnvVMNamespace:              "my-ns",
-					uploader.EnvCheckpointName:           "cp-001",
-					uploader.EnvBackupType:               "incremental",
-					uploader.EnvVeleroBackupName:         "velero-backup",
-					uploader.EnvSourcePVCPath:            uploader.DefaultSourcePVCPath,
-					uploader.EnvDataUploadName:           "du-001",
-					uploader.EnvDataUploadUID:            "uid-001",
-					uploader.EnvVMBName:                  "vmb-001",
+					common.EnvBSLProvider:              "aws",
+					common.EnvBSLBucket:                "my-bucket",
+					common.EnvBSLPrefix:                "my-prefix",
+					common.EnvBSLRegion:                "eu-west-1",
+					common.EnvBSLS3URL:                 "https://minio.example.com",
+					common.EnvBSLS3ForcePathStyle:      "true",
+					common.EnvBSLInsecureSkipTLSVerify: "false",
+					common.EnvBSLCACert:                "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----",
+					common.EnvCredentialsFile:          common.DefaultCredentialsPath,
+					uploader.EnvVMName:                 "my-vm",
+					uploader.EnvVMNamespace:            "my-ns",
+					uploader.EnvCheckpointName:         "cp-001",
+					uploader.EnvBackupType:             "incremental",
+					uploader.EnvVeleroBackupName:       "velero-backup",
+					uploader.EnvSourcePVCPath:          uploader.DefaultSourcePVCPath,
+					uploader.EnvDataUploadName:         "du-001",
+					uploader.EnvDataUploadUID:          "uid-001",
+					uploader.EnvVMBName:                "vmb-001",
 				}
 
 				for key, expected := range expectedEnvs {
@@ -371,8 +371,8 @@ func TestDatamoverPodConfigDefaults(t *testing.T) {
 	}
 
 	// Check default paths are used
-	if envMap[uploader.EnvCredentialsFile] != uploader.DefaultCredentialsPath {
-		t.Errorf("credentials file = %q, want default %q", envMap[uploader.EnvCredentialsFile], uploader.DefaultCredentialsPath)
+	if envMap[common.EnvCredentialsFile] != common.DefaultCredentialsPath {
+		t.Errorf("credentials file = %q, want default %q", envMap[common.EnvCredentialsFile], common.DefaultCredentialsPath)
 	}
 	if envMap[uploader.EnvSourcePVCPath] != uploader.DefaultSourcePVCPath {
 		t.Errorf("source pvc path = %q, want default %q", envMap[uploader.EnvSourcePVCPath], uploader.DefaultSourcePVCPath)
@@ -435,18 +435,18 @@ func TestS3CompatibleBooleanRoundtrip(t *testing.T) {
 			}
 
 			// Verify env var values match input
-			if envMap[uploader.EnvBSLS3ForcePathStyle] != tt.s3ForcePathStyle {
+			if envMap[common.EnvBSLS3ForcePathStyle] != tt.s3ForcePathStyle {
 				t.Errorf("env %s = %q, want %q",
-					uploader.EnvBSLS3ForcePathStyle, envMap[uploader.EnvBSLS3ForcePathStyle], tt.s3ForcePathStyle)
+					common.EnvBSLS3ForcePathStyle, envMap[common.EnvBSLS3ForcePathStyle], tt.s3ForcePathStyle)
 			}
-			if envMap[uploader.EnvBSLInsecureSkipTLSVerify] != tt.insecureSkipTLSVerify {
+			if envMap[common.EnvBSLInsecureSkipTLSVerify] != tt.insecureSkipTLSVerify {
 				t.Errorf("env %s = %q, want %q",
-					uploader.EnvBSLInsecureSkipTLSVerify, envMap[uploader.EnvBSLInsecureSkipTLSVerify], tt.insecureSkipTLSVerify)
+					common.EnvBSLInsecureSkipTLSVerify, envMap[common.EnvBSLInsecureSkipTLSVerify], tt.insecureSkipTLSVerify)
 			}
 
 			// Simulate uploader-side parsing (same logic as LoadConfigFromEnv)
-			gotForcePathStyle := strings.EqualFold(envMap[uploader.EnvBSLS3ForcePathStyle], "true")
-			gotInsecureSkip := strings.EqualFold(envMap[uploader.EnvBSLInsecureSkipTLSVerify], "true")
+			gotForcePathStyle := strings.EqualFold(envMap[common.EnvBSLS3ForcePathStyle], "true")
+			gotInsecureSkip := strings.EqualFold(envMap[common.EnvBSLInsecureSkipTLSVerify], "true")
 
 			if gotForcePathStyle != tt.wantForcePathStyle {
 				t.Errorf("parsed s3ForcePathStyle = %v, want %v", gotForcePathStyle, tt.wantForcePathStyle)

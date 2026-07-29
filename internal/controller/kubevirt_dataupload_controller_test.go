@@ -3717,7 +3717,7 @@ func TestHandleAccepted_HappyPath_IncrementalBackup(t *testing.T) {
 		Scheme:        scheme,
 		Log:           logr.Discard(),
 		OADPNamespace: vmNamespace,
-		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
 			return mockStore, nil
 		},
 	}
@@ -3869,7 +3869,7 @@ func TestHandleAccepted_StaleCheckpointForcesFullBackup(t *testing.T) {
 		Scheme:        scheme,
 		Log:           logr.Discard(),
 		OADPNamespace: vmNamespace,
-		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
 			return mockStore, nil
 		},
 	}
@@ -4021,7 +4021,7 @@ func TestHandleAccepted_SkipsBSLValidationWhenAnnotated(t *testing.T) {
 		Scheme:        scheme,
 		Log:           logr.Discard(),
 		OADPNamespace: vmNamespace,
-		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
 			factoryCalled = true
 			return nil, nil
 		},
@@ -4062,10 +4062,27 @@ func TestLookupCheckpointFromBSL_WithValidCredentials(t *testing.T) {
 	// Mock store with no index (first backup)
 	mockStore := uploader.NewMockObjectStore("my-bucket", "velero-kubevirt-datamover")
 
+	factoryCalled := false
 	r := &KubeVirtDataUploadReconciler{
 		Client:        fakeClient,
 		OADPNamespace: "openshift-adp",
-		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+		ObjectStoreFactory: func(cfg *common.ObjectStoreConfig) (velero.ObjectStore, error) {
+			factoryCalled = true
+			if !bytes.Equal(cfg.CredentialsData, credSecret.Data["cloud"]) {
+				t.Error("ObjectStoreFactory did not receive the BSL credential data")
+			}
+			if cfg.BSLProvider != "aws" {
+				t.Errorf("ObjectStoreFactory cfg.BSLProvider = %q, want %q", cfg.BSLProvider, "aws")
+			}
+			if cfg.BSLBucket != "my-bucket" {
+				t.Errorf("ObjectStoreFactory cfg.BSLBucket = %q, want %q", cfg.BSLBucket, "my-bucket")
+			}
+			if cfg.BSLPrefix != "velero-kubevirt-datamover" {
+				t.Errorf("ObjectStoreFactory cfg.BSLPrefix = %q, want %q", cfg.BSLPrefix, "velero-kubevirt-datamover")
+			}
+			if cfg.BSLRegion != "us-east-1" {
+				t.Errorf("ObjectStoreFactory cfg.BSLRegion = %q, want %q", cfg.BSLRegion, "us-east-1")
+			}
 			return mockStore, nil
 		},
 	}
@@ -4095,6 +4112,9 @@ func TestLookupCheckpointFromBSL_WithValidCredentials(t *testing.T) {
 	}
 
 	result, err := r.lookupCheckpointFromBSL(context.Background(), bsl, "test-ns", "test-vm")
+	if !factoryCalled {
+		t.Fatal("expected ObjectStoreFactory to be invoked during lookupCheckpointFromBSL")
+	}
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -4170,7 +4190,7 @@ func TestLookupCheckpointFromBSL_WithExistingCheckpoint(t *testing.T) {
 	r := &KubeVirtDataUploadReconciler{
 		Client:        fakeClient,
 		OADPNamespace: "openshift-adp",
-		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
 			return mockStore, nil
 		},
 	}
@@ -4954,7 +4974,7 @@ func TestHandleAccepted_ForceFullBackupAnnotation(t *testing.T) {
 		Scheme:        scheme,
 		Log:           logr.Discard(),
 		OADPNamespace: vmNamespace,
-		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
 			objectStoreFactoryCalled = true
 			return nil, fmt.Errorf("should not be called")
 		},
@@ -5301,7 +5321,7 @@ func TestHandleAccepted_StaleCheckpointSetsForceFullOnVMB(t *testing.T) {
 		Scheme:        scheme,
 		Log:           logr.Discard(),
 		OADPNamespace: vmNamespace,
-		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
 			return mockStore, nil
 		},
 	}
@@ -5471,7 +5491,7 @@ func TestValidateBSLCheckpoint_ForceFullOnChainFallback(t *testing.T) {
 		Scheme:        scheme,
 		Log:           logr.Discard(),
 		OADPNamespace: vmNamespace,
-		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
 			return mockStore, nil
 		},
 	}
@@ -5618,7 +5638,7 @@ func TestValidateBSLCheckpoint_ForcesFullBackupWhenCheckpointLookupErrors(t *tes
 		Scheme:        scheme,
 		Log:           logr.Discard(),
 		OADPNamespace: vmNamespace,
-		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
 			return nil, fmt.Errorf("simulated object store initialization error")
 		},
 	}
@@ -5807,7 +5827,7 @@ func TestPrepareVMBackupTracker_FromS3(t *testing.T) {
 		Scheme:        scheme,
 		Log:           logr.Discard(),
 		OADPNamespace: vmNamespace,
-		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
 			return mockStore, nil
 		},
 	}
@@ -6244,7 +6264,7 @@ func TestLookupLatestVMBTFromBSL(t *testing.T) {
 				Scheme:        scheme,
 				Log:           logr.Discard(),
 				OADPNamespace: vmNamespace,
-				ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+				ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
 					return mockStore, nil
 				},
 			}
@@ -6971,7 +6991,7 @@ func TestResolveBackupMode_MaxIncrementalBackups(t *testing.T) {
 				Log:                   logr.Discard(),
 				OADPNamespace:         vmNamespace,
 				MaxIncrementalBackups: tt.maxIncrementalBackups,
-				ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+				ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
 					return mockStore, nil
 				},
 			}
@@ -7101,7 +7121,7 @@ func TestResolveBackupMode_MaxIncrementalSkippedOnBrokenChain(t *testing.T) {
 		Log:                   logr.Discard(),
 		OADPNamespace:         vmNamespace,
 		MaxIncrementalBackups: 5,
-		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
 			return mockStore, nil
 		},
 	}
@@ -7205,7 +7225,7 @@ func TestResolveBackupMode_MaxIncrementalFirstBackup(t *testing.T) {
 		Log:                   logr.Discard(),
 		OADPNamespace:         vmNamespace,
 		MaxIncrementalBackups: 1,
-		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
 			return mockStore, nil
 		},
 	}

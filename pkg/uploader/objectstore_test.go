@@ -29,6 +29,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 )
 
 // fullKeyTestCases is shared across S3, GCP, and Azure fullKey tests
@@ -290,13 +292,15 @@ func TestInitObjectStoreWithCredentialsData(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := &UploaderConfig{
-				BSLProvider:     "aws",
-				BSLBucket:       "test-bucket",
-				BSLRegion:       "us-east-1",
-				CredentialsData: []byte(tt.credData),
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLProvider:     "aws",
+					BSLBucket:       "test-bucket",
+					BSLRegion:       "us-east-1",
+					CredentialsData: []byte(tt.credData),
+				},
 			}
 
-			store, err := InitObjectStore(cfg)
+			store, err := InitObjectStore(&cfg.ObjectStoreConfig)
 
 			if tt.expectError {
 				if err == nil {
@@ -316,11 +320,13 @@ func TestInitObjectStoreWithCredentialsData(t *testing.T) {
 
 func TestInitObjectStoreAzureNotImplemented(t *testing.T) {
 	config := &UploaderConfig{
-		BSLProvider: "azure",
-		BSLBucket:   "test-bucket",
+		ObjectStoreConfig: common.ObjectStoreConfig{
+			BSLProvider: "azure",
+			BSLBucket:   "test-bucket",
+		},
 	}
 
-	_, err := InitObjectStore(config)
+	_, err := InitObjectStore(&config.ObjectStoreConfig)
 	if err == nil {
 		t.Error("expected error for azure provider, got none")
 	}
@@ -496,16 +502,18 @@ func TestInitObjectStoreWithS3Settings(t *testing.T) {
 	caCert := generateTestCACertPEM(t)
 
 	cfg := &UploaderConfig{
-		BSLProvider:              "aws",
-		BSLBucket:                "test-bucket",
-		BSLRegion:                "us-east-1",
-		BSLS3URL:                 "https://minio.example.com:9000",
-		BSLS3ForcePathStyle:      true,
-		BSLInsecureSkipTLSVerify: false,
-		BSLCACert:                caCert,
+		ObjectStoreConfig: common.ObjectStoreConfig{
+			BSLProvider:              "aws",
+			BSLBucket:                "test-bucket",
+			BSLRegion:                "us-east-1",
+			BSLS3URL:                 "https://minio.example.com:9000",
+			BSLS3ForcePathStyle:      true,
+			BSLInsecureSkipTLSVerify: false,
+			BSLCACert:                caCert,
+		},
 	}
 
-	store, err := InitObjectStore(cfg)
+	store, err := InitObjectStore(&cfg.ObjectStoreConfig)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -517,14 +525,16 @@ func TestInitObjectStoreWithS3Settings(t *testing.T) {
 func TestInitObjectStoreWithS3SettingsDefaultProvider(t *testing.T) {
 	// Unknown providers should fall through to S3-compatible
 	cfg := &UploaderConfig{
-		BSLProvider:         "minio",
-		BSLBucket:           "test-bucket",
-		BSLRegion:           "us-east-1",
-		BSLS3URL:            "https://minio.example.com",
-		BSLS3ForcePathStyle: true,
+		ObjectStoreConfig: common.ObjectStoreConfig{
+			BSLProvider:         "minio",
+			BSLBucket:           "test-bucket",
+			BSLRegion:           "us-east-1",
+			BSLS3URL:            "https://minio.example.com",
+			BSLS3ForcePathStyle: true,
+		},
 	}
 
-	store, err := InitObjectStore(cfg)
+	store, err := InitObjectStore(&cfg.ObjectStoreConfig)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
