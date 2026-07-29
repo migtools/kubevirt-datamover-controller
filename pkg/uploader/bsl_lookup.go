@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
@@ -171,8 +172,8 @@ func validateCheckpointChain(
 		// If we find a broken link, try the checkpoint before it
 		brokenAt := -1
 		var brokenReason string
-		for i := len(chain) - 1; i >= 0; i-- {
-			cp := chain[i]
+		for i, v := range slices.Backward(chain) {
+			cp := v
 			if err := validateCheckpointFiles(ctx, store, bucket, cp.Files); err != nil {
 				brokenAt = i
 				brokenReason = err.Error()
