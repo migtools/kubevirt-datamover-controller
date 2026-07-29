@@ -353,15 +353,17 @@ func InitObjectStore(cfg *UploaderConfig) (velero.ObjectStore, error) {
 		configMap["credentialsFile"] = cfg.CredentialsFile
 	}
 
+	const trueStr = "true"
+
 	// S3-compatible storage settings
 	if cfg.BSLS3URL != "" {
 		configMap["s3Url"] = cfg.BSLS3URL
 	}
 	if cfg.BSLS3ForcePathStyle {
-		configMap["s3ForcePathStyle"] = "true"
+		configMap["s3ForcePathStyle"] = trueStr
 	}
 	if cfg.BSLInsecureSkipTLSVerify {
-		configMap["insecureSkipTLSVerify"] = "true"
+		configMap["insecureSkipTLSVerify"] = trueStr
 	}
 	if cfg.BSLCACert != "" {
 		configMap["caCert"] = cfg.BSLCACert
@@ -372,6 +374,27 @@ func InitObjectStore(cfg *UploaderConfig) (velero.ObjectStore, error) {
 	if cfg.BSLKMSKeyName != "" {
 		configMap["kmsKeyName"] = cfg.BSLKMSKeyName
 	}
+	if cfg.BSLResourceGroup != "" {
+		configMap["resourceGroup"] = cfg.BSLResourceGroup
+	}
+	if cfg.BSLStorageAccount != "" {
+		configMap["storageAccount"] = cfg.BSLStorageAccount
+	}
+	if cfg.BSLStorageAccountKeyEnvVar != "" {
+		configMap["storageAccountKeyEnvVar"] = cfg.BSLStorageAccountKeyEnvVar
+	}
+	if cfg.BSLStorageAccountURI != "" {
+		configMap["storageAccountURI"] = cfg.BSLStorageAccountURI
+	}
+	if cfg.BSLSubscriptionID != "" {
+		configMap["subscriptionId"] = cfg.BSLSubscriptionID
+	}
+	if cfg.BSLUseAAD {
+		configMap["useAAD"] = trueStr
+	}
+	if cfg.BSLActiveDirectoryAuthorityURI != "" {
+		configMap["activeDirectoryAuthorityURI"] = cfg.BSLActiveDirectoryAuthorityURI
+	}
 
 	switch strings.ToLower(cfg.BSLProvider) {
 	case "aws":
@@ -379,8 +402,7 @@ func InitObjectStore(cfg *UploaderConfig) (velero.ObjectStore, error) {
 	case "gcp":
 		return NewGCPObjectStore(configMap)
 	case "azure":
-		// TODO: Implement Azure Blob Storage support (issue #11)
-		return nil, fmt.Errorf("azure object store not yet implemented")
+		return NewAzureObjectStore(configMap)
 	default:
 		// Try S3-compatible for unknown providers
 		return NewS3ObjectStore(configMap)
@@ -409,6 +431,15 @@ type BSLConfig struct {
 	// GCP-specific storage provider settings
 	ServiceAccount string
 	KMSKeyName     string
+
+	// Azure-specific storage provider settings
+	ResourceGroup               string
+	StorageAccount              string
+	StorageAccountKeyEnvVar     string
+	StorageAccountURI           string
+	SubscriptionID              string
+	UseAAD                      bool
+	ActiveDirectoryAuthorityURI string
 }
 
 // ExtractBSLConfig extracts and validates common BSL configuration fields.
@@ -438,6 +469,13 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 	caCert := ""
 	serviceAccount := ""
 	kmsKeyName := ""
+	resourceGroup := ""
+	storageAccount := ""
+	storageAccountKeyEnvVar := ""
+	storageAccountURI := ""
+	subscriptionID := ""
+	useAAD := false
+	activeDirectoryAuthorityURI := ""
 	if bsl.Spec.Config != nil {
 		region = bsl.Spec.Config["region"]
 		s3URL = bsl.Spec.Config["s3Url"]
@@ -446,6 +484,13 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 		caCert = bsl.Spec.Config["caCert"]
 		serviceAccount = bsl.Spec.Config["serviceAccount"]
 		kmsKeyName = bsl.Spec.Config["kmsKeyName"]
+		resourceGroup = bsl.Spec.Config["resourceGroup"]
+		storageAccount = bsl.Spec.Config["storageAccount"]
+		storageAccountKeyEnvVar = bsl.Spec.Config["storageAccountKeyEnvVar"]
+		storageAccountURI = bsl.Spec.Config["storageAccountURI"]
+		subscriptionID = bsl.Spec.Config["subscriptionId"]
+		useAAD = strings.EqualFold(bsl.Spec.Config["useAAD"], "true")
+		activeDirectoryAuthorityURI = bsl.Spec.Config["activeDirectoryAuthorityURI"]
 	}
 
 	credName := ""
@@ -458,18 +503,25 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 	}
 
 	return &BSLConfig{
-		Provider:              bsl.Spec.Provider,
-		Bucket:                bucket,
-		Prefix:                prefix,
-		Region:                region,
-		CredentialName:        credName,
-		CredentialKey:         credKey,
-		S3URL:                 s3URL,
-		S3ForcePathStyle:      s3ForcePathStyle,
-		InsecureSkipTLSVerify: insecureSkipTLSVerify,
-		CACert:                caCert,
-		ServiceAccount:        serviceAccount,
-		KMSKeyName:            kmsKeyName,
+		Provider:                    bsl.Spec.Provider,
+		Bucket:                      bucket,
+		Prefix:                      prefix,
+		Region:                      region,
+		CredentialName:              credName,
+		CredentialKey:               credKey,
+		S3URL:                       s3URL,
+		S3ForcePathStyle:            s3ForcePathStyle,
+		InsecureSkipTLSVerify:       insecureSkipTLSVerify,
+		CACert:                      caCert,
+		ServiceAccount:              serviceAccount,
+		KMSKeyName:                  kmsKeyName,
+		ResourceGroup:               resourceGroup,
+		StorageAccount:              storageAccount,
+		StorageAccountKeyEnvVar:     storageAccountKeyEnvVar,
+		StorageAccountURI:           storageAccountURI,
+		SubscriptionID:              subscriptionID,
+		UseAAD:                      useAAD,
+		ActiveDirectoryAuthorityURI: activeDirectoryAuthorityURI,
 	}, nil
 }
 
@@ -501,17 +553,24 @@ func InitObjectStoreFromBSL(
 	}
 
 	store, err := factory(&UploaderConfig{
-		BSLProvider:              cfg.Provider,
-		BSLBucket:                cfg.Bucket,
-		BSLPrefix:                cfg.Prefix,
-		BSLRegion:                cfg.Region,
-		BSLS3URL:                 cfg.S3URL,
-		BSLS3ForcePathStyle:      cfg.S3ForcePathStyle,
-		BSLInsecureSkipTLSVerify: cfg.InsecureSkipTLSVerify,
-		BSLCACert:                cfg.CACert,
-		BSLServiceAccount:        cfg.ServiceAccount,
-		BSLKMSKeyName:            cfg.KMSKeyName,
-		CredentialsData:          credData,
+		BSLProvider:                    cfg.Provider,
+		BSLBucket:                      cfg.Bucket,
+		BSLPrefix:                      cfg.Prefix,
+		BSLRegion:                      cfg.Region,
+		BSLS3URL:                       cfg.S3URL,
+		BSLS3ForcePathStyle:            cfg.S3ForcePathStyle,
+		BSLInsecureSkipTLSVerify:       cfg.InsecureSkipTLSVerify,
+		BSLCACert:                      cfg.CACert,
+		BSLServiceAccount:              cfg.ServiceAccount,
+		BSLKMSKeyName:                  cfg.KMSKeyName,
+		BSLResourceGroup:               cfg.ResourceGroup,
+		BSLStorageAccount:              cfg.StorageAccount,
+		BSLStorageAccountKeyEnvVar:     cfg.StorageAccountKeyEnvVar,
+		BSLStorageAccountURI:           cfg.StorageAccountURI,
+		BSLSubscriptionID:              cfg.SubscriptionID,
+		BSLUseAAD:                      cfg.UseAAD,
+		BSLActiveDirectoryAuthorityURI: cfg.ActiveDirectoryAuthorityURI,
+		CredentialsData:                credData,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to initialize object store: %w", err)

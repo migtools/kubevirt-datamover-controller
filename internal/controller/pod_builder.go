@@ -65,6 +65,15 @@ type DatamoverPodConfig struct {
 	BSLServiceAccount string
 	BSLKMSKeyName     string
 
+	// Azure-specific storage provider settings
+	BSLResourceGroup               string
+	BSLStorageAccount              string
+	BSLStorageAccountKeyEnvVar     string
+	BSLStorageAccountURI           string
+	BSLSubscriptionID              string
+	BSLUseAAD                      string
+	BSLActiveDirectoryAuthorityURI string
+
 	// Credentials
 	CredentialSecretName string
 	CredentialSecretKey  string
@@ -134,6 +143,13 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 		{Name: uploader.EnvBSLCACert, Value: config.BSLCACert},
 		{Name: uploader.EnvBSLServiceAccount, Value: config.BSLServiceAccount},
 		{Name: uploader.EnvBSLKMSKeyName, Value: config.BSLKMSKeyName},
+		{Name: uploader.EnvBSLResourceGroup, Value: config.BSLResourceGroup},
+		{Name: uploader.EnvBSLStorageAccount, Value: config.BSLStorageAccount},
+		{Name: uploader.EnvBSLStorageAccountKeyEnvVar, Value: config.BSLStorageAccountKeyEnvVar},
+		{Name: uploader.EnvBSLStorageAccountURI, Value: config.BSLStorageAccountURI},
+		{Name: uploader.EnvBSLSubscriptionID, Value: config.BSLSubscriptionID},
+		{Name: uploader.EnvBSLUseAAD, Value: config.BSLUseAAD},
+		{Name: uploader.EnvBSLActiveDirectoryAuthorityURI, Value: config.BSLActiveDirectoryAuthorityURI},
 		{Name: uploader.EnvCredentialsFile, Value: uploader.DefaultCredentialsPath},
 		{Name: uploader.EnvVMName, Value: config.VMName},
 		{Name: uploader.EnvVMNamespace, Value: config.VMNamespace},

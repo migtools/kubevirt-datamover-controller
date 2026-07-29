@@ -104,6 +104,15 @@ const (
 	// GCP-specific storage provider settings
 	EnvBSLServiceAccount = "KUBEVIRT_DM_BSL_SERVICE_ACCOUNT"
 	EnvBSLKMSKeyName     = "KUBEVIRT_DM_BSL_KMS_KEY_NAME"
+
+	// Azure-specific storage provider settings
+	EnvBSLResourceGroup               = "KUBEVIRT_DM_BSL_RESOURCE_GROUP"
+	EnvBSLStorageAccount              = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT"
+	EnvBSLStorageAccountKeyEnvVar     = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT_KEY_ENV_VAR"
+	EnvBSLStorageAccountURI           = "KUBEVIRT_DM_BSL_STORAGE_ACCOUNT_URI"
+	EnvBSLSubscriptionID              = "KUBEVIRT_DM_BSL_SUBSCRIPTION_ID"
+	EnvBSLUseAAD                      = "KUBEVIRT_DM_BSL_USE_AAD"
+	EnvBSLActiveDirectoryAuthorityURI = "KUBEVIRT_DM_BSL_ACTIVE_DIRECTORY_AUTHORITY_URI"
 )
 
 // Default paths and values
@@ -135,6 +144,15 @@ type UploaderConfig struct {
 	// GCP-specific storage provider settings
 	BSLServiceAccount string // GCP service account email for compute engine signing
 	BSLKMSKeyName     string // Cloud KMS key for server-side encryption
+
+	// Azure-specific storage provider settings
+	BSLResourceGroup               string
+	BSLStorageAccount              string
+	BSLStorageAccountKeyEnvVar     string
+	BSLStorageAccountURI           string
+	BSLSubscriptionID              string
+	BSLUseAAD                      bool
+	BSLActiveDirectoryAuthorityURI string
 
 	// CredentialsData holds raw credential content (INI-style).
 	// Used by the controller to pass credentials from K8s Secrets directly
