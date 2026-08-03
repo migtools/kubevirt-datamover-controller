@@ -211,18 +211,20 @@ func TestBuildDatamoverPod(t *testing.T) {
 				container := pod.Spec.Containers[0]
 
 				// Verify volume mounts
-				if len(container.VolumeMounts) != 2 {
-					t.Fatalf("expected 2 volume mounts, got %d", len(container.VolumeMounts))
+				if len(container.VolumeMounts) != 3 {
+					t.Fatalf("expected 3 volume mounts, got %d", len(container.VolumeMounts))
 				}
 
 				// Check backup-data mount
-				var backupMount, credsMount *corev1.VolumeMount
+				var backupMount, credsMount, saTokenMount *corev1.VolumeMount
 				for i := range container.VolumeMounts {
 					switch container.VolumeMounts[i].Name {
 					case "backup-data":
 						backupMount = &container.VolumeMounts[i]
 					case "cloud-credentials":
 						credsMount = &container.VolumeMounts[i]
+					case "bound-sa-token":
+						saTokenMount = &container.VolumeMounts[i]
 					}
 				}
 
@@ -246,18 +248,30 @@ func TestBuildDatamoverPod(t *testing.T) {
 					t.Error("cloud-credentials mount should be read-only")
 				}
 
-				// Verify volumes
-				if len(pod.Spec.Volumes) != 2 {
-					t.Fatalf("expected 2 volumes, got %d", len(pod.Spec.Volumes))
+				if saTokenMount == nil {
+					t.Fatal("bound-sa-token volume mount not found")
+				}
+				if saTokenMount.MountPath != "/var/run/secrets/openshift/serviceaccount" {
+					t.Errorf("bound-sa-token mount path = %q, want %q", saTokenMount.MountPath, "/var/run/secrets/openshift/serviceaccount")
+				}
+				if !saTokenMount.ReadOnly {
+					t.Error("bound-sa-token mount should be read-only")
 				}
 
-				var pvcVolume, secretVolume *corev1.Volume
+				// Verify volumes
+				if len(pod.Spec.Volumes) != 3 {
+					t.Fatalf("expected 3 volumes, got %d", len(pod.Spec.Volumes))
+				}
+
+				var pvcVolume, secretVolume, saTokenVolume *corev1.Volume
 				for i := range pod.Spec.Volumes {
 					switch pod.Spec.Volumes[i].Name {
 					case "backup-data":
 						pvcVolume = &pod.Spec.Volumes[i]
 					case "cloud-credentials":
 						secretVolume = &pod.Spec.Volumes[i]
+					case "bound-sa-token":
+						saTokenVolume = &pod.Spec.Volumes[i]
 					}
 				}
 
@@ -273,6 +287,24 @@ func TestBuildDatamoverPod(t *testing.T) {
 				}
 				if secretVolume.Secret.SecretName != "cloud-creds" {
 					t.Errorf("secret name = %q, want %q", secretVolume.Secret.SecretName, "cloud-creds")
+				}
+
+				if saTokenVolume == nil || saTokenVolume.Projected == nil {
+					t.Fatal("bound-sa-token projected volume not found")
+				}
+				sources := saTokenVolume.Projected.Sources
+				if len(sources) != 1 || sources[0].ServiceAccountToken == nil {
+					t.Fatal("bound-sa-token volume should have exactly one ServiceAccountToken projection")
+				}
+				saToken := sources[0].ServiceAccountToken
+				if saToken.Audience != "openshift" {
+					t.Errorf("bound-sa-token audience = %q, want %q", saToken.Audience, "openshift")
+				}
+				if saToken.Path != "token" {
+					t.Errorf("bound-sa-token path = %q, want %q", saToken.Path, "token")
+				}
+				if saToken.ExpirationSeconds == nil || *saToken.ExpirationSeconds != 3600 {
+					t.Errorf("bound-sa-token expirationSeconds = %v, want 3600", saToken.ExpirationSeconds)
 				}
 			},
 		},

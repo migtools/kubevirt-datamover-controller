@@ -171,6 +171,7 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 	//   for privileged access on OpenShift
 	runAsUser := int64(0)
 	readOnlyRootFilesystem := true
+	saTokenExpSeconds := int64(3600)
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -208,6 +209,11 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 							MountPath: "/credentials",
 							ReadOnly:  true,
 						},
+						{
+							Name:      "bound-sa-token",
+							MountPath: "/var/run/secrets/openshift/serviceaccount",
+							ReadOnly:  true,
+						},
 					},
 					SecurityContext: &corev1.SecurityContext{
 						ReadOnlyRootFilesystem: &readOnlyRootFilesystem,
@@ -236,6 +242,22 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 								{
 									Key:  config.CredentialSecretKey,
 									Path: "cloud", // Fixed filename, matches common.DefaultCredentialsPath
+								},
+							},
+						},
+					},
+				},
+				{
+					Name: "bound-sa-token",
+					VolumeSource: corev1.VolumeSource{
+						Projected: &corev1.ProjectedVolumeSource{
+							Sources: []corev1.VolumeProjection{
+								{
+									ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+										Audience:          "openshift",
+										ExpirationSeconds: &saTokenExpSeconds,
+										Path:              "token",
+									},
 								},
 							},
 						},
