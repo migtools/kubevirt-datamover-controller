@@ -27,6 +27,7 @@ import (
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
 )
 
+//nolint:dupl // intentionally mirrors TestGetVMReferenceFromDataDownload for the parallel DataUpload accessor
 func TestGetVMReference(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -101,6 +102,26 @@ func TestGetVMReference(t *testing.T) {
 			expectError: false,
 		},
 		{
+			// Documents current behavior: neither the namespace annotation nor
+			// Spec.SourceNamespace is required to be non-empty. See the matching
+			// case in TestGetVMReferenceFromDataDownload for why.
+			name: "vm-name set, both namespace annotation and source namespace empty",
+			dataUpload: &velerov2alpha1api.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "velero",
+					Annotations: map[string]string{
+						AnnotationVMName: "my-vm",
+					},
+				},
+			},
+			expectedRef: &VMReference{
+				Name:      "my-vm",
+				Namespace: "",
+			},
+			expectError: false,
+		},
+		{
 			name: "both vm-name and vm-namespace set",
 			dataUpload: &velerov2alpha1api.DataUpload{
 				ObjectMeta: metav1.ObjectMeta{
@@ -126,6 +147,140 @@ func TestGetVMReference(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ref, err := GetVMReference(tt.dataUpload)
+
+			if tt.expectError {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errorContains)
+				assert.Nil(t, ref)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, ref)
+				assert.Equal(t, tt.expectedRef.Name, ref.Name)
+				assert.Equal(t, tt.expectedRef.Namespace, ref.Namespace)
+			}
+		})
+	}
+}
+
+//nolint:dupl // intentionally mirrors TestGetVMReference for the parallel DataDownload accessor
+func TestGetVMReferenceFromDataDownload(t *testing.T) {
+	tests := []struct {
+		name          string
+		dataDownload  *velerov2alpha1api.DataDownload
+		expectedRef   *VMReference
+		expectError   bool
+		errorContains string
+	}{
+		{
+			name:          "nil DataDownload",
+			dataDownload:  nil,
+			expectError:   true,
+			errorContains: "DataDownload is nil",
+		},
+		{
+			name: "no annotations",
+			dataDownload: &velerov2alpha1api.DataDownload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-dd",
+					Namespace: "velero",
+				},
+			},
+			expectError:   true,
+			errorContains: "has no annotations",
+		},
+		{
+			name: "missing vm-name annotation",
+			dataDownload: &velerov2alpha1api.DataDownload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-dd",
+					Namespace: "velero",
+					Annotations: map[string]string{
+						"some-other-annotation": "value",
+					},
+				},
+			},
+			expectError:   true,
+			errorContains: "missing required annotation",
+		},
+		{
+			name: "empty vm-name annotation",
+			dataDownload: &velerov2alpha1api.DataDownload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-dd",
+					Namespace: "velero",
+					Annotations: map[string]string{
+						AnnotationVMName: "",
+					},
+				},
+			},
+			expectError:   true,
+			errorContains: "missing required annotation",
+		},
+		{
+			name: "vm-name set, namespace defaults to source",
+			dataDownload: &velerov2alpha1api.DataDownload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-dd",
+					Namespace: "velero",
+					Annotations: map[string]string{
+						AnnotationVMName: "my-vm",
+					},
+				},
+				Spec: velerov2alpha1api.DataDownloadSpec{
+					SourceNamespace: "vm-namespace",
+				},
+			},
+			expectedRef: &VMReference{
+				Name:      "my-vm",
+				Namespace: "vm-namespace",
+			},
+			expectError: false,
+		},
+		{
+			// Unlike GetVMReference (DataUpload), GetVMReferenceFromDataDownload
+			// rejects an empty resolved namespace: a restore's S3 manifest lookup
+			// is keyed by the VM's original namespace, so failing clearly here is
+			// better than a confusing "no backup manifest found for VM <name>/"
+			// later.
+			name: "vm-name set, both namespace annotation and source namespace empty",
+			dataDownload: &velerov2alpha1api.DataDownload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-dd",
+					Namespace: "velero",
+					Annotations: map[string]string{
+						AnnotationVMName: "my-vm",
+					},
+				},
+			},
+			expectError:   true,
+			errorContains: "could not resolve a VM namespace",
+		},
+		{
+			name: "both vm-name and vm-namespace set",
+			dataDownload: &velerov2alpha1api.DataDownload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-dd",
+					Namespace: "velero",
+					Annotations: map[string]string{
+						AnnotationVMName:      "my-vm",
+						AnnotationVMNamespace: "explicit-namespace",
+					},
+				},
+				Spec: velerov2alpha1api.DataDownloadSpec{
+					SourceNamespace: "source-namespace",
+				},
+			},
+			expectedRef: &VMReference{
+				Name:      "my-vm",
+				Namespace: "explicit-namespace",
+			},
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ref, err := GetVMReferenceFromDataDownload(tt.dataDownload)
 
 			if tt.expectError {
 				require.Error(t, err)

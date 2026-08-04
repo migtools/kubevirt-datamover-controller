@@ -281,6 +281,19 @@ var _ = Describe("Manager", Ordered, func() {
 		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
 		//    strings.ToLower(<Kind>),
 		// ))
+
+		// TODO(issue #73): no DataUpload or DataDownload CR scenario exists yet --
+		// this suite only checks that the manager pod comes up and serves metrics,
+		// so it exercises none of the phase0-3 reconciliation logic (identity
+		// contract, upload controller, downloader runtime, download controller).
+		// A cheap wiring smoke test (real kind/CI cluster, not a fake client) would
+		// catch RBAC/CRD-registration gaps that unit tests can't see, e.g.:
+		//   - create a minimal DataUpload/DataDownload CR (datamover: kubevirt)
+		//     missing the VM annotation, or pointing at a nonexistent BSL
+		//   - assert status.phase reaches Failed with the expected message within
+		//     an Eventually
+		// Explicitly not a full backup/restore round-trip (that needs a real
+		// VM/KubeVirt/S3 backend and is out of scope here -- see phase 5 of #73).
 	})
 })
 

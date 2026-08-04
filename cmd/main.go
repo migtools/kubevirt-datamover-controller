@@ -22,6 +22,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -46,6 +48,7 @@ import (
 
 	"github.com/migtools/kubevirt-datamover-controller/internal/controller"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/downloader"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
 	// +kubebuilder:scaffold:imports
 )
@@ -69,9 +72,23 @@ func init() {
 func main() {
 	// Check for subcommand dispatch before parsing flags
 	if len(os.Args) > 1 && os.Args[1] == "upload" {
-		// Run uploader mode
+		// Run uploader mode. Signal-aware so SIGTERM (e.g. pod deletion/eviction
+		// mid-upload) reaches in-flight work instead of the process just dying.
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
 		uploadLogger := zap.New(zap.UseDevMode(false)).WithName("uploader")
-		if err := uploader.Run(context.Background(), uploadLogger); err != nil {
+		if err := uploader.Run(ctx, uploadLogger); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "download" {
+		// Run downloader mode. Signal-aware for the same reason as upload above.
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		downloadLogger := zap.New(zap.UseDevMode(false)).WithName("downloader")
+		if err := downloader.Run(ctx, downloadLogger); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -110,7 +127,7 @@ func main() {
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", 3,
-		"Maximum number of concurrent reconciles for the KubeVirt DataUpload controller")
+		"Maximum number of concurrent reconciles for the KubeVirt DataUpload and DataDownload controllers")
 	flag.StringVar(&datamoverImage, "datamover-image", common.DefaultDatamoverImage,
 		"Image to use for datamover pods")
 	flag.StringVar(&datamoverImagePullPolicy, "datamover-image-pull-policy", "Always",
@@ -130,6 +147,14 @@ func main() {
 
 	if maxIncrementalBackups < 0 {
 		fmt.Fprintln(os.Stderr, "--max-incremental-backups must be >= 0")
+		os.Exit(1)
+	}
+
+	switch corev1.PullPolicy(datamoverImagePullPolicy) {
+	case corev1.PullAlways, corev1.PullIfNotPresent, corev1.PullNever:
+	default:
+		fmt.Fprintf(os.Stderr, "--datamover-image-pull-policy must be one of Always, IfNotPresent, Never (got %q)\n",
+			datamoverImagePullPolicy)
 		os.Exit(1)
 	}
 
@@ -252,6 +277,21 @@ func main() {
 		PodLogCollector:          controller.NewPodLogCollector(kubeClient, 100),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "KubeVirtDataUpload")
+		os.Exit(1)
+	}
+
+	// Setup KubeVirt DataDownload controller
+	if err = (&controller.KubeVirtDataDownloadReconciler{
+		Client:                   mgr.GetClient(),
+		Scheme:                   mgr.GetScheme(),
+		Log:                      ctrl.Log.WithName("controllers").WithName("KubeVirtDataDownload"),
+		MaxConcurrentReconciles:  maxConcurrentReconciles,
+		DatamoverImage:           datamoverImage,
+		DatamoverImagePullPolicy: corev1.PullPolicy(datamoverImagePullPolicy),
+		OADPNamespace:            oadpNamespace,
+		PodLogCollector:          controller.NewPodLogCollector(kubeClient, 100),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "KubeVirtDataDownload")
 		os.Exit(1)
 	}
 

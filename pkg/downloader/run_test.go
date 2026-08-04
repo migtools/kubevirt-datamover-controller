@@ -62,47 +62,32 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if cfg.BSLBucket != "test-bucket" {
-			t.Errorf("BSLBucket = %q, want %q", cfg.BSLBucket, "test-bucket")
+
+		fields := []struct {
+			name string
+			got  string
+			want string
+		}{
+			{"BSLBucket", cfg.BSLBucket, "test-bucket"},
+			{"VMName", cfg.VMName, "test-vm"},
+			{"VMNamespace", cfg.VMNamespace, "test-ns"},
+			{"VeleroBackupName", cfg.VeleroBackupName, "test-backup"},
+			{"TargetVolume", cfg.TargetVolume, "disk1"},
+			{"TargetPath", cfg.TargetPath, DefaultTargetPath},
+			{"ScratchPath", cfg.ScratchPath, DefaultScratchPath},
+			{"CredentialsFile", cfg.CredentialsFile, common.DefaultCredentialsPath},
+			{"DataDownloadName", cfg.DataDownloadName, "test-datadownload"},
+			{"DataDownloadUID", cfg.DataDownloadUID, "test-uid"},
+			{"BSLProvider", cfg.BSLProvider, "aws"},
+			{"BSLPrefix", cfg.BSLPrefix, "velero-kubevirt-datamover"},
+			{"BSLRegion", cfg.BSLRegion, "us-east-1"},
+			{"BSLS3URL", cfg.BSLS3URL, "https://s3.example.com"},
+			{"BSLCACert", cfg.BSLCACert, "test-ca-cert"},
 		}
-		if cfg.VMName != "test-vm" {
-			t.Errorf("VMName = %q, want %q", cfg.VMName, "test-vm")
-		}
-		if cfg.VMNamespace != "test-ns" {
-			t.Errorf("VMNamespace = %q, want %q", cfg.VMNamespace, "test-ns")
-		}
-		if cfg.VeleroBackupName != "test-backup" {
-			t.Errorf("VeleroBackupName = %q, want %q", cfg.VeleroBackupName, "test-backup")
-		}
-		if cfg.TargetVolume != "disk1" {
-			t.Errorf("TargetVolume = %q, want %q", cfg.TargetVolume, "disk1")
-		}
-		if cfg.TargetPath != DefaultTargetPath {
-			t.Errorf("TargetPath = %q, want default %q", cfg.TargetPath, DefaultTargetPath)
-		}
-		if cfg.ScratchPath != DefaultScratchPath {
-			t.Errorf("ScratchPath = %q, want default %q", cfg.ScratchPath, DefaultScratchPath)
-		}
-		if cfg.CredentialsFile != common.DefaultCredentialsPath {
-			t.Errorf("CredentialsFile = %q, want default %q", cfg.CredentialsFile, common.DefaultCredentialsPath)
-		}
-		if cfg.DataDownloadName != "test-datadownload" {
-			t.Errorf("DataDownloadName = %q, want %q", cfg.DataDownloadName, "test-datadownload")
-		}
-		if cfg.DataDownloadUID != "test-uid" {
-			t.Errorf("DataDownloadUID = %q, want %q", cfg.DataDownloadUID, "test-uid")
-		}
-		if cfg.BSLProvider != "aws" {
-			t.Errorf("BSLProvider = %q, want %q", cfg.BSLProvider, "aws")
-		}
-		if cfg.BSLPrefix != "velero-kubevirt-datamover" {
-			t.Errorf("BSLPrefix = %q, want %q", cfg.BSLPrefix, "velero-kubevirt-datamover")
-		}
-		if cfg.BSLRegion != "us-east-1" {
-			t.Errorf("BSLRegion = %q, want %q", cfg.BSLRegion, "us-east-1")
-		}
-		if cfg.BSLS3URL != "https://s3.example.com" {
-			t.Errorf("BSLS3URL = %q, want %q", cfg.BSLS3URL, "https://s3.example.com")
+		for _, f := range fields {
+			if f.got != f.want {
+				t.Errorf("%s = %q, want %q", f.name, f.got, f.want)
+			}
 		}
 		if !cfg.BSLS3ForcePathStyle {
 			t.Error("BSLS3ForcePathStyle = false, want true")
@@ -110,8 +95,44 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		if !cfg.BSLInsecureSkipTLSVerify {
 			t.Error("BSLInsecureSkipTLSVerify = false, want true")
 		}
-		if cfg.BSLCACert != "test-ca-cert" {
-			t.Errorf("BSLCACert = %q, want %q", cfg.BSLCACert, "test-ca-cert")
+	})
+
+	t.Run("GCP and Azure BSL fields are mapped from env", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv(common.EnvBSLServiceAccount, "test-service-account")
+		t.Setenv(common.EnvBSLResourceGroup, "test-resource-group")
+		t.Setenv(common.EnvBSLStorageAccount, "test-storage-account")
+		t.Setenv(common.EnvBSLStorageAccountKeyEnvVar, "AZURE_STORAGE_KEY")
+		t.Setenv(common.EnvBSLStorageAccountURI, "https://test.blob.core.windows.net")
+		t.Setenv(common.EnvBSLSubscriptionID, "test-subscription-id")
+		t.Setenv(common.EnvBSLUseAAD, "true")
+		t.Setenv(common.EnvBSLActiveDirectoryAuthorityURI, "https://login.microsoftonline.com")
+
+		cfg, err := LoadConfigFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		fields := []struct {
+			name string
+			got  string
+			want string
+		}{
+			{"BSLServiceAccount", cfg.BSLServiceAccount, "test-service-account"},
+			{"BSLResourceGroup", cfg.BSLResourceGroup, "test-resource-group"},
+			{"BSLStorageAccount", cfg.BSLStorageAccount, "test-storage-account"},
+			{"BSLStorageAccountKeyEnvVar", cfg.BSLStorageAccountKeyEnvVar, "AZURE_STORAGE_KEY"},
+			{"BSLStorageAccountURI", cfg.BSLStorageAccountURI, "https://test.blob.core.windows.net"},
+			{"BSLSubscriptionID", cfg.BSLSubscriptionID, "test-subscription-id"},
+			{"BSLActiveDirectoryAuthorityURI", cfg.BSLActiveDirectoryAuthorityURI, "https://login.microsoftonline.com"},
+		}
+		for _, f := range fields {
+			if f.got != f.want {
+				t.Errorf("%s = %q, want %q", f.name, f.got, f.want)
+			}
+		}
+		if !cfg.BSLUseAAD {
+			t.Error("BSLUseAAD = false, want true")
 		}
 	})
 

@@ -79,7 +79,7 @@ func Run(ctx context.Context, logger logr.Logger) error {
 		return fmt.Errorf("no VM index found for VM %s/%s", config.VMNamespace, config.VMName)
 	}
 
-	files, err := resolveCheckpointFiles(
+	files, err := ResolveCheckpointFiles(
 		config.VMNamespace, config.VMName, manifest.CheckpointChain, vmIndex, config.TargetVolume)
 	if err != nil {
 		return fmt.Errorf("failed to resolve checkpoint chain: %w", err)
@@ -166,20 +166,28 @@ func prepareDir(dir string) error {
 func LoadConfigFromEnv() (*DownloaderConfig, error) {
 	config := &DownloaderConfig{
 		ObjectStoreConfig: common.ObjectStoreConfig{
-			BSLProvider:                  os.Getenv(common.EnvBSLProvider),
-			BSLBucket:                    os.Getenv(common.EnvBSLBucket),
-			BSLPrefix:                    os.Getenv(common.EnvBSLPrefix),
-			BSLRegion:                    os.Getenv(common.EnvBSLRegion),
-			BSLS3URL:                     os.Getenv(common.EnvBSLS3URL),
-			BSLS3ForcePathStyle:          common.ParseBool(os.Getenv(common.EnvBSLS3ForcePathStyle)),
-			BSLInsecureSkipTLSVerify:     common.ParseBool(os.Getenv(common.EnvBSLInsecureSkipTLSVerify)),
-			BSLCACert:                    os.Getenv(common.EnvBSLCACert),
-			BSLServerSideEncryption:      os.Getenv(common.EnvBSLServerSideEncryption),
-			BSLKMSKeyID:                  os.Getenv(common.EnvBSLKMSKeyID),
-			BSLChecksumAlgorithm:         os.Getenv(common.EnvBSLChecksumAlgorithm),
-			BSLCustomerKeyEncryptionFile: os.Getenv(common.EnvBSLCustomerKeyEncryptionFile),
-			BSLProfile:                   os.Getenv(common.EnvBSLProfile),
-			CredentialsFile:              os.Getenv(common.EnvCredentialsFile),
+			BSLProvider:                    os.Getenv(common.EnvBSLProvider),
+			BSLBucket:                      os.Getenv(common.EnvBSLBucket),
+			BSLPrefix:                      os.Getenv(common.EnvBSLPrefix),
+			BSLRegion:                      os.Getenv(common.EnvBSLRegion),
+			BSLS3URL:                       os.Getenv(common.EnvBSLS3URL),
+			BSLS3ForcePathStyle:            common.ParseBool(os.Getenv(common.EnvBSLS3ForcePathStyle)),
+			BSLInsecureSkipTLSVerify:       common.ParseBool(os.Getenv(common.EnvBSLInsecureSkipTLSVerify)),
+			BSLCACert:                      os.Getenv(common.EnvBSLCACert),
+			BSLServerSideEncryption:        os.Getenv(common.EnvBSLServerSideEncryption),
+			BSLKMSKeyID:                    os.Getenv(common.EnvBSLKMSKeyID),
+			BSLChecksumAlgorithm:           os.Getenv(common.EnvBSLChecksumAlgorithm),
+			BSLCustomerKeyEncryptionFile:   os.Getenv(common.EnvBSLCustomerKeyEncryptionFile),
+			BSLProfile:                     os.Getenv(common.EnvBSLProfile),
+			BSLServiceAccount:              os.Getenv(common.EnvBSLServiceAccount),
+			BSLResourceGroup:               os.Getenv(common.EnvBSLResourceGroup),
+			BSLStorageAccount:              os.Getenv(common.EnvBSLStorageAccount),
+			BSLStorageAccountKeyEnvVar:     os.Getenv(common.EnvBSLStorageAccountKeyEnvVar),
+			BSLStorageAccountURI:           os.Getenv(common.EnvBSLStorageAccountURI),
+			BSLSubscriptionID:              os.Getenv(common.EnvBSLSubscriptionID),
+			BSLUseAAD:                      common.ParseBool(os.Getenv(common.EnvBSLUseAAD)),
+			BSLActiveDirectoryAuthorityURI: os.Getenv(common.EnvBSLActiveDirectoryAuthorityURI),
+			CredentialsFile:                os.Getenv(common.EnvCredentialsFile),
 		},
 		VMName:           os.Getenv(EnvVMName),
 		VMNamespace:      os.Getenv(EnvVMNamespace),

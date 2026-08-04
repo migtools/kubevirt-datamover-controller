@@ -19,9 +19,11 @@ package controller
 import (
 	"maps"
 	"os"
+	"path"
 	"path/filepath"
 
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/downloader"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,6 +39,32 @@ const (
 	// OperationModeDownload runs the restore download path.
 	OperationModeDownload OperationMode = OperationMode(common.PodTypeDownload)
 )
+
+// downloadTargetFilename is where the reconstructed raw disk image is written,
+// relative to the scratch PVC mount. It must live inside the scratch mount since
+// the download pod has only one read-write volume (the scratch PVC): the same
+// volume stages the downloaded qcow2 chain and holds the final flattened image
+// until the PV is rebound into the restore target namespace. Named disk.img at
+// the mount root (not a subdirectory) to match the CDI/KubeVirt convention for
+// filesystem-mode PVC-backed disk images, since this PV is rebound directly as
+// the restore target's volume. Downloaded qcow2 chain files are named
+// "<index>-<filename>.qcow2" at this same root (see downloadCheckpointFiles),
+// so there's no collision with disk.img.
+const downloadTargetFilename = "disk.img"
+
+// cloudCredentialsVolumeName is the name shared by the BSL credentials
+// volume and its mount in both upload and download pods.
+const cloudCredentialsVolumeName = "cloud-credentials"
+
+// boundSATokenVolumeName is the name shared by the projected service-account
+// token volume and its mount in both upload and download pods (STS auth).
+const boundSATokenVolumeName = "bound-sa-token"
+
+// scratchDataVolumeName is the download-mode scratch PVC volume/mount name.
+const scratchDataVolumeName = "scratch-data"
+
+// backupDataVolumeName is the upload-mode source PVC volume/mount name.
+const backupDataVolumeName = "backup-data"
 
 // DatamoverPodConfig contains configuration for building a datamover pod.
 type DatamoverPodConfig struct {
@@ -105,8 +133,16 @@ type DatamoverPodConfig struct {
 	UIDLabelKey       string
 	NameAnnotationKey string
 
-	// Source PVC
+	// Source PVC (upload mode only): the app PVC being backed up, mounted read-only.
 	SourcePVCName string
+
+	// ScratchPVCName (download mode only): read-write PVC that stages the downloaded
+	// qcow2 chain and holds the final flattened raw disk image.
+	ScratchPVCName string
+
+	// TargetVolume (download mode only): the disk/PVC name being restored, used to
+	// filter the checkpoint chain down to the matching file.
+	TargetVolume string
 
 	// Labels for pod
 	Labels map[string]string
@@ -121,13 +157,26 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 
 	// Merge default labels with provided labels.
 	// Use UID for labels (always ≤ 63 chars); name goes in annotations.
+	// Defaults are mode-aware: an unset key must default to the constant matching
+	// this pod's own operation mode, not unconditionally to DataUpload's -- a
+	// caller that forgets to set these for a download-mode config would otherwise
+	// silently mislabel the pod, breaking findPodForDataDownload's label lookup.
 	uidLabelKey := config.UIDLabelKey
-	if uidLabelKey == "" {
-		uidLabelKey = common.LabelDataUploadUID
-	}
 	nameAnnotationKey := config.NameAnnotationKey
-	if nameAnnotationKey == "" {
-		nameAnnotationKey = common.AnnotationDataUploadName
+	if mode == OperationModeDownload {
+		if uidLabelKey == "" {
+			uidLabelKey = common.LabelDataDownloadUID
+		}
+		if nameAnnotationKey == "" {
+			nameAnnotationKey = common.AnnotationDataDownloadName
+		}
+	} else {
+		if uidLabelKey == "" {
+			uidLabelKey = common.LabelDataUploadUID
+		}
+		if nameAnnotationKey == "" {
+			nameAnnotationKey = common.AnnotationDataUploadName
+		}
 	}
 
 	labels := map[string]string{
@@ -140,41 +189,14 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 		nameAnnotationKey: config.ResourceName,
 	}
 
-	// Build environment variables
-	envVars := []corev1.EnvVar{
-		{Name: common.EnvBSLProvider, Value: config.BSLProvider},
-		{Name: common.EnvBSLBucket, Value: config.BSLBucket},
-		{Name: common.EnvBSLPrefix, Value: config.BSLPrefix},
-		{Name: common.EnvBSLRegion, Value: config.BSLRegion},
-		{Name: common.EnvBSLS3URL, Value: config.BSLS3URL},
-		{Name: common.EnvBSLS3ForcePathStyle, Value: config.BSLS3ForcePathStyle},
-		{Name: common.EnvBSLInsecureSkipTLSVerify, Value: config.BSLInsecureSkipTLSVerify},
-		{Name: common.EnvBSLCACert, Value: config.BSLCACert},
-		{Name: common.EnvBSLServerSideEncryption, Value: config.BSLServerSideEncryption},
-		{Name: common.EnvBSLKMSKeyID, Value: config.BSLKMSKeyID},
-		{Name: common.EnvBSLChecksumAlgorithm, Value: config.BSLChecksumAlgorithm},
-		{Name: common.EnvBSLProfile, Value: config.BSLProfile},
-		{Name: common.EnvBSLCustomerKeyEncryptionFile, Value: sseCustomerKeyPath(config)},
-		{Name: common.EnvBSLServiceAccount, Value: config.BSLServiceAccount},
-		{Name: common.EnvBSLKMSKeyName, Value: config.BSLKMSKeyName},
-		{Name: common.EnvBSLResourceGroup, Value: config.BSLResourceGroup},
-		{Name: common.EnvBSLStorageAccount, Value: config.BSLStorageAccount},
-		{Name: common.EnvBSLStorageAccountKeyEnvVar, Value: config.BSLStorageAccountKeyEnvVar},
-		{Name: common.EnvBSLStorageAccountURI, Value: config.BSLStorageAccountURI},
-		{Name: common.EnvBSLSubscriptionID, Value: config.BSLSubscriptionID},
-		{Name: common.EnvBSLUseAAD, Value: config.BSLUseAAD},
-		{Name: common.EnvBSLActiveDirectoryAuthorityURI, Value: config.BSLActiveDirectoryAuthorityURI},
-		{Name: common.EnvCredentialsFile, Value: common.DefaultCredentialsPath},
-		{Name: uploader.EnvVMName, Value: config.VMName},
-		{Name: uploader.EnvVMNamespace, Value: config.VMNamespace},
-		{Name: uploader.EnvCheckpointName, Value: config.CheckpointName},
-		{Name: uploader.EnvBackupType, Value: config.BackupType},
-		{Name: uploader.EnvVeleroBackupName, Value: config.VeleroBackupName},
-		{Name: uploader.EnvSourcePVCPath, Value: uploader.DefaultSourcePVCPath},
-		{Name: uploader.EnvDataUploadName, Value: config.ResourceName},
-		{Name: uploader.EnvDataUploadUID, Value: config.ResourceUID},
-		{Name: uploader.EnvVMBName, Value: config.VMBName},
-		{Name: uploader.EnvVMBTName, Value: config.VMBTName},
+	var envVars []corev1.EnvVar
+	var volumes []corev1.Volume
+	var volumeMounts []corev1.VolumeMount
+
+	if mode == OperationModeDownload {
+		envVars, volumes, volumeMounts = buildDownloadPodResources(config)
+	} else {
+		envVars, volumes, volumeMounts = buildUploadPodResources(config)
 	}
 
 	// Inject Azure Workload Identity env vars if present in the controller pod
@@ -192,7 +214,6 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 	//   for privileged access on OpenShift
 	runAsUser := int64(0)
 	readOnlyRootFilesystem := true
-	saTokenExpSeconds := int64(3600)
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -219,69 +240,13 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 					ImagePullPolicy: config.ImagePullPolicy,
 					Command:         []string{"/manager", string(mode)},
 					Env:             envVars,
-					VolumeMounts: []corev1.VolumeMount{
-						{
-							Name:      "backup-data",
-							MountPath: uploader.DefaultSourcePVCPath,
-							ReadOnly:  true,
-						},
-						{
-							Name:      "cloud-credentials",
-							MountPath: "/credentials",
-							ReadOnly:  true,
-						},
-						{
-							Name:      "bound-sa-token",
-							MountPath: "/var/run/secrets/openshift/serviceaccount",
-							ReadOnly:  true,
-						},
-					},
+					VolumeMounts:    volumeMounts,
 					SecurityContext: &corev1.SecurityContext{
 						ReadOnlyRootFilesystem: &readOnlyRootFilesystem,
 					},
 				},
 			},
-			Volumes: []corev1.Volume{
-				{
-					Name: "backup-data",
-					VolumeSource: corev1.VolumeSource{
-						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-							ClaimName: config.SourcePVCName,
-							ReadOnly:  true,
-						},
-					},
-				},
-				{
-					Name: "cloud-credentials",
-					VolumeSource: corev1.VolumeSource{
-						Secret: &corev1.SecretVolumeSource{
-							SecretName: config.CredentialSecretName,
-							Items: []corev1.KeyToPath{
-								{
-									Key:  config.CredentialSecretKey,
-									Path: "cloud",
-								},
-							},
-						},
-					},
-				},
-				{
-					Name: "bound-sa-token",
-					VolumeSource: corev1.VolumeSource{
-						Projected: &corev1.ProjectedVolumeSource{
-							Sources: []corev1.VolumeProjection{
-								{
-									ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-										Audience:          "openshift",
-										ExpirationSeconds: &saTokenExpSeconds,
-										Path:              "token",
-									},
-								},
-							},
-						},
-					},
-				},
-			},
+			Volumes: volumes,
 		},
 	}
 
@@ -296,6 +261,188 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 	}
 
 	return pod
+}
+
+// buildSharedBSLEnvVars returns the BSL provider/connection env vars common to
+// both upload and download pods (S3, GCP service-account auth, Azure
+// storage-account/AAD auth, plus the shared credentials-file path). Extracted
+// to a single list so the two pod-resource builders can't silently diverge on
+// which BSL settings a datamover pod receives.
+func buildSharedBSLEnvVars(config *DatamoverPodConfig) []corev1.EnvVar {
+	return []corev1.EnvVar{
+		{Name: common.EnvBSLProvider, Value: config.BSLProvider},
+		{Name: common.EnvBSLBucket, Value: config.BSLBucket},
+		{Name: common.EnvBSLPrefix, Value: config.BSLPrefix},
+		{Name: common.EnvBSLRegion, Value: config.BSLRegion},
+		{Name: common.EnvBSLS3URL, Value: config.BSLS3URL},
+		{Name: common.EnvBSLS3ForcePathStyle, Value: config.BSLS3ForcePathStyle},
+		{Name: common.EnvBSLInsecureSkipTLSVerify, Value: config.BSLInsecureSkipTLSVerify},
+		{Name: common.EnvBSLCACert, Value: config.BSLCACert},
+		{Name: common.EnvBSLServerSideEncryption, Value: config.BSLServerSideEncryption},
+		{Name: common.EnvBSLKMSKeyID, Value: config.BSLKMSKeyID},
+		{Name: common.EnvBSLChecksumAlgorithm, Value: config.BSLChecksumAlgorithm},
+		{Name: common.EnvBSLCustomerKeyEncryptionFile, Value: sseCustomerKeyPath(config)},
+		{Name: common.EnvBSLProfile, Value: config.BSLProfile},
+		{Name: common.EnvBSLServiceAccount, Value: config.BSLServiceAccount},
+		{Name: common.EnvBSLResourceGroup, Value: config.BSLResourceGroup},
+		{Name: common.EnvBSLStorageAccount, Value: config.BSLStorageAccount},
+		{Name: common.EnvBSLStorageAccountKeyEnvVar, Value: config.BSLStorageAccountKeyEnvVar},
+		{Name: common.EnvBSLStorageAccountURI, Value: config.BSLStorageAccountURI},
+		{Name: common.EnvBSLSubscriptionID, Value: config.BSLSubscriptionID},
+		{Name: common.EnvBSLUseAAD, Value: config.BSLUseAAD},
+		{Name: common.EnvBSLActiveDirectoryAuthorityURI, Value: config.BSLActiveDirectoryAuthorityURI},
+		{Name: common.EnvCredentialsFile, Value: common.DefaultCredentialsPath},
+	}
+}
+
+// buildDownloadPodResources returns the env vars, volumes, and volume mounts
+// for a download-mode (OperationModeDownload) datamover pod.
+func buildDownloadPodResources(config *DatamoverPodConfig) ([]corev1.EnvVar, []corev1.Volume, []corev1.VolumeMount) {
+	envVars := append(buildSharedBSLEnvVars(config),
+		corev1.EnvVar{Name: downloader.EnvVMName, Value: config.VMName},
+		corev1.EnvVar{Name: downloader.EnvVMNamespace, Value: config.VMNamespace},
+		corev1.EnvVar{Name: downloader.EnvVeleroBackupName, Value: config.VeleroBackupName},
+		corev1.EnvVar{Name: downloader.EnvDataDownloadName, Value: config.ResourceName},
+		corev1.EnvVar{Name: downloader.EnvDataDownloadUID, Value: config.ResourceUID},
+		corev1.EnvVar{Name: downloader.EnvTargetVolume, Value: config.TargetVolume},
+		corev1.EnvVar{Name: downloader.EnvScratchPath, Value: downloader.DefaultScratchPath},
+		corev1.EnvVar{Name: downloader.EnvTargetPath, Value: path.Join(downloader.DefaultScratchPath, downloadTargetFilename)},
+	)
+
+	volumes := []corev1.Volume{
+		{
+			Name: scratchDataVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: config.ScratchPVCName,
+				},
+			},
+		},
+		buildCredentialsVolume(config),
+		buildBoundSATokenVolume(),
+	}
+
+	volumeMounts := []corev1.VolumeMount{
+		{
+			Name:      scratchDataVolumeName,
+			MountPath: downloader.DefaultScratchPath,
+		},
+		buildCredentialsVolumeMount(),
+		buildBoundSATokenVolumeMount(),
+	}
+
+	return envVars, volumes, volumeMounts
+}
+
+// buildCredentialsVolume returns the BSL credentials secret volume shared by
+// upload and download pods. The secret key (from BSL config) is mounted at a
+// fixed filename matching common.DefaultCredentialsPath -- simpler than
+// Velero's dynamic path approach since we control both ends.
+func buildCredentialsVolume(config *DatamoverPodConfig) corev1.Volume {
+	credentialsMode := int32(0400)
+	return corev1.Volume{
+		Name: cloudCredentialsVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName:  config.CredentialSecretName,
+				DefaultMode: &credentialsMode,
+				Items: []corev1.KeyToPath{
+					{
+						Key:  config.CredentialSecretKey,
+						Path: path.Base(common.DefaultCredentialsPath),
+					},
+				},
+			},
+		},
+	}
+}
+
+// buildCredentialsVolumeMount returns the mount for buildCredentialsVolume.
+func buildCredentialsVolumeMount() corev1.VolumeMount {
+	return corev1.VolumeMount{
+		Name:      cloudCredentialsVolumeName,
+		MountPath: path.Dir(common.DefaultCredentialsPath),
+		ReadOnly:  true,
+	}
+}
+
+// buildBoundSATokenVolume returns the projected service-account token volume
+// shared by upload and download pods, used for STS auth to cloud storage.
+func buildBoundSATokenVolume() corev1.Volume {
+	saTokenExpSeconds := int64(3600)
+	return corev1.Volume{
+		Name: boundSATokenVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Projected: &corev1.ProjectedVolumeSource{
+				Sources: []corev1.VolumeProjection{
+					{
+						ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+							Audience:          "openshift",
+							ExpirationSeconds: &saTokenExpSeconds,
+							Path:              "token",
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// buildBoundSATokenVolumeMount returns the mount for buildBoundSATokenVolume.
+func buildBoundSATokenVolumeMount() corev1.VolumeMount {
+	return corev1.VolumeMount{
+		Name:      boundSATokenVolumeName,
+		MountPath: "/var/run/secrets/openshift/serviceaccount",
+		ReadOnly:  true,
+	}
+}
+
+// buildUploadPodResources returns the env vars, volumes, and volume mounts for
+// an upload-mode (OperationModeUpload) datamover pod.
+func buildUploadPodResources(config *DatamoverPodConfig) ([]corev1.EnvVar, []corev1.Volume, []corev1.VolumeMount) {
+	envVars := append(buildSharedBSLEnvVars(config),
+		// EnvBSLKMSKeyName is upload-only: it names the SSE-KMS key used to
+		// encrypt newly-uploaded objects. Downloads read existing objects and
+		// rely on the bucket's own SSE-KMS config to decrypt transparently, so
+		// they never need this.
+		corev1.EnvVar{Name: common.EnvBSLKMSKeyName, Value: config.BSLKMSKeyName},
+		corev1.EnvVar{Name: uploader.EnvVMName, Value: config.VMName},
+		corev1.EnvVar{Name: uploader.EnvVMNamespace, Value: config.VMNamespace},
+		corev1.EnvVar{Name: uploader.EnvCheckpointName, Value: config.CheckpointName},
+		corev1.EnvVar{Name: uploader.EnvBackupType, Value: config.BackupType},
+		corev1.EnvVar{Name: uploader.EnvVeleroBackupName, Value: config.VeleroBackupName},
+		corev1.EnvVar{Name: uploader.EnvSourcePVCPath, Value: uploader.DefaultSourcePVCPath},
+		corev1.EnvVar{Name: uploader.EnvDataUploadName, Value: config.ResourceName},
+		corev1.EnvVar{Name: uploader.EnvDataUploadUID, Value: config.ResourceUID},
+		corev1.EnvVar{Name: uploader.EnvVMBName, Value: config.VMBName},
+		corev1.EnvVar{Name: uploader.EnvVMBTName, Value: config.VMBTName},
+	)
+
+	volumes := []corev1.Volume{
+		{
+			Name: backupDataVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: config.SourcePVCName,
+					ReadOnly:  true,
+				},
+			},
+		},
+		buildCredentialsVolume(config),
+		buildBoundSATokenVolume(),
+	}
+
+	volumeMounts := []corev1.VolumeMount{
+		{
+			Name:      backupDataVolumeName,
+			MountPath: uploader.DefaultSourcePVCPath,
+			ReadOnly:  true,
+		},
+		buildCredentialsVolumeMount(),
+		buildBoundSATokenVolumeMount(),
+	}
+
+	return envVars, volumes, volumeMounts
 }
 
 const sseCustomerKeyMountPath = "/etc/sse-c/key"

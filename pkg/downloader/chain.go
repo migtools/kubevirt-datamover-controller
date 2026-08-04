@@ -23,7 +23,7 @@ import (
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
 )
 
-// resolveCheckpointFiles walks the (already-ordered) checkpoint chain and
+// ResolveCheckpointFiles walks the (already-ordered) checkpoint chain and
 // returns, for each checkpoint, the single CheckpointFile matching
 // targetVolume. The chain is assumed to be full-backup-first,
 // incrementals-after, as produced by the uploader at backup time.
@@ -32,7 +32,7 @@ import (
 // S3-sourced metadata, and are used to verify each matched file's ObjectPath
 // actually falls under this VM's own checkpoint prefix (see the ObjectPath
 // check below) before it's ever handed to downloadCheckpointFiles.
-func resolveCheckpointFiles(
+func ResolveCheckpointFiles(
 	vmNamespace, vmName string, chain []string, vmIndex uploader.VMIndex, targetVolume string,
 ) ([]uploader.CheckpointFile, error) {
 	if len(chain) == 0 {
