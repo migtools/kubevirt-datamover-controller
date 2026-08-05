@@ -344,3 +344,58 @@ func TestCleanupPodsByUID(t *testing.T) {
 		}
 	})
 }
+
+// TestFindPodByUID_APIReaderFallback covers the informer-cache-lag case: a pod
+// that genuinely exists but hasn't yet propagated to the cached client's
+// informer (e.g. created by this same controller moments ago in an earlier
+// reconcile) must still be found via the uncached apiReader fallback, not
+// misreported as absent.
+func TestFindPodByUID_APIReaderFallback(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "lagging-pod", Namespace: "ns",
+			Labels: map[string]string{"uid-label": "abc"},
+		},
+	}
+
+	t.Run("cached client has the pod, apiReader is never needed", func(t *testing.T) {
+		cached := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod.DeepCopy()).Build()
+		apiReader := fake.NewClientBuilder().WithScheme(scheme).Build() // deliberately empty
+
+		got, err := findPodByUID(context.Background(), cached, apiReader, "uid-label", "abc", "ns")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got == nil || got.Name != pod.Name {
+			t.Errorf("expected to find pod via cached client, got %+v", got)
+		}
+	})
+
+	t.Run("cached client is empty (cache lag), apiReader fallback finds it", func(t *testing.T) {
+		cached := fake.NewClientBuilder().WithScheme(scheme).Build() // simulates a stale/lagging cache
+		apiReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod.DeepCopy()).Build()
+
+		got, err := findPodByUID(context.Background(), cached, apiReader, "uid-label", "abc", "ns")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got == nil || got.Name != pod.Name {
+			t.Errorf("expected apiReader fallback to find pod, got %+v", got)
+		}
+	})
+
+	t.Run("both empty and apiReader nil: genuinely not found, no panic", func(t *testing.T) {
+		cached := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+		got, err := findPodByUID(context.Background(), cached, nil, "uid-label", "abc", "ns")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != nil {
+			t.Errorf("expected nil pod, got %+v", got)
+		}
+	})
+}

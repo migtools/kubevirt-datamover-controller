@@ -38,6 +38,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -81,6 +82,18 @@ type KubeVirtDataUploadReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	Log    logr.Logger
+
+	// APIReader is an uncached client, used as a fallback when the cached client's
+	// List returns no results for a child resource this controller expects to
+	// exist -- the informer cache is only eventually consistent, so a resource
+	// created moments ago in an earlier reconcile may not yet be visible to it.
+	// May be nil (falls back to cached-only lookups), so tests that don't wire
+	// one keep working.
+	APIReader client.Reader
+
+	// EventRecorder emits Kubernetes Events on DataUpload objects. May be nil,
+	// in which case event emission is skipped.
+	EventRecorder record.EventRecorder
 
 	// OADPNamespace is the namespace where OADP and Velero resources are located
 	OADPNamespace string
@@ -1279,16 +1292,13 @@ func (r *KubeVirtDataUploadReconciler) filterKubeVirtDataMover() predicate.Predi
 // while DataUpload is in OADP namespace (cross-namespace owner refs not allowed).
 // The PVC will be cleaned up during PV rebinding or explicit cleanup.
 func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, namespace string) (*corev1.PersistentVolumeClaim, error) {
-	pvcList := &corev1.PersistentVolumeClaimList{}
-	if err := r.List(ctx, pvcList, client.InNamespace(namespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
-		return nil, fmt.Errorf("failed to list temporary PVCs: %w", err)
+	existing, err := r.findTempPVC(ctx, du, namespace)
+	if err != nil {
+		return nil, err
 	}
-	if len(pvcList.Items) > 1 {
-		return nil, fmt.Errorf("found multiple temporary PVCs for DataUpload %s", du.Name)
-	}
-	if len(pvcList.Items) == 1 {
-		logger.V(1).Info("Temporary PVC already exists", "pvc", pvcList.Items[0].Name)
-		return &pvcList.Items[0], nil
+	if existing != nil {
+		logger.V(1).Info("Temporary PVC already exists", "pvc", existing.Name)
+		return existing, nil
 	}
 
 	pvcSize, err := r.calculateBackupPVCSize(ctx, logger, du, namespace)
@@ -1326,6 +1336,33 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 
 	logger.Info("Created temporary PVC", "generateName", pvc.GenerateName, "namespace", namespace, "size", pvcSize.String())
 	return pvc, nil
+}
+
+// findTempPVC finds the unique temporary backup PVC for a DataUpload, if any.
+// Tries the cached client first; if it finds nothing, retries via APIReader
+// (an uncached read) before the caller concludes none exists -- the informer
+// cache is only eventually consistent, so a PVC created moments ago in an
+// earlier reconcile may not yet be visible to a cached List.
+func (r *KubeVirtDataUploadReconciler) findTempPVC(ctx context.Context, du *velerov2alpha1.DataUpload, namespace string) (*corev1.PersistentVolumeClaim, error) {
+	pvc, err := listTempPVC(ctx, r.Client, du, namespace)
+	if err != nil || pvc != nil || r.APIReader == nil {
+		return pvc, err
+	}
+	return listTempPVC(ctx, r.APIReader, du, namespace)
+}
+
+func listTempPVC(ctx context.Context, reader client.Reader, du *velerov2alpha1.DataUpload, namespace string) (*corev1.PersistentVolumeClaim, error) {
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	if err := reader.List(ctx, pvcList, client.InNamespace(namespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		return nil, fmt.Errorf("failed to list temporary PVCs: %w", err)
+	}
+	if len(pvcList.Items) > 1 {
+		return nil, fmt.Errorf("found multiple temporary PVCs for DataUpload %s", du.Name)
+	}
+	if len(pvcList.Items) == 1 {
+		return &pvcList.Items[0], nil
+	}
+	return nil, nil
 }
 
 // sizeOverheadPercent is the percentage added on top of source PVC capacity when
@@ -1662,10 +1699,22 @@ func (r *KubeVirtDataUploadReconciler) getBackupStorageLocationForDU(ctx context
 	return bsl, nil
 }
 
-// findVMBForDataUpload finds the unique VirtualMachineBackup associated with a DataUpload.
+// findVMBForDataUpload finds the unique VirtualMachineBackup associated with a
+// DataUpload. Tries the cached client first; if it finds nothing, retries via
+// APIReader (an uncached read) before the caller concludes none exists -- the
+// informer cache is only eventually consistent, so a VMB created moments ago in
+// an earlier reconcile may not yet be visible to a cached List.
 func (r *KubeVirtDataUploadReconciler) findVMBForDataUpload(ctx context.Context, du *velerov2alpha1.DataUpload, namespace string) (*kubevirtbackupv1alpha1.VirtualMachineBackup, error) {
+	vmb, err := listVMBForDataUpload(ctx, r.Client, du, namespace)
+	if err != nil || vmb != nil || r.APIReader == nil {
+		return vmb, err
+	}
+	return listVMBForDataUpload(ctx, r.APIReader, du, namespace)
+}
+
+func listVMBForDataUpload(ctx context.Context, reader client.Reader, du *velerov2alpha1.DataUpload, namespace string) (*kubevirtbackupv1alpha1.VirtualMachineBackup, error) {
 	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
-	if err := r.List(ctx, vmbList, client.InNamespace(namespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+	if err := reader.List(ctx, vmbList, client.InNamespace(namespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
 		return nil, err
 	}
 	if len(vmbList.Items) == 0 {
@@ -1889,5 +1938,5 @@ func (r *KubeVirtDataUploadReconciler) lookupCheckpointFromBSL(ctx context.Conte
 
 // findPodForDataUpload finds the unique datamover pod associated with a DataUpload.
 func (r *KubeVirtDataUploadReconciler) findPodForDataUpload(ctx context.Context, du *velerov2alpha1.DataUpload, namespace string) (*corev1.Pod, error) {
-	return findPodByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), namespace)
+	return findPodByUID(ctx, r.Client, r.APIReader, common.LabelDataUploadUID, string(du.UID), namespace)
 }

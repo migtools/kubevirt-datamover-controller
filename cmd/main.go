@@ -266,6 +266,8 @@ func main() {
 	// Setup KubeVirt DataUpload controller
 	if err = (&controller.KubeVirtDataUploadReconciler{
 		Client:                   mgr.GetClient(),
+		APIReader:                mgr.GetAPIReader(),
+		EventRecorder:            mgr.GetEventRecorderFor("kubevirt-dataupload-controller"),
 		Scheme:                   mgr.GetScheme(),
 		Log:                      ctrl.Log.WithName("controllers").WithName("KubeVirtDataUpload"),
 		MaxConcurrentReconciles:  maxConcurrentReconciles,
@@ -283,6 +285,8 @@ func main() {
 	// Setup KubeVirt DataDownload controller
 	if err = (&controller.KubeVirtDataDownloadReconciler{
 		Client:                   mgr.GetClient(),
+		APIReader:                mgr.GetAPIReader(),
+		EventRecorder:            mgr.GetEventRecorderFor("kubevirt-datadownload-controller"),
 		Scheme:                   mgr.GetScheme(),
 		Log:                      ctrl.Log.WithName("controllers").WithName("KubeVirtDataDownload"),
 		MaxConcurrentReconciles:  maxConcurrentReconciles,

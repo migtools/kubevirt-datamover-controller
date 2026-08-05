@@ -164,9 +164,23 @@ func getBackupStorageLocation(ctx context.Context, k8sClient client.Client, bslN
 }
 
 // findPodByUID finds the unique datamover pod associated with a resource UID.
-func findPodByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid, namespace string) (*corev1.Pod, error) {
+// Tries the cached client first; if it finds nothing, retries via apiReader
+// (an uncached read) before the caller concludes the pod is genuinely absent --
+// controller-runtime's informer cache is only eventually consistent, so a pod
+// this same controller created moments ago in an earlier reconcile may not yet
+// be visible to a cached List. apiReader may be nil (falls back to cached-only
+// behavior), so existing callers/tests that don't wire one still work.
+func findPodByUID(ctx context.Context, k8sClient client.Client, apiReader client.Reader, uidLabelKey, uid, namespace string) (*corev1.Pod, error) {
+	pod, err := listPodByUID(ctx, k8sClient, uidLabelKey, uid, namespace)
+	if err != nil || pod != nil || apiReader == nil {
+		return pod, err
+	}
+	return listPodByUID(ctx, apiReader, uidLabelKey, uid, namespace)
+}
+
+func listPodByUID(ctx context.Context, reader client.Reader, uidLabelKey, uid, namespace string) (*corev1.Pod, error) {
 	podList := &corev1.PodList{}
-	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
+	if err := reader.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
 		return nil, err
 	}
 	if len(podList.Items) == 0 {

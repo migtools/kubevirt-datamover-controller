@@ -1130,6 +1130,51 @@ func newDDTestFixture(t *testing.T) *ddTestFixture {
 	return &ddTestFixture{dd: dd, bsl: bsl, credSec: credSec, targetPVC: targetPVCObj, mockStore: mockStore}
 }
 
+// TestFindScratchPVC_APIReaderFallback covers the informer-cache-lag case: a
+// scratch PVC that genuinely exists but hasn't yet propagated to the cached
+// client's informer (e.g. created by this same controller moments ago in an
+// earlier reconcile) must still be found via the uncached APIReader fallback,
+// not misreported as absent -- which would otherwise create a duplicate
+// scratch PVC via ensureScratchPVC's GenerateName create.
+func TestFindScratchPVC_APIReaderFallback(t *testing.T) {
+	f := newDDTestFixture(t)
+	scheme := ddScheme()
+
+	scratchPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "scratch-pvc-1", Namespace: "openshift-adp",
+			Labels: map[string]string{common.LabelDataDownloadUID: string(f.dd.UID)},
+		},
+	}
+
+	t.Run("cached client is empty (cache lag), APIReader fallback finds it", func(t *testing.T) {
+		cached := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd).Build()
+		apiReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, scratchPVC.DeepCopy()).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: cached, APIReader: apiReader, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		got, err := r.findScratchPVC(context.Background(), f.dd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got == nil || got.Name != scratchPVC.Name {
+			t.Errorf("expected APIReader fallback to find scratch PVC, got %+v", got)
+		}
+	})
+
+	t.Run("nil APIReader falls back to cached-only behavior", func(t *testing.T) {
+		cached := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: cached, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		got, err := r.findScratchPVC(context.Background(), f.dd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != nil {
+			t.Errorf("expected nil, got %+v", got)
+		}
+	})
+}
+
 func TestHandleAcceptedDataDownload(t *testing.T) {
 	t.Run("target PVC not found requeues without failing", func(t *testing.T) {
 		f := newDDTestFixture(t)

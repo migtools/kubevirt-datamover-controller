@@ -35,6 +35,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -77,6 +78,18 @@ type KubeVirtDataDownloadReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	Log    logr.Logger
+
+	// APIReader is an uncached client, used as a fallback when the cached client's
+	// List returns no results for a child resource this controller expects to
+	// exist -- the informer cache is only eventually consistent, so a resource
+	// created moments ago in an earlier reconcile may not yet be visible to it.
+	// May be nil (falls back to cached-only lookups), so tests that don't wire
+	// one keep working.
+	APIReader client.Reader
+
+	// EventRecorder emits Kubernetes Events on DataDownload objects. May be nil,
+	// in which case event emission is skipped.
+	EventRecorder record.EventRecorder
 
 	// OADPNamespace is the namespace where OADP and Velero resources are located
 	OADPNamespace string
@@ -657,10 +670,22 @@ func calculateScratchPVCSize(logger logr.Logger, vmIndex uploader.VMIndex, chain
 	return finalSize
 }
 
-// findScratchPVC finds the unique scratch PVC associated with a DataDownload, if any.
+// findScratchPVC finds the unique scratch PVC associated with a DataDownload, if
+// any. Tries the cached client first; if it finds nothing, retries via APIReader
+// (an uncached read) before the caller concludes none exists -- the informer
+// cache is only eventually consistent, so a PVC created moments ago in an
+// earlier reconcile may not yet be visible to a cached List.
 func (r *KubeVirtDataDownloadReconciler) findScratchPVC(ctx context.Context, dd *velerov2alpha1.DataDownload) (*corev1.PersistentVolumeClaim, error) {
+	pvc, err := listScratchPVC(ctx, r.Client, r.getPodNamespace(dd), dd)
+	if err != nil || pvc != nil || r.APIReader == nil {
+		return pvc, err
+	}
+	return listScratchPVC(ctx, r.APIReader, r.getPodNamespace(dd), dd)
+}
+
+func listScratchPVC(ctx context.Context, reader client.Reader, namespace string, dd *velerov2alpha1.DataDownload) (*corev1.PersistentVolumeClaim, error) {
 	pvcList := &corev1.PersistentVolumeClaimList{}
-	if err := r.List(ctx, pvcList, client.InNamespace(r.getPodNamespace(dd)), client.MatchingLabels{common.LabelDataDownloadUID: string(dd.UID)}); err != nil {
+	if err := reader.List(ctx, pvcList, client.InNamespace(namespace), client.MatchingLabels{common.LabelDataDownloadUID: string(dd.UID)}); err != nil {
 		return nil, fmt.Errorf("failed to list scratch PVCs: %w", err)
 	}
 	if len(pvcList.Items) > 1 {
@@ -1256,7 +1281,7 @@ func (r *KubeVirtDataDownloadReconciler) getBackupStorageLocationForDD(ctx conte
 
 // findPodForDataDownload finds the unique downloader pod associated with a DataDownload.
 func (r *KubeVirtDataDownloadReconciler) findPodForDataDownload(ctx context.Context, dd *velerov2alpha1.DataDownload, namespace string) (*corev1.Pod, error) {
-	return findPodByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), namespace)
+	return findPodByUID(ctx, r.Client, r.APIReader, common.LabelDataDownloadUID, string(dd.UID), namespace)
 }
 
 // SetupWithManager sets up the controller with the Manager
