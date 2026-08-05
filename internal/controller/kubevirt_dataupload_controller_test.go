@@ -8483,6 +8483,50 @@ func TestEmitPodLogs(t *testing.T) {
 	}
 }
 
+// TestEmitPodLogs_TruncatesLongOutput covers #154: a pod that produced a very
+// large log (e.g. a crash loop with verbose output) must not flood the
+// controller's own logs unbounded -- only the last maxEmittedPodLogLines lines
+// are kept, with a truncation notice recording how many were dropped.
+func TestEmitPodLogs_TruncatesLongOutput(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "datamover-test-pod", Namespace: "openshift-adp"}}
+
+	const totalLines = maxEmittedPodLogLines + 50
+	var sb strings.Builder
+	for i := 1; i <= totalLines; i++ {
+		fmt.Fprintf(&sb, "line-%d\n", i)
+	}
+
+	var logBuf bytes.Buffer
+	logger := funcr.New(func(prefix, args string) {
+		logBuf.WriteString(args + "\n")
+	}, funcr.Options{})
+
+	r := &KubeVirtDataUploadReconciler{
+		PodLogCollector: func(ctx context.Context, podName, podNamespace string) (string, error) {
+			return sb.String(), nil
+		},
+	}
+
+	r.emitPodLogs(context.Background(), logger, pod)
+
+	output := logBuf.String()
+	if got := strings.Count(output, "\"message\"=\"line-"); got != maxEmittedPodLogLines {
+		t.Errorf("expected %d emitted lines, got %d", maxEmittedPodLogLines, got)
+	}
+	if !strings.Contains(output, "Datamover pod log truncated") {
+		t.Error("expected a truncation notice, found none")
+	}
+	if !strings.Contains(output, fmt.Sprintf("\"skippedLeadingLines\"=%d", totalLines-maxEmittedPodLogLines)) {
+		t.Errorf("expected skippedLeadingLines=%d in the truncation notice, output: %s", totalLines-maxEmittedPodLogLines, output)
+	}
+	if strings.Contains(output, "\"message\"=\"line-1\"") {
+		t.Error("expected the earliest lines to be dropped, but line-1 was emitted")
+	}
+	if !strings.Contains(output, fmt.Sprintf("\"message\"=\"line-%d\"", totalLines)) {
+		t.Errorf("expected the final line (line-%d) to be kept", totalLines)
+	}
+}
+
 func TestHandleInProgress_PodLogCollectionFailureDoesNotBlock(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)

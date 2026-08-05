@@ -18,6 +18,7 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/downloader"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
@@ -1899,6 +1901,51 @@ func TestCompleteSuccessfulDownload_EmitsRetainedPVEvent(t *testing.T) {
 		}
 	default:
 		t.Error("expected an Event to be recorded for the retained PV, got none")
+	}
+}
+
+// TestEmitPodLogsDataDownload_TruncatesLongOutput covers #154: a downloader
+// pod that produced a very large log (e.g. a crash loop with verbose output)
+// must not flood the controller's own logs unbounded -- only the last
+// maxEmittedPodLogLines lines are kept, with a truncation notice recording how
+// many were dropped.
+func TestEmitPodLogsDataDownload_TruncatesLongOutput(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "downloader-test-pod", Namespace: "openshift-adp"}}
+
+	const totalLines = maxEmittedPodLogLines + 50
+	var sb strings.Builder
+	for i := 1; i <= totalLines; i++ {
+		fmt.Fprintf(&sb, "line-%d\n", i)
+	}
+
+	var logBuf bytes.Buffer
+	logger := funcr.New(func(prefix, args string) {
+		logBuf.WriteString(args + "\n")
+	}, funcr.Options{})
+
+	r := &KubeVirtDataDownloadReconciler{
+		PodLogCollector: func(ctx context.Context, podName, podNamespace string) (string, error) {
+			return sb.String(), nil
+		},
+	}
+
+	r.emitPodLogs(context.Background(), logger, pod)
+
+	output := logBuf.String()
+	if got := strings.Count(output, "\"message\"=\"line-"); got != maxEmittedPodLogLines {
+		t.Errorf("expected %d emitted lines, got %d", maxEmittedPodLogLines, got)
+	}
+	if !strings.Contains(output, "Downloader pod log truncated") {
+		t.Error("expected a truncation notice, found none")
+	}
+	if !strings.Contains(output, fmt.Sprintf("\"skippedLeadingLines\"=%d", totalLines-maxEmittedPodLogLines)) {
+		t.Errorf("expected skippedLeadingLines=%d in the truncation notice, output: %s", totalLines-maxEmittedPodLogLines, output)
+	}
+	if strings.Contains(output, "\"message\"=\"line-1\"") {
+		t.Error("expected the earliest lines to be dropped, but line-1 was emitted")
+	}
+	if !strings.Contains(output, fmt.Sprintf("\"message\"=\"line-%d\"", totalLines)) {
+		t.Errorf("expected the final line (line-%d) to be kept", totalLines)
 	}
 }
 

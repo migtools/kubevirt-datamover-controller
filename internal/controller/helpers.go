@@ -46,6 +46,13 @@ const DefaultOperationTimeout = 4 * time.Hour
 // is treated by controller-runtime as "don't requeue," not "requeue now."
 const immediateRequeueDelay = time.Second
 
+// maxEmittedPodLogLines caps how many lines of a datamover/downloader pod's
+// log emitPodLogs re-emits through the controller's own logger. A pod that
+// produced a very large log (e.g. a crash loop with verbose output) would
+// otherwise flood the controller's logs with no bound; keeping only the last
+// N lines still surfaces the most relevant (final) output.
+const maxEmittedPodLogLines = 200
+
 // operationTimeoutExceeded reports whether the time elapsed since acceptedAt
 // exceeds the effective operation timeout: specTimeout when positive, otherwise
 // DefaultOperationTimeout. Returns exceeded=false if acceptedAt is nil (nothing

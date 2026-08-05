@@ -1128,11 +1128,22 @@ func (r *KubeVirtDataUploadReconciler) emitPodLogs(ctx context.Context, logger l
 		return
 	}
 	lines := strings.Split(strings.TrimRight(logs, "\n"), "\n")
+	skipped := 0
+	if len(lines) > maxEmittedPodLogLines {
+		skipped = len(lines) - maxEmittedPodLogLines
+		lines = lines[skipped:]
+	}
+	if skipped > 0 {
+		logger.Info("Datamover pod log truncated",
+			"source", "datamover-pod",
+			"pod", pod.Name,
+			"skippedLeadingLines", skipped)
+	}
 	for i, line := range lines {
 		logger.Info("Datamover pod log",
 			"source", "datamover-pod",
 			"pod", pod.Name,
-			"line", i+1,
+			"line", skipped+i+1,
 			"message", line)
 	}
 }
