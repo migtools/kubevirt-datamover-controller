@@ -24,13 +24,25 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
 	"math/big"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
+)
+
+const (
+	testSSEAES256     = "AES256"
+	testChecksumCRC32 = "CRC32"
 )
 
 // fullKeyTestCases is shared across S3, GCP, and Azure fullKey tests
@@ -480,9 +492,17 @@ func TestInitWithAllS3CompatibleOptions(t *testing.T) {
 		"s3ForcePathStyle":      "true",
 		"insecureSkipTLSVerify": "false",
 		"caCert":                caCert,
+		"serverSideEncryption":  testSSEAES256,
+		"checksumAlgorithm":     testChecksumCRC32,
 	})
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
+	}
+	if store.serverSideEncryption != testSSEAES256 {
+		t.Errorf("serverSideEncryption = %q, want AES256", store.serverSideEncryption)
+	}
+	if store.checksumAlgorithm != testChecksumCRC32 {
+		t.Errorf("checksumAlgorithm = %q, want CRC32", store.checksumAlgorithm)
 	}
 }
 
@@ -543,6 +563,189 @@ func TestInitObjectStoreWithS3SettingsDefaultProvider(t *testing.T) {
 	}
 }
 
+func TestInitWithServerSideEncryption(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  map[string]string
+		wantSSE string
+		wantKMS string
+	}{
+		{
+			name: testSSEAES256,
+			config: map[string]string{
+				"bucket":               "test-bucket",
+				"serverSideEncryption": testSSEAES256,
+			},
+			wantSSE: testSSEAES256,
+		},
+		{
+			name: "aws:kms with kmsKeyId",
+			config: map[string]string{
+				"bucket":               "test-bucket",
+				"serverSideEncryption": "aws:kms",
+				"kmsKeyId":             "arn:aws:kms:us-east-1:123456789:key/test-key-id",
+			},
+			wantSSE: "aws:kms",
+			wantKMS: "arn:aws:kms:us-east-1:123456789:key/test-key-id",
+		},
+		{
+			name: "aws:kms:dsse",
+			config: map[string]string{
+				"bucket":               "test-bucket",
+				"serverSideEncryption": "aws:kms:dsse",
+				"kmsKeyId":             "arn:aws:kms:us-east-1:123456789:key/test-key-id",
+			},
+			wantSSE: "aws:kms:dsse",
+			wantKMS: "arn:aws:kms:us-east-1:123456789:key/test-key-id",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &S3ObjectStore{}
+			err := store.Init(tt.config)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if store.serverSideEncryption != tt.wantSSE {
+				t.Errorf("serverSideEncryption = %q, want %q", store.serverSideEncryption, tt.wantSSE)
+			}
+			if store.kmsKeyId != tt.wantKMS {
+				t.Errorf("kmsKeyId = %q, want %q", store.kmsKeyId, tt.wantKMS)
+			}
+		})
+	}
+}
+
+func TestInitWithChecksumAlgorithm(t *testing.T) {
+	validAlgorithms := []string{testChecksumCRC32, "CRC32C", "SHA1", "SHA256", "crc32", "sha256"}
+	for _, algo := range validAlgorithms {
+		t.Run("valid_"+algo, func(t *testing.T) {
+			store := &S3ObjectStore{}
+			err := store.Init(map[string]string{
+				"bucket":            "test-bucket",
+				"checksumAlgorithm": algo,
+			})
+			if err != nil {
+				t.Fatalf("unexpected error for algorithm %q: %v", algo, err)
+			}
+			if store.checksumAlgorithm == "" {
+				t.Error("checksumAlgorithm should be set")
+			}
+		})
+	}
+
+	t.Run("invalid algorithm", func(t *testing.T) {
+		store := &S3ObjectStore{}
+		err := store.Init(map[string]string{
+			"bucket":            "test-bucket",
+			"checksumAlgorithm": "MD5",
+		})
+		if err == nil {
+			t.Fatal("expected error for unsupported algorithm")
+		}
+	})
+}
+
+func writeSSECKeyFile(t *testing.T, data []byte) string {
+	t.Helper()
+	tmpFile, err := os.CreateTemp("", "sse-c-key-*")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(tmpFile.Name()) })
+	if _, err := tmpFile.Write(data); err != nil {
+		t.Fatalf("failed to write key: %v", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		t.Fatalf("failed to close temp file: %v", err)
+	}
+	return tmpFile.Name()
+}
+
+func TestInitWithSSECKeyFile(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	keyFile := writeSSECKeyFile(t, key)
+
+	store := &S3ObjectStore{}
+	err := store.Init(map[string]string{
+		"bucket":                    "test-bucket",
+		"customerKeyEncryptionFile": keyFile,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.sseCustomerAlgorithm != testSSEAES256 {
+		t.Errorf("sseCustomerAlgorithm = %q, want AES256", store.sseCustomerAlgorithm)
+	}
+	if store.sseCustomerKey == "" {
+		t.Error("sseCustomerKey should be set")
+	}
+	if store.sseCustomerKeyMD5 == "" {
+		t.Error("sseCustomerKeyMD5 should be set")
+	}
+}
+
+func TestInitSSECKeyFileWrongSize(t *testing.T) {
+	keyFile := writeSSECKeyFile(t, []byte("too-short"))
+
+	store := &S3ObjectStore{}
+	err := store.Init(map[string]string{
+		"bucket":                    "test-bucket",
+		"customerKeyEncryptionFile": keyFile,
+	})
+	if err == nil {
+		t.Fatal("expected error for wrong key size")
+	}
+}
+
+func TestInitSSECMutualExclusivity(t *testing.T) {
+	keyFile := writeSSECKeyFile(t, make([]byte, 32))
+
+	store := &S3ObjectStore{}
+	err := store.Init(map[string]string{
+		"bucket":                    "test-bucket",
+		"customerKeyEncryptionFile": keyFile,
+		"kmsKeyId":                  "arn:aws:kms:us-east-1:123456789:key/test",
+	})
+	if err == nil {
+		t.Fatal("expected error when both customerKeyEncryptionFile and kmsKeyId are set")
+	}
+}
+
+func TestInitObjectStoreWithEncryptionSettings(t *testing.T) {
+	cfg := &common.ObjectStoreConfig{
+		BSLProvider:             "aws",
+		BSLBucket:               "test-bucket",
+		BSLRegion:               "us-east-1",
+		BSLServerSideEncryption: testSSEAES256,
+		BSLChecksumAlgorithm:    testChecksumCRC32,
+	}
+
+	store, err := InitObjectStore(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store == nil {
+		t.Fatal("expected non-nil store")
+	}
+}
+
+func TestInitWithBooleanParsing(t *testing.T) {
+	store := &S3ObjectStore{}
+	err := store.Init(map[string]string{
+		"bucket":                "test-bucket",
+		"s3ForcePathStyle":      "1",
+		"insecureSkipTLSVerify": "t",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // generateTestCACertPEM creates a self-signed CA certificate PEM at runtime for testing.
 func generateTestCACertPEM(t *testing.T) string {
 	t.Helper()
@@ -571,4 +774,212 @@ func generateTestCACertPEM(t *testing.T) string {
 		t.Fatalf("failed to encode PEM: %v", err)
 	}
 	return buf.String()
+}
+
+// capturingTransport is an http.RoundTripper that records requests and returns
+// a canned S3-compatible response so the SDK doesn't error.
+type capturingTransport struct {
+	mu       sync.Mutex
+	requests []*http.Request
+}
+
+func (ct *capturingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Drain the request body so the SDK's checksum computation can complete.
+	if req.Body != nil {
+		_, _ = io.Copy(io.Discard, req.Body)
+		_ = req.Body.Close()
+	}
+
+	ct.mu.Lock()
+	ct.requests = append(ct.requests, req.Clone(req.Context()))
+	ct.mu.Unlock()
+
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Etag":         {`"d41d8cd98f00b204e9800998ecf8427e"`},
+			"Content-Type": {"application/octet-stream"},
+		},
+		Body: io.NopCloser(strings.NewReader("test-content")),
+	}, nil
+}
+
+func (t *capturingTransport) lastRequest() *http.Request {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.requests) == 0 {
+		return nil
+	}
+	return t.requests[len(t.requests)-1]
+}
+
+// newTestS3StoreWithTransport creates an S3ObjectStore with a custom HTTP
+// transport for intercepting requests. The store is configured with the
+// given encryption/checksum fields already set.
+func newTestS3StoreWithTransport(t *testing.T, transport http.RoundTripper, opts func(*S3ObjectStore)) *S3ObjectStore {
+	t.Helper()
+	httpClient := &http.Client{Transport: transport}
+	client := s3.New(s3.Options{
+		Region:      "us-east-1",
+		HTTPClient:  httpClient,
+		Credentials: aws.AnonymousCredentials{},
+	})
+	store := &S3ObjectStore{
+		client:   client,
+		uploader: transfermanager.New(client),
+		bucket:   "test-bucket",
+	}
+	if opts != nil {
+		opts(store)
+	}
+	return store
+}
+
+func TestPutObjectSendsSSEHeaders(t *testing.T) {
+	transport := &capturingTransport{}
+	store := newTestS3StoreWithTransport(t, transport, func(s *S3ObjectStore) {
+		s.serverSideEncryption = testSSEAES256
+	})
+
+	err := store.PutObject("test-bucket", "test-key", strings.NewReader("data"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	req := transport.lastRequest()
+	if req == nil {
+		t.Fatal("no request captured")
+	}
+	got := req.Header.Get("X-Amz-Server-Side-Encryption")
+	if got != testSSEAES256 {
+		t.Errorf("X-Amz-Server-Side-Encryption = %q, want %q", got, testSSEAES256)
+	}
+}
+
+func TestPutObjectSendsKMSHeaders(t *testing.T) {
+	transport := &capturingTransport{}
+	kmsKey := "arn:aws:kms:us-east-1:123456789:key/test-key-id"
+	store := newTestS3StoreWithTransport(t, transport, func(s *S3ObjectStore) {
+		s.serverSideEncryption = "aws:kms"
+		s.kmsKeyId = kmsKey
+	})
+
+	err := store.PutObject("test-bucket", "test-key", strings.NewReader("data"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	req := transport.lastRequest()
+	if req == nil {
+		t.Fatal("no request captured")
+	}
+	if got := req.Header.Get("X-Amz-Server-Side-Encryption"); got != "aws:kms" {
+		t.Errorf("X-Amz-Server-Side-Encryption = %q, want aws:kms", got)
+	}
+	if got := req.Header.Get("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id"); got != kmsKey {
+		t.Errorf("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id = %q, want %q", got, kmsKey)
+	}
+}
+
+func TestPutObjectSendsChecksumHeader(t *testing.T) {
+	transport := &capturingTransport{}
+	store := newTestS3StoreWithTransport(t, transport, func(s *S3ObjectStore) {
+		s.checksumAlgorithm = testChecksumCRC32
+	})
+
+	err := store.PutObject("test-bucket", "test-key", strings.NewReader("data"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	req := transport.lastRequest()
+	if req == nil {
+		t.Fatal("no request captured")
+	}
+	// The SDK sends x-amz-sdk-checksum-algorithm to indicate which algorithm is used,
+	// and the actual checksum value may be sent as a trailing header.
+	foundChecksum := false
+	for key := range req.Header {
+		lower := strings.ToLower(key)
+		if strings.Contains(lower, "checksum") {
+			foundChecksum = true
+			break
+		}
+	}
+	if !foundChecksum {
+		t.Errorf("expected a checksum-related header, got none. Headers: %v", req.Header)
+	}
+}
+
+func TestPutObjectSendsSSECHeaders(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	keyFile := writeSSECKeyFile(t, key)
+
+	// Init to compute the base64/MD5 values, then copy to a transport-backed store
+	initStore := &S3ObjectStore{}
+	err := initStore.Init(map[string]string{
+		"bucket":                    "test-bucket",
+		"customerKeyEncryptionFile": keyFile,
+	})
+	if err != nil {
+		t.Fatalf("Init error: %v", err)
+	}
+
+	transport := &capturingTransport{}
+	store := newTestS3StoreWithTransport(t, transport, func(s *S3ObjectStore) {
+		s.sseCustomerAlgorithm = initStore.sseCustomerAlgorithm
+		s.sseCustomerKey = initStore.sseCustomerKey
+		s.sseCustomerKeyMD5 = initStore.sseCustomerKeyMD5
+	})
+
+	err = store.PutObject("test-bucket", "test-key", strings.NewReader("data"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	req := transport.lastRequest()
+	if req == nil {
+		t.Fatal("no request captured")
+	}
+	if got := req.Header.Get("X-Amz-Server-Side-Encryption-Customer-Algorithm"); got != testSSEAES256 {
+		t.Errorf("SSE-C algorithm header = %q, want %q", got, testSSEAES256)
+	}
+	if got := req.Header.Get("X-Amz-Server-Side-Encryption-Customer-Key"); got == "" {
+		t.Error("SSE-C key header should be set")
+	}
+	if got := req.Header.Get("X-Amz-Server-Side-Encryption-Customer-Key-Md5"); got == "" {
+		t.Error("SSE-C key MD5 header should be set")
+	}
+}
+
+func TestGetObjectSendsSSECHeaders(t *testing.T) {
+	transport := &capturingTransport{}
+	store := newTestS3StoreWithTransport(t, transport, func(s *S3ObjectStore) {
+		s.sseCustomerAlgorithm = testSSEAES256
+		s.sseCustomerKey = "dGVzdC1rZXktYmFzZTY0LWVuY29kZWQ="
+		s.sseCustomerKeyMD5 = "dGVzdC1tZDU="
+	})
+
+	body, err := store.GetObject("test-bucket", "test-key")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_ = body.Close()
+
+	req := transport.lastRequest()
+	if req == nil {
+		t.Fatal("no request captured")
+	}
+	if got := req.Header.Get("X-Amz-Server-Side-Encryption-Customer-Algorithm"); got != testSSEAES256 {
+		t.Errorf("SSE-C algorithm header = %q, want %q", got, testSSEAES256)
+	}
+	if got := req.Header.Get("X-Amz-Server-Side-Encryption-Customer-Key"); got == "" {
+		t.Error("SSE-C key header should be set on GET")
+	}
+	if got := req.Header.Get("X-Amz-Server-Side-Encryption-Customer-Key-Md5"); got == "" {
+		t.Error("SSE-C key MD5 header should be set on GET")
+	}
 }

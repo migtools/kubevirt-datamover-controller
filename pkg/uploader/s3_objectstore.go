@@ -19,8 +19,10 @@ package uploader
 import (
 	"bytes"
 	"context"
+	"crypto/md5" //nolint:gosec // MD5 required by AWS SSE-C protocol
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -30,10 +32,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
+	tmtypes "github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
@@ -48,11 +53,19 @@ type S3ObjectStore struct {
 	uploader *transfermanager.Client
 	bucket   string
 	prefix   string
+
+	serverSideEncryption string
+	kmsKeyId             string
+	checksumAlgorithm    string
+	sseCustomerAlgorithm string
+	sseCustomerKey       string
+	sseCustomerKeyMD5    string
 }
 
 // NewS3ObjectStore creates a new S3ObjectStore from a config map.
 // Supported keys: bucket, prefix, region, credentialsFile, credentialsData,
-// s3Url, s3ForcePathStyle, insecureSkipTLSVerify, caCert.
+// s3Url, s3ForcePathStyle, insecureSkipTLSVerify, caCert,
+// serverSideEncryption, kmsKeyId, checksumAlgorithm, customerKeyEncryptionFile.
 func NewS3ObjectStore(configMap map[string]string) (*S3ObjectStore, error) {
 	store := &S3ObjectStore{
 		bucket: configMap["bucket"],
@@ -69,7 +82,8 @@ func NewS3ObjectStore(configMap map[string]string) (*S3ObjectStore, error) {
 // Init initializes the ObjectStore with the provided config.
 // This implements velero.ObjectStore.Init().
 // Expected config keys: bucket, prefix, region, credentialsFile, credentialsData,
-// s3Url, s3ForcePathStyle, insecureSkipTLSVerify, caCert.
+// s3Url, s3ForcePathStyle, insecureSkipTLSVerify, caCert,
+// serverSideEncryption, kmsKeyId, checksumAlgorithm, customerKeyEncryptionFile.
 // Credential parsing is delegated to the AWS SDK via
 // config.WithSharedCredentialsFiles, matching Velero's approach.
 func (s *S3ObjectStore) Init(configMap map[string]string) error {
@@ -123,7 +137,7 @@ func (s *S3ObjectStore) Init(configMap map[string]string) error {
 
 	// Configure custom TLS for S3-compatible endpoints with private CAs
 	// or when TLS verification needs to be skipped.
-	insecureSkipTLSVerify := strings.EqualFold(configMap["insecureSkipTLSVerify"], "true")
+	insecureSkipTLSVerify := common.ParseBool(configMap["insecureSkipTLSVerify"])
 	caCert := configMap["caCert"]
 	if insecureSkipTLSVerify || caCert != "" {
 		httpClient, err := buildTLSHTTPClient(insecureSkipTLSVerify, caCert)
@@ -140,7 +154,7 @@ func (s *S3ObjectStore) Init(configMap map[string]string) error {
 
 	// Apply S3-specific options: custom endpoint URL and path-style addressing.
 	s3URL := configMap["s3Url"]
-	forcePathStyle := strings.EqualFold(configMap["s3ForcePathStyle"], "true")
+	forcePathStyle := common.ParseBool(configMap["s3ForcePathStyle"])
 
 	if s3URL != "" {
 		if !isValidS3URLScheme(s3URL) {
@@ -160,6 +174,36 @@ func (s *S3ObjectStore) Init(configMap map[string]string) error {
 		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 	})
 
+	// Configure server-side encryption
+	s.serverSideEncryption = configMap["serverSideEncryption"]
+	s.kmsKeyId = configMap["kmsKeyId"]
+
+	// Configure checksum algorithm
+	if algo := configMap["checksumAlgorithm"]; algo != "" {
+		upper := strings.ToUpper(algo)
+		switch upper {
+		case "CRC32", "CRC32C", "SHA1", "SHA256":
+			s.checksumAlgorithm = upper
+		default:
+			return fmt.Errorf("unsupported checksumAlgorithm %q: must be CRC32, CRC32C, SHA1, or SHA256", algo)
+		}
+	}
+
+	// Configure SSE-C (customer-provided encryption key)
+	if customerKeyFile := configMap["customerKeyEncryptionFile"]; customerKeyFile != "" {
+		if s.kmsKeyId != "" {
+			return fmt.Errorf("customerKeyEncryptionFile cannot be used with kmsKeyId")
+		}
+		sseKey, err := loadSSECKey(customerKeyFile)
+		if err != nil {
+			return fmt.Errorf("failed to load SSE-C key: %w", err)
+		}
+		s.sseCustomerAlgorithm = "AES256"
+		s.sseCustomerKey = base64.StdEncoding.EncodeToString(sseKey)
+		hash := md5.Sum(sseKey) //nolint:gosec // MD5 required by AWS SSE-C protocol
+		s.sseCustomerKeyMD5 = base64.StdEncoding.EncodeToString(hash[:])
+	}
+
 	return nil
 }
 
@@ -174,11 +218,26 @@ func (s *S3ObjectStore) fullKey(key string) string {
 // PutObject uploads an object to S3.
 // Implements velero.ObjectStore.PutObject().
 func (s *S3ObjectStore) PutObject(bucket, key string, body io.Reader) error {
-	_, err := s.uploader.UploadObject(context.Background(), &transfermanager.UploadObjectInput{
+	input := &transfermanager.UploadObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(s.fullKey(key)),
 		Body:   body,
-	})
+	}
+	if s.serverSideEncryption != "" {
+		input.ServerSideEncryption = tmtypes.ServerSideEncryption(s.serverSideEncryption)
+	}
+	if s.kmsKeyId != "" {
+		input.SSEKMSKeyID = aws.String(s.kmsKeyId)
+	}
+	if s.checksumAlgorithm != "" {
+		input.ChecksumAlgorithm = tmtypes.ChecksumAlgorithm(s.checksumAlgorithm)
+	}
+	if s.sseCustomerAlgorithm != "" {
+		input.SSECustomerAlgorithm = aws.String(s.sseCustomerAlgorithm)
+		input.SSECustomerKey = aws.String(s.sseCustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(s.sseCustomerKeyMD5)
+	}
+	_, err := s.uploader.UploadObject(context.Background(), input)
 	if err != nil {
 		return fmt.Errorf("failed to upload object %s: %w", key, err)
 	}
@@ -188,10 +247,16 @@ func (s *S3ObjectStore) PutObject(bucket, key string, body io.Reader) error {
 // GetObject retrieves an object from S3.
 // Implements velero.ObjectStore.GetObject().
 func (s *S3ObjectStore) GetObject(bucket, key string) (io.ReadCloser, error) {
-	output, err := s.client.GetObject(context.Background(), &s3.GetObjectInput{
+	input := &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(s.fullKey(key)),
-	})
+	}
+	if s.sseCustomerAlgorithm != "" {
+		input.SSECustomerAlgorithm = aws.String(s.sseCustomerAlgorithm)
+		input.SSECustomerKey = aws.String(s.sseCustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(s.sseCustomerKeyMD5)
+	}
+	output, err := s.client.GetObject(context.Background(), input)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get object %s: %w", key, err)
 	}
@@ -201,10 +266,16 @@ func (s *S3ObjectStore) GetObject(bucket, key string) (io.ReadCloser, error) {
 // ObjectExists checks if an object exists in S3.
 // Implements velero.ObjectStore.ObjectExists().
 func (s *S3ObjectStore) ObjectExists(bucket, key string) (bool, error) {
-	_, err := s.client.HeadObject(context.Background(), &s3.HeadObjectInput{
+	input := &s3.HeadObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(s.fullKey(key)),
-	})
+	}
+	if s.sseCustomerAlgorithm != "" {
+		input.SSECustomerAlgorithm = aws.String(s.sseCustomerAlgorithm)
+		input.SSECustomerKey = aws.String(s.sseCustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(s.sseCustomerKeyMD5)
+	}
+	_, err := s.client.HeadObject(context.Background(), input)
 	if err != nil {
 		// Check if it's a not found error using AWS SDK error types
 		var notFound *s3types.NotFound
@@ -360,6 +431,18 @@ func buildTLSHTTPClient(insecureSkipTLSVerify bool, caCert string) (*http.Client
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.TLSClientConfig = tlsConfig
 	return &http.Client{Transport: tr}, nil
+}
+
+// loadSSECKey reads a 32-byte SSE-C encryption key from the given file path.
+func loadSSECKey(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read SSE-C key file %q: %w", path, err)
+	}
+	if len(data) != 32 {
+		return nil, fmt.Errorf("SSE-C key must be exactly 32 bytes, got %d", len(data))
+	}
+	return data, nil
 }
 
 // writeCredentialsToTempFile writes credential data to a temporary file and returns
