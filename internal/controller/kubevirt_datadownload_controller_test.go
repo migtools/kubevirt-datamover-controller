@@ -2583,6 +2583,52 @@ func TestHandleCancelingDataDownload_PodCleanupFailureDoesNotPersistCanceled(t *
 	}
 }
 
+// TestHandleCancelingDataDownload_ScratchPVCDeleteFailureDoesNotPersistCanceled
+// covers the same terminal-phase contract as the pod-cleanup-failure test
+// above, but for the scratch PVC delete step: Canceled is terminal (no further
+// reconciliation ever runs for this object once it persists), so a swallowed
+// scratch PVC delete failure would leak it forever with nothing left to retry
+// the delete -- deleteAllScratchPVCs must propagate the failure instead of the
+// best-effort cleanupScratchPVCIfPresent used by other, non-terminal paths.
+func TestHandleCancelingDataDownload_ScratchPVCDeleteFailureDoesNotPersistCanceled(t *testing.T) {
+	f := newDDTestFixture(t)
+	scheme := ddScheme()
+	scratchPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "scratch-pvc-1", Namespace: "openshift-adp",
+			Labels: map[string]string{common.LabelDataDownloadUID: string(f.dd.UID)},
+		},
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, scratchPVC).Build()
+	interceptedClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if _, ok := obj.(*corev1.PersistentVolumeClaim); ok {
+				return fmt.Errorf("simulated delete failure")
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	r := &KubeVirtDataDownloadReconciler{Client: interceptedClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+	if _, err := r.handleCanceling(context.Background(), logr.Discard(), f.dd); err == nil {
+		t.Fatal("expected an error when the scratch PVC can't be deleted, got nil")
+	}
+
+	var updated velerov2alpha1.DataDownload
+	if err := baseClient.Get(context.Background(), types.NamespacedName{Name: f.dd.Name, Namespace: f.dd.Namespace}, &updated); err != nil {
+		t.Fatalf("failed to get DataDownload: %v", err)
+	}
+	if updated.Status.Phase == velerov2alpha1.DataDownloadPhaseCanceled {
+		t.Error("phase must not be Canceled until scratch PVC cleanup actually succeeds")
+	}
+
+	var pvcs corev1.PersistentVolumeClaimList
+	_ = baseClient.List(context.Background(), &pvcs)
+	if len(pvcs.Items) != 1 {
+		t.Errorf("expected scratch PVC to still exist (delete failed), found %d", len(pvcs.Items))
+	}
+}
+
 func TestBuildDownloaderPodConfig(t *testing.T) {
 	f := newDDTestFixture(t)
 	f.bsl.Spec.Provider = "azure"

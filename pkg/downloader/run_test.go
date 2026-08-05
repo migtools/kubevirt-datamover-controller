@@ -32,6 +32,7 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv(EnvVeleroBackupName, "test-backup")
 	t.Setenv(EnvTargetVolume, "disk1")
 	t.Setenv(EnvTargetPath, "")
+	t.Setenv(EnvTargetIsBlockDevice, "")
 	t.Setenv(EnvScratchPath, "")
 	t.Setenv(common.EnvCredentialsFile, "")
 	t.Setenv(EnvDataDownloadName, "")
@@ -43,6 +44,14 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv(common.EnvBSLS3ForcePathStyle, "")
 	t.Setenv(common.EnvBSLInsecureSkipTLSVerify, "")
 	t.Setenv(common.EnvBSLCACert, "")
+	t.Setenv(common.EnvBSLServiceAccount, "")
+	t.Setenv(common.EnvBSLResourceGroup, "")
+	t.Setenv(common.EnvBSLStorageAccount, "")
+	t.Setenv(common.EnvBSLStorageAccountKeyEnvVar, "")
+	t.Setenv(common.EnvBSLStorageAccountURI, "")
+	t.Setenv(common.EnvBSLSubscriptionID, "")
+	t.Setenv(common.EnvBSLUseAAD, "")
+	t.Setenv(common.EnvBSLActiveDirectoryAuthorityURI, "")
 }
 
 func TestLoadConfigFromEnv(t *testing.T) {

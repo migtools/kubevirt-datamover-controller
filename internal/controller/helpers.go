@@ -222,7 +222,14 @@ func listPodByUID(ctx context.Context, reader client.Reader, uidLabelKey, uid, n
 // after the delete calls (Delete only requests removal -- kubelet must still
 // terminate containers and unmount volumes before the pod object actually
 // disappears).
-func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid, namespace string, logger logr.Logger) bool {
+//
+// apiReader is an uncached client used for the confirmation re-list only, if
+// non-nil: a cached client's informer can still show a pod that Delete just
+// removed moments ago (the same staleness findPodByUID guards against, just
+// in the opposite direction -- here a stale cache can report a pod as still
+// present when it's actually already gone), which would otherwise report a
+// false "still present" and needlessly retry a cleanup that already succeeded.
+func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, apiReader client.Reader, uidLabelKey, uid, namespace string, logger logr.Logger) bool {
 	podList := &corev1.PodList{}
 	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
 		logger.Error(err, "Failed to list datamover pods for cleanup")
@@ -245,11 +252,16 @@ func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, uidLabelKey,
 		return true
 	}
 
-	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
-		logger.Error(err, "Failed to re-check datamover pods after delete")
+	confirmReader := client.Reader(k8sClient)
+	if apiReader != nil {
+		confirmReader = apiReader
+	}
+	remaining := &corev1.PodList{}
+	if err := confirmReader.List(ctx, remaining, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
+		logger.Error(err, "Failed to re-list datamover pods after cleanup")
 		return true
 	}
-	return len(podList.Items) > 0
+	return len(remaining.Items) > 0
 }
 
 // extractPodFailureMessage extracts the failure message from a failed pod.

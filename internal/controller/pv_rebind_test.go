@@ -267,7 +267,58 @@ func TestValidateExistingPVCForBind(t *testing.T) {
 	}
 }
 
-// TestCreateNewBoundPVC_AlreadyExistsReturnsRealUID covers the BindTargetCreate
+// TestFindPVByUIDLabel covers findPVByUIDLabel's own contract: zero matches
+// returns (nil, nil), exactly one match returns it, and (per the fix for a
+// CodeRabbit-flagged finding) multiple matches must error rather than
+// silently picking the first one -- callers (resolveSourcePV's crash-recovery
+// path, cleanupReboundPVCAndPV's cleanup-by-label fallback) both rebind or
+// delete based on this result, so guessing among ambiguous matches risks
+// operating on the wrong PV.
+func TestFindPVByUIDLabel(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	const labelKey = "velero.io/datadownload-uid"
+	const uid = "uid-123"
+
+	t.Run("no matches returns nil, nil", func(t *testing.T) {
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		got, err := findPVByUIDLabel(context.Background(), fakeClient, labelKey, uid)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != nil {
+			t.Errorf("expected nil, got %+v", got)
+		}
+	})
+
+	t.Run("exactly one match returns it", func(t *testing.T) {
+		pv := &corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: "pv-1", Labels: map[string]string{labelKey: uid}},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pv).Build()
+		got, err := findPVByUIDLabel(context.Background(), fakeClient, labelKey, uid)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got == nil || got.Name != "pv-1" {
+			t.Errorf("expected pv-1, got %+v", got)
+		}
+	})
+
+	t.Run("multiple matches errors instead of picking one arbitrarily", func(t *testing.T) {
+		pv1 := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-1", Labels: map[string]string{labelKey: uid}}}
+		pv2 := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pv-2", Labels: map[string]string{labelKey: uid}}}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pv1, pv2).Build()
+		got, err := findPVByUIDLabel(context.Background(), fakeClient, labelKey, uid)
+		if err == nil {
+			t.Fatalf("expected an error when multiple PVs match, got nil (picked %+v)", got)
+		}
+		if got != nil {
+			t.Errorf("expected nil result alongside the error, got %+v", got)
+		}
+	})
+}
+
 // race where two invocations (e.g. two reconciles) generate the same auto-named
 // PVC and the second one's Create call fails with AlreadyExists. Create leaves
 // the local object's ObjectMeta untouched on failure, so without re-fetching,
@@ -738,6 +789,118 @@ func TestRebindPVToNamespace_RecoversAfterSourcePVCDeletedMidCrash(t *testing.T)
 	}
 	if pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.Name != targetPVC.Name || pv.Spec.ClaimRef.Namespace != targetPVC.Namespace {
 		t.Errorf("PV claimRef = %+v, want %s/%s", pv.Spec.ClaimRef, targetPVC.Namespace, targetPVC.Name)
+	}
+}
+
+// TestRebindPVToNamespace_RecoversAfterSourcePVCDeletedMidCrash_BindTargetCreate
+// covers the same #153 recovery as the test above, but for the BindTargetCreate
+// path (the upload controller's own rebind) instead of BindTargetExisting:
+// when resolveSourcePV recovers via UID-label search (sourcePVCAlreadyGone),
+// Step 4's createNewBoundPVC must derive the new PVC's AccessModes/Resources/
+// StorageClassName/VolumeMode from the recovered PV (pvcSpecFromPV), not the
+// zero-value sourcePVC placeholder resolveSourcePV returns in that case --
+// otherwise the auto-created destination PVC comes out with no capacity,
+// storage class, or volume mode at all.
+func TestRebindPVToNamespace_RecoversAfterSourcePVCDeletedMidCrash_BindTargetCreate(t *testing.T) {
+	origInterval, origTimeout := pvRebindPollInterval, pvRebindTimeout
+	pvRebindPollInterval = 10 * time.Millisecond
+	pvRebindTimeout = 2 * time.Second
+	defer func() {
+		pvRebindPollInterval = origInterval
+		pvRebindTimeout = origTimeout
+	}()
+	pvRebindTimeout := pvRebindTimeout
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	sourcePV := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "pv-backup",
+			Labels: map[string]string{"velero.io/dataupload-uid": "uid-456"},
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			Capacity:                      corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("5Gi")},
+			AccessModes:                   []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimDelete,
+			StorageClassName:              "standard",
+			VolumeMode:                    new(corev1.PersistentVolumeFilesystem),
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sourcePV).Build()
+
+	newPVCName := common.SafeResourceName(common.ReboundPVCNamePrefix, "test-du")
+	targetNamespace := "oadp-ns"
+
+	binderDone := make(chan struct{})
+	var statusUpdateErr error
+	go func() {
+		defer close(binderDone)
+		deadline := time.Now().Add(pvRebindTimeout)
+		for time.Now().Before(deadline) {
+			pv := &corev1.PersistentVolume{}
+			if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: sourcePV.Name}, pv); err != nil {
+				statusUpdateErr = fmt.Errorf("get PV: %w", err)
+				return
+			}
+			if pv.Spec.ClaimRef != nil && pv.Spec.ClaimRef.Name == newPVCName && pv.Spec.ClaimRef.Namespace == targetNamespace {
+				pvc := &corev1.PersistentVolumeClaim{}
+				if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: newPVCName, Namespace: targetNamespace}, pvc); err != nil {
+					statusUpdateErr = fmt.Errorf("get target PVC: %w", err)
+					return
+				}
+				pvc.Status.Phase = corev1.ClaimBound
+				statusUpdateErr = fakeClient.Status().Update(context.Background(), pvc)
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		statusUpdateErr = fmt.Errorf("timed out waiting for PV %s claimRef to name target PVC %s/%s", sourcePV.Name, targetNamespace, newPVCName)
+	}()
+	defer func() {
+		select {
+		case <-binderDone:
+			if statusUpdateErr != nil {
+				t.Errorf("fake-binder goroutine failed: %v", statusUpdateErr)
+			}
+		case <-time.After(pvRebindTimeout + time.Second):
+			t.Log("timed out waiting for fake-binder goroutine to finish")
+		}
+	}()
+
+	result, err := rebindPVToNamespace(
+		context.Background(), fakeClient, logr.Discard(),
+		"backup-pvc", "vm-ns", targetNamespace,
+		"test-du", "uid-456",
+		"velero.io/dataupload-uid", "velero.io/dataupload-name",
+		BindTargetCreate, "",
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NewPVCName != newPVCName {
+		t.Errorf("NewPVCName = %q, want %q", result.NewPVCName, newPVCName)
+	}
+
+	var newPVC corev1.PersistentVolumeClaim
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: newPVCName, Namespace: targetNamespace}, &newPVC); err != nil {
+		t.Fatalf("failed to get new PVC: %v", err)
+	}
+	if len(newPVC.Spec.AccessModes) != 1 || newPVC.Spec.AccessModes[0] != corev1.ReadWriteOnce {
+		t.Errorf("AccessModes = %v, want [%s]", newPVC.Spec.AccessModes, corev1.ReadWriteOnce)
+	}
+	gotSize := newPVC.Spec.Resources.Requests[corev1.ResourceStorage]
+	wantSize := resource.MustParse("5Gi")
+	if gotSize.Cmp(wantSize) != 0 {
+		t.Errorf("requested storage = %s, want %s -- createNewBoundPVC must derive this from the recovered PV, not a zero-value source PVC",
+			gotSize.String(), wantSize.String())
+	}
+	if newPVC.Spec.StorageClassName == nil || *newPVC.Spec.StorageClassName != "standard" {
+		t.Errorf("StorageClassName = %v, want %q", newPVC.Spec.StorageClassName, "standard")
+	}
+	if newPVC.Spec.VolumeMode == nil || *newPVC.Spec.VolumeMode != corev1.PersistentVolumeFilesystem {
+		t.Errorf("VolumeMode = %v, want %q", newPVC.Spec.VolumeMode, corev1.PersistentVolumeFilesystem)
 	}
 }
 

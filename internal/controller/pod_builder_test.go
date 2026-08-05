@@ -709,10 +709,16 @@ func TestBuildDatamoverPod_FilesystemModeTarget_NoVolumeDevices(t *testing.T) {
 	if len(container.VolumeDevices) != 0 {
 		t.Errorf("expected no volume devices for a Filesystem-mode target, got %+v", container.VolumeDevices)
 	}
+	envMap := make(map[string]string, len(container.Env))
 	for _, e := range container.Env {
-		if e.Name == downloader.EnvTargetIsBlockDevice && e.Value != "false" {
-			t.Errorf("%s = %q, want %q", downloader.EnvTargetIsBlockDevice, e.Value, "false")
-		}
+		envMap[e.Name] = e.Value
+	}
+	got, ok := envMap[downloader.EnvTargetIsBlockDevice]
+	if !ok {
+		t.Fatalf("%s must always be set so the downloader can select the publish path", downloader.EnvTargetIsBlockDevice)
+	}
+	if got != "false" {
+		t.Errorf("%s = %q, want %q", downloader.EnvTargetIsBlockDevice, got, "false")
 	}
 }
 

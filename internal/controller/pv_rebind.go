@@ -120,7 +120,7 @@ func resolveSourcePV(ctx context.Context, k8sClient client.Client, logger logr.L
 		return pv, pvName, sourcePVC, false, nil
 
 	case errors.IsNotFound(getErr):
-		found, err := findPVByUIDLabel(ctx, k8sClient, logger, uidLabelKey, resourceUID)
+		found, err := findPVByUIDLabel(ctx, k8sClient, uidLabelKey, resourceUID)
 		if err != nil {
 			return nil, "", nil, false, fmt.Errorf("failed to search for PV by label after source PVC %s/%s was not found: %w", sourceNamespace, sourcePVCName, err)
 		}
@@ -264,7 +264,16 @@ func rebindPVToNamespace(
 	// already resolved and validated targetPVC in Step 1.5 above.
 	if bindMode != BindTargetExisting {
 		var err error
-		targetPVC, err = createNewBoundPVC(ctx, k8sClient, logger, sourcePVC, targetNamespace, resourceName, resourceUID, uidLabelKey, nameAnnotationKey, pvName)
+		specSource := sourcePVC
+		if sourcePVCAlreadyGone {
+			// sourcePVC is the zero-value placeholder resolveSourcePV returned in
+			// this case (there's no real source PVC object left to read), so
+			// createNewBoundPVC's AccessModes/Resources/StorageClassName/VolumeMode
+			// copy would otherwise silently produce a PVC missing all of them.
+			// The recovered PV carries equivalent values -- derive from it instead.
+			specSource = pvcSpecFromPV(pv)
+		}
+		targetPVC, err = createNewBoundPVC(ctx, k8sClient, logger, specSource, targetNamespace, resourceName, resourceUID, uidLabelKey, nameAnnotationKey, pvName)
 		if err != nil {
 			return nil, err
 		}
@@ -313,6 +322,33 @@ func rebindPVToNamespace(
 		PVName:                pvName,
 		OriginalReclaimPolicy: originalReclaimPolicy,
 	}, nil
+}
+
+// pvcSpecFromPV builds a minimal PersistentVolumeClaim carrying just the
+// fields createNewBoundPVC reads (AccessModes, Resources, StorageClassName,
+// VolumeMode), derived directly from a PV. Used by rebindPVToNamespace's
+// Step 4 (BindTargetCreate path) when resolveSourcePV recovered via a
+// UID-label search instead of the real source PVC (sourcePVCAlreadyGone) --
+// that recovery path has no source PVC object left to copy these fields
+// from, only the PV itself, which carries equivalent values.
+func pvcSpecFromPV(pv *corev1.PersistentVolume) *corev1.PersistentVolumeClaim {
+	requests := corev1.ResourceList{}
+	if capacity, ok := pv.Spec.Capacity[corev1.ResourceStorage]; ok {
+		requests[corev1.ResourceStorage] = capacity
+	}
+	var storageClassName *string
+	if pv.Spec.StorageClassName != "" {
+		sc := pv.Spec.StorageClassName
+		storageClassName = &sc
+	}
+	return &corev1.PersistentVolumeClaim{
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      pv.Spec.AccessModes,
+			Resources:        corev1.VolumeResourceRequirements{Requests: requests},
+			StorageClassName: storageClassName,
+			VolumeMode:       pv.Spec.VolumeMode,
+		},
+	}
 }
 
 // createNewBoundPVC creates a brand-new, auto-named PVC in the target namespace,
@@ -692,7 +728,7 @@ func waitForPVCBound(ctx context.Context, k8sClient client.Client, pvcName, name
 // regardless of how far a prior, interrupted invocation got. Returns (nil, nil)
 // if no PV carries the label -- not an error, since callers use this as a
 // fallback path where "none found" is a valid, meaningful outcome.
-func findPVByUIDLabel(ctx context.Context, k8sClient client.Client, logger logr.Logger, uidLabelKey, resourceUID string) (*corev1.PersistentVolume, error) {
+func findPVByUIDLabel(ctx context.Context, k8sClient client.Client, uidLabelKey, resourceUID string) (*corev1.PersistentVolume, error) {
 	pvList := &corev1.PersistentVolumeList{}
 	if err := k8sClient.List(ctx, pvList, client.MatchingLabels{uidLabelKey: resourceUID}); err != nil {
 		return nil, fmt.Errorf("failed to list PVs by label: %w", err)
@@ -701,7 +737,14 @@ func findPVByUIDLabel(ctx context.Context, k8sClient client.Client, logger logr.
 		return nil, nil
 	}
 	if len(pvList.Items) > 1 {
-		logger.Info("Warning: multiple PVs found with label, using first one", "count", len(pvList.Items), "label", uidLabelKey)
+		names := make([]string, 0, len(pvList.Items))
+		for i := range pvList.Items {
+			names = append(names, pvList.Items[i].Name)
+		}
+		// Picking arbitrarily here risks rebinding/cleaning up the wrong PV --
+		// fail instead so this gets investigated rather than silently guessing.
+		return nil, fmt.Errorf("found %d PVs carrying label %s=%s (%v); expected exactly one, refusing to pick arbitrarily",
+			len(pvList.Items), uidLabelKey, resourceUID, names)
 	}
 	return &pvList.Items[0], nil
 }
@@ -751,7 +794,7 @@ func cleanupReboundPVCAndPV(
 			return fmt.Errorf("failed to get PV %s: %w", pvName, err)
 		}
 	} else {
-		found, err := findPVByUIDLabel(ctx, k8sClient, logger, uidLabelKey, resourceUID)
+		found, err := findPVByUIDLabel(ctx, k8sClient, uidLabelKey, resourceUID)
 		if err != nil {
 			return fmt.Errorf("failed to list PVs by label: %w", err)
 		}

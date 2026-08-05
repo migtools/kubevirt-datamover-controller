@@ -174,7 +174,7 @@ func (r *KubeVirtDataDownloadReconciler) Reconcile(ctx context.Context, req ctrl
 				if err := r.updatePhase(ctx, dataDownload, velerov2alpha1.DataDownloadPhaseCompleted, "Restored disk provisioned to target volume"); err != nil {
 					return ctrl.Result{}, err
 				}
-				if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dataDownload.UID), r.getPodNamespace(dataDownload), logger); cleanupNotReady {
+				if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, r.APIReader, common.LabelDataDownloadUID, string(dataDownload.UID), r.getPodNamespace(dataDownload), logger); cleanupNotReady {
 					logger.Info("Datamover pod still terminating (or its status couldn't be confirmed)")
 					// Continue -- the restore already completed, don't block on cleanup failures
 				}
@@ -362,7 +362,7 @@ func (r *KubeVirtDataDownloadReconciler) checkOperationTimeout(ctx context.Conte
 			// persisting it before cleanup actually succeeds would leave the pod
 			// running forever with no chance to retry -- returning the error here
 			// instead lets the reconcile retry until cleanup succeeds.
-			if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), r.getPodNamespace(dd), logger); cleanupNotReady {
+			if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, r.APIReader, common.LabelDataDownloadUID, string(dd.UID), r.getPodNamespace(dd), logger); cleanupNotReady {
 				return fmt.Errorf("downloader pod still terminating (or its status couldn't be confirmed) before failing DataDownload on timeout")
 			}
 			return r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed, message)
@@ -817,11 +817,15 @@ func (r *KubeVirtDataDownloadReconciler) listAllScratchPVCs(ctx context.Context,
 
 // cleanupScratchPVCIfPresent best-effort deletes all of this DataDownload's
 // scratch PVCs, if any are still found (one for a Filesystem-mode restore
-// target, two for a Block-mode target -- see listAllScratchPVCs). Used by
-// short-circuit completion paths (idempotent-resume, cancel-after-provisioned)
-// where a prior attempt may have already gotten the rebind done (which
-// deletes the rebound scratch PVC as part of its own flow) without persisting
-// the terminal phase update afterward -- in the common case this finds nothing.
+// target, two for a Block-mode target -- see listAllScratchPVCs). Used by the
+// idempotent-resume short-circuit path (handleInProgress), where a prior
+// attempt already got the rebind done (which deletes the rebound scratch PVC
+// as part of its own flow) without persisting the terminal phase update
+// afterward -- the restore already completed by that point, so a cleanup
+// failure here shouldn't block reporting success; in the common case this
+// finds nothing anyway. handleCanceling uses the stricter deleteAllScratchPVCs
+// instead, since Canceled is terminal and a swallowed failure there would
+// leak the PVC(s) forever with no further reconcile to retry the delete.
 func (r *KubeVirtDataDownloadReconciler) cleanupScratchPVCIfPresent(ctx context.Context, dd *velerov2alpha1.DataDownload, logger logr.Logger) {
 	pvcs, err := r.listAllScratchPVCs(ctx, dd)
 	if err != nil {
@@ -833,6 +837,25 @@ func (r *KubeVirtDataDownloadReconciler) cleanupScratchPVCIfPresent(ctx context.
 			logger.Error(err, "Failed to delete scratch PVC", "pvc", pvcs[i].Name)
 		}
 	}
+}
+
+// deleteAllScratchPVCs deletes all of this DataDownload's scratch PVCs,
+// returning the first deletion failure (ignoring NotFound) instead of
+// swallowing it -- unlike cleanupScratchPVCIfPresent's best-effort cleanup,
+// used by handleCanceling where Canceled being terminal means a swallowed
+// failure would leak the PVC(s) forever rather than retry on the next
+// reconcile (which handleCanceling's caller triggers by returning an error).
+func (r *KubeVirtDataDownloadReconciler) deleteAllScratchPVCs(ctx context.Context, dd *velerov2alpha1.DataDownload) error {
+	pvcs, err := r.listAllScratchPVCs(ctx, dd)
+	if err != nil {
+		return err
+	}
+	for i := range pvcs {
+		if err := r.Delete(ctx, &pvcs[i]); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete scratch PVC %s: %w", pvcs[i].Name, err)
+		}
+	}
+	return nil
 }
 
 // isRestoreAlreadyProvisioned reports whether the rebind that provisions the
@@ -1234,7 +1257,7 @@ func (r *KubeVirtDataDownloadReconciler) handleInProgress(ctx context.Context, l
 		// Best-effort: the pod (and scratch PVC, if somehow still present) may not
 		// have been cleaned up by whichever prior attempt got the rebind done,
 		// since this path returns before reaching the normal cleanup call below.
-		if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), r.getPodNamespace(dd), logger); cleanupNotReady {
+		if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, r.APIReader, common.LabelDataDownloadUID, string(dd.UID), r.getPodNamespace(dd), logger); cleanupNotReady {
 			logger.Info("Datamover pod still terminating (or its status couldn't be confirmed)")
 			// Continue -- the restore already completed, don't block on cleanup failures
 		}
@@ -1298,7 +1321,7 @@ func (r *KubeVirtDataDownloadReconciler) handleInProgress(ctx context.Context, l
 		// that wait until it times out. Propagate a cleanup failure instead of
 		// proceeding into that deadlock-prone wait: the retry re-enters either
 		// this branch (pod still visible) or the pod-absent marker branch above.
-		if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), podNamespace, logger); cleanupNotReady {
+		if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, r.APIReader, common.LabelDataDownloadUID, string(dd.UID), podNamespace, logger); cleanupNotReady {
 			return ctrl.Result{}, fmt.Errorf("downloader pod still terminating (or its status couldn't be confirmed) before rebinding restored volume")
 		}
 
@@ -1455,7 +1478,7 @@ func (r *KubeVirtDataDownloadReconciler) handleCanceling(ctx context.Context, lo
 
 	podNamespace := r.getPodNamespace(dd)
 
-	if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), podNamespace, logger); cleanupNotReady {
+	if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, r.APIReader, common.LabelDataDownloadUID, string(dd.UID), podNamespace, logger); cleanupNotReady {
 		// Canceled is terminal -- no further reconciliation ever runs for this
 		// object once it's persisted. Returning here instead of continuing
 		// means a cleanup failure retries (this handler runs again) rather than
@@ -1466,11 +1489,16 @@ func (r *KubeVirtDataDownloadReconciler) handleCanceling(ctx context.Context, lo
 		return ctrl.Result{}, fmt.Errorf("downloader pod still terminating (or its status couldn't be confirmed) before canceling DataDownload")
 	}
 
-	// The scratch PVC is never rebound out of podNamespace before Completed (only the
-	// InProgress->Completed transition rebinds it), so on cancel it can be deleted
-	// directly rather than via cleanupReboundPVCAndPV (which expects a PV whose
-	// claimRef has already been reset for a rebind).
-	r.cleanupScratchPVCIfPresent(ctx, dd, logger)
+	// The scratch PVC(s) are never rebound out of podNamespace before Completed
+	// (only the InProgress->Completed transition rebinds the output/scratch
+	// PVC), so on cancel they can be deleted directly rather than via
+	// cleanupReboundPVCAndPV (which expects a PV whose claimRef has already
+	// been reset for a rebind). Canceled is terminal like the pod cleanup
+	// above, so a swallowed delete failure here would leak the PVC(s) forever
+	// with no further reconcile to retry it -- propagate the error instead.
+	if err := r.deleteAllScratchPVCs(ctx, dd); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to delete scratch PVC(s) before canceling DataDownload: %w", err)
+	}
 
 	if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseCanceled, "DataDownload canceled"); err != nil {
 		return ctrl.Result{}, err

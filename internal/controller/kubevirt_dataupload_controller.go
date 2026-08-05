@@ -322,7 +322,7 @@ func (r *KubeVirtDataUploadReconciler) checkOperationTimeout(ctx context.Context
 			// persisting it before cleanup actually succeeds would leave the pod
 			// running forever with no chance to retry -- returning the error here
 			// instead lets the reconcile retry until cleanup succeeds.
-			if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), r.getPodNamespace(du), logger); cleanupNotReady {
+			if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, r.APIReader, common.LabelDataUploadUID, string(du.UID), r.getPodNamespace(du), logger); cleanupNotReady {
 				return fmt.Errorf("datamover pod still terminating (or its status couldn't be confirmed) before failing DataUpload on timeout")
 			}
 			return r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, message)
@@ -1155,7 +1155,7 @@ func (r *KubeVirtDataUploadReconciler) emitPodLogs(ctx context.Context, logger l
 // a later reconcile retry once the pod is confirmed gone.
 // See https://github.com/migtools/kubevirt-datamover-controller/issues/171.
 func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, podNamespace string) bool {
-	if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), podNamespace, logger); cleanupNotReady {
+	if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, r.APIReader, common.LabelDataUploadUID, string(du.UID), podNamespace, logger); cleanupNotReady {
 		logger.Info("Datamover pod still terminating (or its status couldn't be confirmed), deferring PVC/PV cleanup to next reconcile")
 		return false
 	}

@@ -118,18 +118,19 @@ func inspectQcow2(ctx context.Context, path string) (qcow2Info, error) {
 // single flat raw disk image. qemu-img convert transparently follows the
 // backing chain, so this handles both a lone full backup (chain length 1)
 // and a full-plus-incrementals chain uniformly.
-// flattenToRaw converts the tip of the (now-rebased) backing chain into a
-// single flat raw disk image. qemu-img convert transparently follows the
-// backing chain, so this handles both a lone full backup (chain length 1)
-// and a full-plus-incrementals chain uniformly.
 //
-// skipRemoveOnError must be true when outputPath is a raw block device (not a
-// regular file inside a mounted filesystem): unlinking a device special-file
+// outputIsBlockDevice must be true when outputPath is a raw block device (not
+// a regular file inside a mounted filesystem): unlinking a device special-file
 // node destroys the pod's only path to that volume for the rest of its
-// lifetime, unlike a disposable regular file that's safe to remove and retry.
-func flattenToRaw(ctx context.Context, chainTipPath, outputPath string, skipRemoveOnError bool) error {
+// lifetime, unlike a disposable regular file that's safe to remove and retry,
+// so error paths skip removal in that case. Chmod'ing a device node's
+// permission bits is also skipped -- that's kubelet/CSI's responsibility for
+// a device special file, not application code's, and this pod's own copy of
+// the node is ephemeral (freshly created by kubelet per-pod) so any change
+// here wouldn't persist to future consumers anyway.
+func flattenToRaw(ctx context.Context, chainTipPath, outputPath string, outputIsBlockDevice bool) error {
 	removeOnError := func() {
-		if !skipRemoveOnError {
+		if !outputIsBlockDevice {
 			_ = os.Remove(outputPath)
 		}
 	}
@@ -142,15 +143,19 @@ func flattenToRaw(ctx context.Context, chainTipPath, outputPath string, skipRemo
 	// with different content or permissions — the O_CREATE mode argument
 	// alone is only applied when the file doesn't already exist. Both
 	// O_CREATE and O_TRUNC are safe no-ops against an existing block device
-	// node (the kernel ignores truncate semantics for special files).
+	// node (the kernel ignores truncate semantics for special files); the
+	// Chmod calls below are skipped entirely for a block device target
+	// instead, rather than relying on that being a no-op too.
 	f, err := os.OpenFile(outputPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("failed to pre-create raw image %q: %w", outputPath, err)
 	}
-	if err := f.Chmod(0o600); err != nil {
-		_ = f.Close()
-		removeOnError()
-		return fmt.Errorf("failed to pre-create raw image %q: %w", outputPath, err)
+	if !outputIsBlockDevice {
+		if err := f.Chmod(0o600); err != nil {
+			_ = f.Close()
+			removeOnError()
+			return fmt.Errorf("failed to pre-create raw image %q: %w", outputPath, err)
+		}
 	}
 	if err := f.Close(); err != nil {
 		removeOnError()
@@ -162,11 +167,13 @@ func flattenToRaw(ctx context.Context, chainTipPath, outputPath string, skipRemo
 		removeOnError()
 		return fmt.Errorf("failed to flatten %q to raw %q: %w (%s)", chainTipPath, outputPath, err, stderr)
 	}
-	// Kept as defense in depth in case convert ever recreates the file
-	// instead of writing in place.
-	if err := os.Chmod(outputPath, 0o600); err != nil {
-		removeOnError()
-		return fmt.Errorf("failed to restrict permissions on raw image %q: %w", outputPath, err)
+	if !outputIsBlockDevice {
+		// Kept as defense in depth in case convert ever recreates the file
+		// instead of writing in place.
+		if err := os.Chmod(outputPath, 0o600); err != nil {
+			removeOnError()
+			return fmt.Errorf("failed to restrict permissions on raw image %q: %w", outputPath, err)
+		}
 	}
 	return nil
 }

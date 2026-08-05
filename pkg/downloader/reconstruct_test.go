@@ -268,7 +268,7 @@ func TestFlattenToRaw(t *testing.T) {
 		}
 	})
 
-	t.Run("skipRemoveOnError leaves the output path alone on failure", func(t *testing.T) {
+	t.Run("outputIsBlockDevice leaves the output path alone on failure", func(t *testing.T) {
 		// Models a raw block device target: unlinking it would destroy the
 		// pod's only path to that volume, unlike a disposable regular file.
 		outputPath := filepath.Join(t.TempDir(), "disk.raw")
@@ -284,7 +284,7 @@ func TestFlattenToRaw(t *testing.T) {
 		}
 
 		if _, statErr := os.Stat(outputPath); statErr != nil {
-			t.Errorf("expected output path to be left alone (skipRemoveOnError=true), stat err = %v", statErr)
+			t.Errorf("expected output path to be left alone (outputIsBlockDevice=true), stat err = %v", statErr)
 		}
 	})
 }
