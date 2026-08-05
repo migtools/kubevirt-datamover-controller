@@ -291,7 +291,7 @@ func TestCleanupPodsByUID(t *testing.T) {
 
 	t.Run("deletes matching pods", func(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod.DeepCopy()).Build()
-		if cleanupNotReady := cleanupPodsByUID(context.Background(), fakeClient, nil, "uid-label", "abc", "ns", logr.Discard()); cleanupNotReady {
+		if cleanupNotReady, _ := cleanupPodsByUID(context.Background(), fakeClient, nil, "uid-label", "abc", "ns", logr.Discard()); cleanupNotReady {
 			t.Fatal("expected cleanup to be ready (pod deleted with no finalizers), got not-ready")
 		}
 		var got corev1.Pod
@@ -310,7 +310,7 @@ func TestCleanupPodsByUID(t *testing.T) {
 				},
 			}).Build()
 
-		if cleanupNotReady := cleanupPodsByUID(context.Background(), fakeClient, nil, "uid-label", "abc", "ns", logr.Discard()); !cleanupNotReady {
+		if cleanupNotReady, _ := cleanupPodsByUID(context.Background(), fakeClient, nil, "uid-label", "abc", "ns", logr.Discard()); !cleanupNotReady {
 			t.Fatal("expected not-ready to be reported, got ready")
 		}
 		// The pod must still exist -- the caller learns cleanup didn't actually
@@ -331,8 +331,12 @@ func TestCleanupPodsByUID(t *testing.T) {
 		terminatingPod.Finalizers = []string{"example.com/still-cleaning-up"}
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(terminatingPod).Build()
 
-		if cleanupNotReady := cleanupPodsByUID(context.Background(), fakeClient, nil, "uid-label", "abc", "ns", logr.Discard()); !cleanupNotReady {
+		cleanupNotReady, terminating := cleanupPodsByUID(context.Background(), fakeClient, nil, "uid-label", "abc", "ns", logr.Discard())
+		if !cleanupNotReady {
 			t.Fatal("expected not-ready to be reported for incomplete cleanup, got ready")
+		}
+		if !terminating {
+			t.Error("expected terminating=true (pod has a DeletionTimestamp), got false")
 		}
 
 		var got corev1.Pod
@@ -341,6 +345,29 @@ func TestCleanupPodsByUID(t *testing.T) {
 		}
 		if got.DeletionTimestamp == nil {
 			t.Error("expected DeletionTimestamp to be set (delete was requested), but pod looks untouched")
+		}
+	})
+
+	t.Run("a pod remaining with no DeletionTimestamp is a hard not-ready, not terminating", func(t *testing.T) {
+		// Models a genuine anomaly: Delete was called and returned no error, but
+		// the pod survived with no DeletionTimestamp at all (e.g. an interceptor
+		// or webhook silently no-oping it) -- unlike the finalizer-blocked case
+		// above, this isn't the expected self-resolving state, so terminating
+		// must be false even though notReady is true.
+		survivingPod := pod.DeepCopy()
+		baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(survivingPod).Build()
+		fakeClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				return nil // silently do nothing
+			},
+		})
+
+		cleanupNotReady, terminating := cleanupPodsByUID(context.Background(), fakeClient, nil, "uid-label", "abc", "ns", logr.Discard())
+		if !cleanupNotReady {
+			t.Fatal("expected not-ready to be reported for incomplete cleanup, got ready")
+		}
+		if terminating {
+			t.Error("expected terminating=false for a pod with no DeletionTimestamp, got true")
 		}
 	})
 
@@ -370,8 +397,35 @@ func TestCleanupPodsByUID(t *testing.T) {
 		})
 		apiReader := fake.NewClientBuilder().WithScheme(scheme).Build() // authoritative: pod is gone
 
-		if cleanupNotReady := cleanupPodsByUID(context.Background(), cached, apiReader, "uid-label", "abc", "ns", logr.Discard()); cleanupNotReady {
+		if cleanupNotReady, _ := cleanupPodsByUID(context.Background(), cached, apiReader, "uid-label", "abc", "ns", logr.Discard()); cleanupNotReady {
 			t.Error("expected APIReader fallback to override the stale cached confirmation, got not-ready")
+		}
+	})
+
+	t.Run("APIReader fallback finds a pod missed by the initial cached list", func(t *testing.T) {
+		// The pod genuinely exists in the one real backing store (base), but the
+		// cached client's List is rigged to always report it missing -- modeling
+		// informer cache lag right after this controller created it. k8sClient's
+		// Delete still targets the same real store (matching a real cluster,
+		// where a cached client's writes go straight to the API server) --
+		// without the initial-list fallback, the delete loop would issue no
+		// Delete calls at all, and nothing would ever get cleaned up until some
+		// later reconcile's cache happened to catch up.
+		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod.DeepCopy()).Build()
+		cached := interceptor.NewClient(base, interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				return nil // always report empty, regardless of real state
+			},
+		})
+
+		if cleanupNotReady, _ := cleanupPodsByUID(context.Background(), cached, base, "uid-label", "abc", "ns", logr.Discard()); cleanupNotReady {
+			t.Fatal("expected cleanup to be ready (pod found via APIReader and deleted), got not-ready")
+		}
+
+		var got corev1.Pod
+		err := base.Get(context.Background(), client.ObjectKeyFromObject(pod), &got)
+		if !apierrors.IsNotFound(err) {
+			t.Errorf("expected pod found via APIReader to be deleted, got err=%v", err)
 		}
 	})
 }

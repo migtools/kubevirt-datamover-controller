@@ -777,6 +777,56 @@ func TestHandleCancelingDataUpload_PodCleanupFailureDoesNotPersistCanceled(t *te
 	}
 }
 
+// TestHandleCancelingDataUpload_PodStillTerminatingRequeuesWithoutError covers
+// the expected, self-resolving case ErrPodsStillTerminating exists for: a
+// datamover pod blocked on a finalizer (Delete accepted, kubelet just hasn't
+// finished tearing it down yet) must requeue quickly without being treated as
+// a reconcile error -- unlike a genuine cleanup failure, this isn't something
+// worth logging as broken.
+func TestHandleCancelingDataUpload_PodStillTerminatingRequeuesWithoutError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = kubevirtcorev1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "du-cancel-still-terminating", Namespace: "openshift-adp",
+			UID: types.UID("du-cancel-still-terminating-uid"),
+		},
+		Spec:   velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+		Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseCanceling},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "du-cancel-still-terminating-pod", Namespace: "openshift-adp",
+			Labels:     map[string]string{common.LabelDataUploadUID: string(du.UID)},
+			Finalizers: []string{"example.com/still-cleaning-up"},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du, pod).Build()
+	r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+	result, err := r.handleCanceling(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Error("expected a short requeue while the pod is still terminating")
+	}
+
+	var updated velerov2alpha1.DataUpload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, &updated); err != nil {
+		t.Fatalf("failed to get DataUpload: %v", err)
+	}
+	if updated.Status.Phase == velerov2alpha1.DataUploadPhaseCanceled {
+		t.Error("phase must not be Canceled until the pod actually finishes terminating")
+	}
+}
+
 func TestFilterKubeVirtDataMover(t *testing.T) {
 	tests := []struct {
 		name      string

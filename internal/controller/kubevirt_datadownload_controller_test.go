@@ -2627,6 +2627,42 @@ func TestHandleCancelingDataDownload_PodCleanupFailureDoesNotPersistCanceled(t *
 	}
 }
 
+// TestHandleCancelingDataDownload_PodStillTerminatingRequeuesWithoutError
+// covers the expected, self-resolving case ErrPodsStillTerminating exists
+// for: a downloader pod blocked on a finalizer (Delete accepted, kubelet just
+// hasn't finished tearing it down yet) must requeue quickly without being
+// treated as a reconcile error -- unlike a genuine cleanup failure, this
+// isn't something worth logging as broken.
+func TestHandleCancelingDataDownload_PodStillTerminatingRequeuesWithoutError(t *testing.T) {
+	f := newDDTestFixture(t)
+	scheme := ddScheme()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "downloader-pod", Namespace: "openshift-adp",
+			Labels:     map[string]string{common.LabelDataDownloadUID: string(f.dd.UID)},
+			Finalizers: []string{"example.com/still-cleaning-up"},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, pod).Build()
+	r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+	result, err := r.handleCanceling(context.Background(), logr.Discard(), f.dd)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Error("expected a short requeue while the pod is still terminating")
+	}
+
+	var updated velerov2alpha1.DataDownload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: f.dd.Name, Namespace: f.dd.Namespace}, &updated); err != nil {
+		t.Fatalf("failed to get DataDownload: %v", err)
+	}
+	if updated.Status.Phase == velerov2alpha1.DataDownloadPhaseCanceled {
+		t.Error("phase must not be Canceled until the pod actually finishes terminating")
+	}
+}
+
 // TestHandleCancelingDataDownload_ScratchPVCDeleteFailureDoesNotPersistCanceled
 // covers the same terminal-phase contract as the pod-cleanup-failure test
 // above, but for the scratch PVC delete step: Canceled is terminal (no further

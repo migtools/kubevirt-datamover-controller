@@ -214,8 +214,10 @@ func listPodByUID(ctx context.Context, reader client.Reader, uidLabelKey, uid, n
 }
 
 // cleanupPodsByUID deletes all pods matching a UID label in the given namespace
-// and reports whether it's NOT yet safe to proceed as though they're gone.
-// A true return folds together several cases callers should treat the same way
+// and reports whether it's NOT yet safe to proceed as though they're gone, plus
+// whether that not-ready state is the expected, self-resolving kind.
+//
+// notReady folds together several cases callers should treat the same way
 // (retry on a later reconcile): a List failure (unknown state, so
 // conservatively assume cleanup isn't done yet), a Delete call that failed for
 // a reason other than the pod already being gone, or a pod still present
@@ -223,17 +225,35 @@ func listPodByUID(ctx context.Context, reader client.Reader, uidLabelKey, uid, n
 // terminate containers and unmount volumes before the pod object actually
 // disappears).
 //
-// apiReader is an uncached client used for the confirmation re-list only, if
-// non-nil: a cached client's informer can still show a pod that Delete just
-// removed moments ago (the same staleness findPodByUID guards against, just
-// in the opposite direction -- here a stale cache can report a pod as still
-// present when it's actually already gone), which would otherwise report a
-// false "still present" and needlessly retry a cleanup that already succeeded.
-func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, apiReader client.Reader, uidLabelKey, uid, namespace string, logger logr.Logger) bool {
+// terminating is true only when notReady is true and every remaining pod
+// already carries a DeletionTimestamp (Delete was accepted, kubelet just
+// hasn't finished tearing it down yet) -- callers on a fast requeue loop can
+// use this to retry quietly instead of treating it as a reconcile error, as
+// opposed to a pod remaining with no DeletionTimestamp at all (a genuine
+// anomaly -- Delete didn't even get accepted -- worth the normal
+// error-and-backoff path). Meaningless when notReady is false.
+//
+// apiReader is an uncached client used as a fallback for both the initial
+// list and the confirmation re-list, if non-nil: a cached client's informer
+// can be stale in either direction here -- it can miss a pod this controller
+// created moments ago (initial list, same staleness findPodByUID guards
+// against), or it can still show a pod that Delete just removed moments ago
+// (confirmation re-list, the opposite direction), which would otherwise
+// report a false "still present" and needlessly retry a cleanup that already
+// succeeded. Missing the initial list entirely would be worse than that: the
+// delete loop would issue no Delete calls at all, so nothing would ever get
+// cleaned up until the cache happened to catch up on some later reconcile.
+func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, apiReader client.Reader, uidLabelKey, uid, namespace string, logger logr.Logger) (notReady, terminating bool) {
 	podList := &corev1.PodList{}
 	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
 		logger.Error(err, "Failed to list datamover pods for cleanup")
-		return true
+		return true, false
+	}
+	if len(podList.Items) == 0 && apiReader != nil {
+		if err := apiReader.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
+			logger.Error(err, "Failed to list datamover pods for cleanup via APIReader")
+			return true, false
+		}
 	}
 	deleteFailed := false
 	for i := range podList.Items {
@@ -249,7 +269,7 @@ func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, apiReader cl
 		}
 	}
 	if deleteFailed {
-		return true
+		return true, false
 	}
 
 	confirmReader := client.Reader(k8sClient)
@@ -259,9 +279,19 @@ func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, apiReader cl
 	remaining := &corev1.PodList{}
 	if err := confirmReader.List(ctx, remaining, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
 		logger.Error(err, "Failed to re-list datamover pods after cleanup")
-		return true
+		return true, false
 	}
-	return len(remaining.Items) > 0
+	if len(remaining.Items) == 0 {
+		return false, false
+	}
+	allTerminating := true
+	for i := range remaining.Items {
+		if remaining.Items[i].DeletionTimestamp == nil {
+			allTerminating = false
+			break
+		}
+	}
+	return true, allTerminating
 }
 
 // extractPodFailureMessage extracts the failure message from a failed pod.

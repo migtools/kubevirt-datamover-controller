@@ -487,7 +487,11 @@ func validateExistingPVCForBind(
 
 	if requested, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; ok {
 		capacity, hasCapacity := pv.Spec.Capacity[corev1.ResourceStorage]
-		if !hasCapacity || requested.Cmp(capacity) > 0 {
+		if !hasCapacity {
+			return nil, fmt.Errorf("PV %s has no storage capacity recorded, cannot validate target PVC %s/%s request of %s",
+				pv.Name, targetNamespace, existingPVCName, requested.String())
+		}
+		if requested.Cmp(capacity) > 0 {
 			return nil, fmt.Errorf("target PVC %s/%s requests %s storage which exceeds PV %s capacity %s",
 				targetNamespace, existingPVCName, requested.String(), pv.Name, capacity.String())
 		}

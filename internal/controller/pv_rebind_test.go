@@ -190,6 +190,15 @@ func TestValidateExistingPVCForBind(t *testing.T) {
 			errorContains: "exceeds",
 		},
 		{
+			name: "PV has no recorded capacity",
+			pv: basePV(func(p *corev1.PersistentVolume) {
+				p.Spec.Capacity = nil
+			}),
+			pvc:           basePVC(nil),
+			expectError:   true,
+			errorContains: "no storage capacity recorded",
+		},
+		{
 			name: "volumeMode mismatch",
 			pv:   basePV(nil),
 			pvc: basePVC(func(p *corev1.PersistentVolumeClaim) {
@@ -319,6 +328,7 @@ func TestFindPVByUIDLabel(t *testing.T) {
 	})
 }
 
+// TestCreateNewBoundPVC_AlreadyExistsReturnsRealUID covers the BindTargetCreate
 // race where two invocations (e.g. two reconciles) generate the same auto-named
 // PVC and the second one's Create call fails with AlreadyExists. Create leaves
 // the local object's ObjectMeta untouched on failure, so without re-fetching,
