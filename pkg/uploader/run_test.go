@@ -204,9 +204,9 @@ func TestResolveDiskNameFromVolumes(t *testing.T) {
 			name:     "longest match wins",
 			filename: "vmb-test-my-data-disk.qcow2",
 			volumeMap: map[string]string{
-				"disk":          "pvc-1",
-				"data-disk":     "pvc-2",
-				"my-data-disk":  "pvc-3",
+				"disk":         "pvc-1",
+				"data-disk":    "pvc-2",
+				"my-data-disk": "pvc-3",
 			},
 			expected: "my-data-disk",
 		},
@@ -770,52 +770,6 @@ func TestUpdateVMIndex(t *testing.T) {
 				}
 			},
 		},
-		{
-			name: "hyphenated disk names resolve correctly via VMB prefix",
-			config: &UploaderConfig{
-				ObjectStoreConfig: common.ObjectStoreConfig{
-					BSLBucket: "test-bucket",
-				},
-				VMName:           "test-vm",
-				VMNamespace:      "test-ns",
-				CheckpointName:   "cp-001",
-				BackupType:       "full",
-				VMBName:          "vmb-du-bkp-baselinqt2dj",
-				VeleroBackupName: "backup-001",
-			},
-			files: []CheckpointFile{
-				{
-					Filename:   "vmb-du-bkp-baselinqt2dj-datadisk-1.qcow2",
-					DiskName:   "datadisk-1",
-					Size:       1024,
-					ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-du-bkp-baselinqt2dj-datadisk-1.qcow2",
-				},
-				{
-					Filename:   "vmb-du-bkp-baselinqt2dj-rootdisk.qcow2",
-					DiskName:   "rootdisk",
-					Size:       512,
-					ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-du-bkp-baselinqt2dj-rootdisk.qcow2",
-				},
-			},
-			archived: &archivedPaths{
-				VMBObjectPath:  "checkpoints/test-ns/test-vm/cp-001/vmb.json",
-				VMBTObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmbt.json",
-			},
-			existingIndex: nil,
-			expectError:   false,
-			validateResult: func(t *testing.T, store *MockObjectStore) {
-				data, err := store.GetObjectBytes("checkpoints/test-ns/test-vm/index.json")
-				if err != nil {
-					t.Fatalf("failed to get index: %v", err)
-				}
-				if !containsBytes(data, "datadisk-1") {
-					t.Error("index should contain hyphenated disk name datadisk-1")
-				}
-				if !containsBytes(data, "rootdisk") {
-					t.Error("index should contain rootdisk")
-				}
-			},
-		},
 	}
 
 	for _, tt := range tests {
@@ -866,6 +820,64 @@ func TestUpdateVMIndex(t *testing.T) {
 				tt.validateResult(t, store)
 			}
 		})
+	}
+}
+
+func TestUpdateVMIndex_HyphenatedDiskNames(t *testing.T) {
+	scheme := getTestScheme()
+
+	config := &UploaderConfig{
+		ObjectStoreConfig: common.ObjectStoreConfig{
+			BSLBucket: "test-bucket",
+		},
+		VMName:           "test-vm",
+		VMNamespace:      "test-ns",
+		CheckpointName:   "cp-001",
+		BackupType:       "full",
+		VMBName:          "vmb-du-bkp-baselinqt2dj",
+		VeleroBackupName: "backup-001",
+	}
+
+	files := []CheckpointFile{
+		{
+			Filename:   "vmb-du-bkp-baselinqt2dj-datadisk-1.qcow2",
+			DiskName:   "datadisk-1",
+			Size:       1024,
+			ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-du-bkp-baselinqt2dj-datadisk-1.qcow2",
+		},
+		{
+			Filename:   "vmb-du-bkp-baselinqt2dj-rootdisk.qcow2",
+			DiskName:   "rootdisk",
+			Size:       512,
+			ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-du-bkp-baselinqt2dj-rootdisk.qcow2",
+		},
+	}
+
+	archived := &archivedPaths{
+		VMBObjectPath:  "checkpoints/test-ns/test-vm/cp-001/vmb.json",
+		VMBTObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmbt.json",
+	}
+
+	store := NewMockObjectStore("test-bucket", "")
+	objects := getTestClientObjects(config, files)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objects...).Build()
+
+	err := updateVMIndex(context.Background(), store, fakeClient, config, files, archived, logr.Discard())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	data, err := store.GetObjectBytes("checkpoints/test-ns/test-vm/index.json")
+	if err != nil {
+		t.Fatalf("failed to get index: %v", err)
+	}
+	if !containsBytes(data, "datadisk-1") {
+		t.Error("index should contain hyphenated disk name datadisk-1")
+	}
+	if !containsBytes(data, "rootdisk") {
+		t.Error("index should contain rootdisk")
 	}
 }
 
