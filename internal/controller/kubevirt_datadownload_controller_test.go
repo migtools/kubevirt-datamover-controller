@@ -1002,8 +1002,15 @@ func TestCalculateWorkPVCSize(t *testing.T) {
 			expectExact: addOverhead(*resource.NewQuantity(6*1024*1024*1024, resource.BinarySI), sizeOverheadPercent),
 		},
 		{
-			name:        "no files floors at 1Gi",
+			name:        "no file size metadata at all falls back to default",
 			files:       nil,
+			expectExact: resource.MustParse(DefaultScratchPVCSize),
+		},
+		{
+			name: "genuinely tiny non-zero chain floors at 1Gi",
+			files: []uploader.CheckpointFile{
+				{Size: 1024}, // 1KiB -- not zero, so no-metadata fallback must not apply
+			},
 			expectExact: resource.MustParse("1Gi"),
 		},
 	}
@@ -1418,6 +1425,43 @@ func TestListAllScratchPVCs_APIReaderFallback(t *testing.T) {
 		}
 		if len(got) != 0 {
 			t.Errorf("expected empty, got %+v", got)
+		}
+	})
+
+	t.Run("Block-mode target with only one of two PVCs cached retries via APIReader", func(t *testing.T) {
+		// A Block-mode restore provisions two scratch PVCs (work + output),
+		// created moments apart -- the cached client can have one visible and
+		// not the other. "Found one" must not be mistaken for "list complete"
+		// the way it correctly is for a Filesystem-mode target's single PVC.
+		f.dd.Annotations[AnnotationRestoreBlockMode] = "true"
+		workPVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "work-pvc-1", Namespace: "openshift-adp",
+				Labels: map[string]string{
+					common.LabelDataDownloadUID:   string(f.dd.UID),
+					common.LabelScratchVolumeRole: common.ScratchVolumeRoleWork,
+				},
+			},
+		}
+		outputPVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "output-pvc-1", Namespace: "openshift-adp",
+				Labels: map[string]string{
+					common.LabelDataDownloadUID:   string(f.dd.UID),
+					common.LabelScratchVolumeRole: common.ScratchVolumeRoleOutput,
+				},
+			},
+		}
+		cached := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, workPVC.DeepCopy()).Build()
+		apiReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, workPVC.DeepCopy(), outputPVC.DeepCopy()).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: cached, APIReader: apiReader, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		got, err := r.listAllScratchPVCs(context.Background(), f.dd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 2 {
+			t.Errorf("expected both work and output PVCs via APIReader retry, got %d: %+v", len(got), got)
 		}
 	})
 }

@@ -715,10 +715,21 @@ func maxDiskSizeFromIndex(vmIndex uploader.VMIndex, chain []string, targetVolume
 // headroom.
 func calculateWorkPVCSize(logger logr.Logger, files []uploader.CheckpointFile) resource.Quantity {
 	minSize := resource.MustParse("1Gi")
+	defaultSize := resource.MustParse(DefaultScratchPVCSize)
 
 	var totalFileSize int64
 	for _, f := range files {
 		totalFileSize += f.Size
+	}
+
+	if totalFileSize == 0 {
+		// No checkpoint file size metadata at all (e.g. an older/partial index)
+		// -- flooring at 1Gi would be an unfoundedly optimistic guess for an
+		// unknown-but-plausibly-large qcow2 chain. Match calculateScratchPVCSize's
+		// own no-metadata fallback instead of guessing smaller.
+		logger.Info("No checkpoint file size metadata available, falling back to default work PVC size",
+			"finalSize", defaultSize.String())
+		return defaultSize
 	}
 
 	withOverhead := addOverhead(*resource.NewQuantity(totalFileSize, resource.BinarySI), sizeOverheadPercent)
@@ -814,8 +825,21 @@ func listScratchPVC(ctx context.Context, reader client.Reader, namespace string,
 // terminal path where missing one here means it's never cleaned up at all.
 func (r *KubeVirtDataDownloadReconciler) listAllScratchPVCs(ctx context.Context, dd *velerov2alpha1.DataDownload) ([]corev1.PersistentVolumeClaim, error) {
 	pvcs, err := listAllScratchPVCsFrom(ctx, r.Client, r.getPodNamespace(dd), dd)
-	if err != nil || len(pvcs) > 0 || r.APIReader == nil {
+	if err != nil || r.APIReader == nil {
 		return pvcs, err
+	}
+	// A Block-mode restore provisions two scratch PVCs (work + output); the
+	// cached client can have one visible and not the other (each created in a
+	// separate handleAccepted Create call, moments apart), so finding *some*
+	// PVCs isn't proof the list is complete the way it is for a Filesystem-mode
+	// target's single PVC. Retry via APIReader whenever the cached count is
+	// under the expected total, not just when it's entirely empty.
+	expected := 1
+	if isBlockModeRestore(dd) {
+		expected = 2
+	}
+	if len(pvcs) >= expected {
+		return pvcs, nil
 	}
 	return listAllScratchPVCsFrom(ctx, r.APIReader, r.getPodNamespace(dd), dd)
 }
