@@ -983,6 +983,84 @@ func TestCalculateScratchPVCSize(t *testing.T) {
 	}
 }
 
+// TestCalculateWorkPVCSize covers the Block-mode restore's work PVC sizing:
+// unlike calculateScratchPVCSize, it must drop the raw-disk-size component
+// entirely (the flattened image lands on the separate output PVC instead) and
+// size purely off the resolved checkpoint files' sizes.
+func TestCalculateWorkPVCSize(t *testing.T) {
+	tests := []struct {
+		name        string
+		files       []uploader.CheckpointFile
+		expectExact resource.Quantity
+	}{
+		{
+			name: "sized from file sizes plus overhead",
+			files: []uploader.CheckpointFile{
+				{Size: 4 * 1024 * 1024 * 1024}, // 4Gi
+				{Size: 2 * 1024 * 1024 * 1024}, // 2Gi
+			},
+			expectExact: addOverhead(*resource.NewQuantity(6*1024*1024*1024, resource.BinarySI), sizeOverheadPercent),
+		},
+		{
+			name:        "no files floors at 1Gi",
+			files:       nil,
+			expectExact: resource.MustParse("1Gi"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := calculateWorkPVCSize(logr.Discard(), tt.files)
+			if got.Cmp(tt.expectExact) != 0 {
+				t.Errorf("size = %s, want exactly %s", got.String(), tt.expectExact.String())
+			}
+		})
+	}
+}
+
+// TestCalculateOutputPVCSize covers the Block-mode restore's output PVC
+// sizing: unlike calculateScratchPVCSize, it must drop the chain-file
+// component entirely (the qcow2 chain lives on the separate work PVC instead)
+// and size purely off the max known original-disk capacity.
+func TestCalculateOutputPVCSize(t *testing.T) {
+	vmIndex := uploader.VMIndex{
+		VMName:    "vm-1",
+		Namespace: "vm-ns",
+		Checkpoints: []uploader.CheckpointEntry{
+			{
+				ID:       "cp-1",
+				PVCs:     []string{"pvc-1"},
+				PVCSizes: []resource.Quantity{resource.MustParse("10Gi")},
+				Files:    []uploader.CheckpointFile{{DiskName: "disk-1"}},
+			},
+		},
+	}
+
+	t.Run("sized from max PVCSizes across chain, ignoring file sizes", func(t *testing.T) {
+		got := calculateOutputPVCSize(logr.Discard(), vmIndex, []string{"cp-1"}, "disk-1", resource.Quantity{})
+		want := addOverhead(resource.MustParse("10Gi"), sizeOverheadPercent)
+		if got.Cmp(want) != 0 {
+			t.Errorf("size = %s, want exactly %s", got.String(), want.String())
+		}
+	})
+
+	t.Run("floored by target disk capacity when no chain match", func(t *testing.T) {
+		got := calculateOutputPVCSize(logr.Discard(), vmIndex, []string{"cp-99"}, "disk-1", resource.MustParse("20Gi"))
+		want := addOverhead(resource.MustParse("20Gi"), sizeOverheadPercent)
+		if got.Cmp(want) != 0 {
+			t.Errorf("size = %s, want exactly %s", got.String(), want.String())
+		}
+	})
+
+	t.Run("no metadata at all falls back to default", func(t *testing.T) {
+		got := calculateOutputPVCSize(logr.Discard(), vmIndex, []string{"cp-99"}, "disk-1", resource.Quantity{})
+		want := resource.MustParse(DefaultScratchPVCSize)
+		if got.Cmp(want) != 0 {
+			t.Errorf("size = %s, want exactly %s", got.String(), want.String())
+		}
+	})
+}
+
 // TestResolveTargetDiskName_ChainTipWins covers a real fix: a VM's disk-to-PVC
 // mapping is normally stable across a chain, but if it changed between the full
 // backup and a later incremental (e.g. a differently-named DataVolume reattached
@@ -1277,7 +1355,7 @@ func TestFindScratchPVC_APIReaderFallback(t *testing.T) {
 		apiReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, scratchPVC.DeepCopy()).Build()
 		r := &KubeVirtDataDownloadReconciler{Client: cached, APIReader: apiReader, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
 
-		got, err := r.findScratchPVC(context.Background(), f.dd)
+		got, err := r.findScratchPVC(context.Background(), f.dd, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1290,7 +1368,7 @@ func TestFindScratchPVC_APIReaderFallback(t *testing.T) {
 		cached := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd).Build()
 		r := &KubeVirtDataDownloadReconciler{Client: cached, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
 
-		got, err := r.findScratchPVC(context.Background(), f.dd)
+		got, err := r.findScratchPVC(context.Background(), f.dd, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1371,7 +1449,7 @@ func TestHandleAcceptedDataDownload(t *testing.T) {
 			t.Fatalf("phase = %q, want %q (message: %s)", updated.Status.Phase, velerov2alpha1.DataDownloadPhasePrepared, updated.Status.Message)
 		}
 
-		scratchPVC, err := r.findScratchPVC(context.Background(), f.dd)
+		scratchPVC, err := r.findScratchPVC(context.Background(), f.dd, "")
 		if err != nil {
 			t.Fatalf("failed to find scratch PVC: %v", err)
 		}
@@ -1397,11 +1475,6 @@ func TestHandleAcceptedDataDownload(t *testing.T) {
 		mutate       func(pvc *corev1.PersistentVolumeClaim)
 		noScratchMsg string
 	}{
-		{
-			name:         "Block volumeMode target PVC fails without creating a scratch PVC",
-			mutate:       func(pvc *corev1.PersistentVolumeClaim) { pvc.Spec.VolumeMode = new(corev1.PersistentVolumeBlock) },
-			noScratchMsg: "expected no scratch PVC to be created for a Block-mode target",
-		},
 		{
 			name: "target PVC with spec.selector fails without creating a scratch PVC",
 			mutate: func(pvc *corev1.PersistentVolumeClaim) {
@@ -1447,7 +1520,7 @@ func TestHandleAcceptedDataDownload(t *testing.T) {
 				t.Errorf("phase = %q, want %q (message: %s)", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseFailed, updated.Status.Message)
 			}
 
-			scratchPVC, err := r.findScratchPVC(context.Background(), f.dd)
+			scratchPVC, err := r.findScratchPVC(context.Background(), f.dd, "")
 			if err != nil {
 				t.Fatalf("failed to check for scratch PVC: %v", err)
 			}
@@ -1455,6 +1528,67 @@ func TestHandleAcceptedDataDownload(t *testing.T) {
 				t.Error(tc.noScratchMsg)
 			}
 		})
+	}
+}
+
+// TestHandleAcceptedDataDownload_BlockMode covers a Block-mode restore target:
+// handleAccepted must provision both a Filesystem-mode work PVC (staging the
+// qcow2 chain) and a Block-mode output PVC (sized to target capacity, holding
+// the final flattened image) instead of the single Filesystem-mode scratch
+// PVC a Filesystem-mode target uses. Split out from TestHandleAcceptedDataDownload
+// to keep that function's cyclomatic complexity down (gocyclo).
+func TestHandleAcceptedDataDownload_BlockMode(t *testing.T) {
+	f := newDDTestFixture(t)
+	scheme := ddScheme()
+	f.targetPVC.Spec.VolumeMode = new(corev1.PersistentVolumeBlock)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, f.bsl, f.credSec, f.targetPVC).Build()
+	r := &KubeVirtDataDownloadReconciler{
+		Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) { return f.mockStore, nil },
+	}
+
+	result, err := r.handleAccepted(context.Background(), logr.Discard(), f.dd)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Error("expected requeue after transitioning to Prepared")
+	}
+
+	var updated velerov2alpha1.DataDownload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: f.dd.Name, Namespace: f.dd.Namespace}, &updated); err != nil {
+		t.Fatalf("failed to get DataDownload: %v", err)
+	}
+	if updated.Status.Phase != velerov2alpha1.DataDownloadPhasePrepared {
+		t.Fatalf("phase = %q, want %q (message: %s)", updated.Status.Phase, velerov2alpha1.DataDownloadPhasePrepared, updated.Status.Message)
+	}
+	if got := updated.Annotations[AnnotationRestoreBlockMode]; got != "true" {
+		t.Errorf("annotation %s = %q, want %q", AnnotationRestoreBlockMode, got, "true")
+	}
+
+	workPVC, err := r.findScratchPVC(context.Background(), f.dd, common.ScratchVolumeRoleWork)
+	if err != nil {
+		t.Fatalf("failed to find work PVC: %v", err)
+	}
+	if workPVC == nil {
+		t.Fatal("expected work PVC to be created")
+	}
+	if workPVC.Spec.VolumeMode == nil || *workPVC.Spec.VolumeMode != corev1.PersistentVolumeFilesystem {
+		t.Errorf("work PVC volumeMode = %v, want %q", workPVC.Spec.VolumeMode, corev1.PersistentVolumeFilesystem)
+	}
+
+	outputPVC, err := r.findScratchPVC(context.Background(), f.dd, common.ScratchVolumeRoleOutput)
+	if err != nil {
+		t.Fatalf("failed to find output PVC: %v", err)
+	}
+	if outputPVC == nil {
+		t.Fatal("expected output PVC to be created")
+	}
+	if outputPVC.Spec.VolumeMode == nil || *outputPVC.Spec.VolumeMode != corev1.PersistentVolumeBlock {
+		t.Errorf("output PVC volumeMode = %v, want %q", outputPVC.Spec.VolumeMode, corev1.PersistentVolumeBlock)
+	}
+	if outputPVC.Spec.StorageClassName == nil || *outputPVC.Spec.StorageClassName != "standard" {
+		t.Errorf("output PVC storageClassName = %v, want %q", outputPVC.Spec.StorageClassName, "standard")
 	}
 }
 
@@ -1612,6 +1746,99 @@ func TestHandlePreparedDataDownload(t *testing.T) {
 			t.Errorf("expected no pod to be created, got %d", len(pods.Items))
 		}
 	})
+}
+
+// TestHandlePreparedDataDownload_BlockMode covers a Block-mode restore target:
+// the downloader pod must mount the work PVC as a filesystem volume (staging
+// the qcow2 chain) and the output PVC as a raw volumeDevice (receiving the
+// final flattened image), with KUBEVIRT_DM_TARGET_IS_BLOCK_DEVICE set so the
+// downloader knows which publish path to take. Split out from
+// TestHandlePreparedDataDownload to keep that function's cyclomatic
+// complexity down (gocyclo).
+func TestHandlePreparedDataDownload_BlockMode(t *testing.T) {
+	f := newDDTestFixture(t)
+	f.dd.Annotations[AnnotationTargetDiskName] = "disk1"
+	f.dd.Annotations[AnnotationRestoreBlockMode] = "true"
+	scheme := ddScheme()
+	workPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "work-pvc-1", Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataDownloadUID:   string(f.dd.UID),
+				common.LabelScratchVolumeRole: common.ScratchVolumeRoleWork,
+			},
+		},
+	}
+	outputPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "output-pvc-1", Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataDownloadUID:   string(f.dd.UID),
+				common.LabelScratchVolumeRole: common.ScratchVolumeRoleOutput,
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, f.bsl, f.credSec, workPVC, outputPVC).Build()
+	r := &KubeVirtDataDownloadReconciler{
+		Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+		DatamoverImage: "quay.io/test/datamover:latest",
+	}
+
+	if _, err := r.handlePrepared(context.Background(), logr.Discard(), f.dd); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var updated velerov2alpha1.DataDownload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: f.dd.Name, Namespace: f.dd.Namespace}, &updated); err != nil {
+		t.Fatalf("failed to get DataDownload: %v", err)
+	}
+	if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseInProgress {
+		t.Fatalf("phase = %q, want %q (message: %s)", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseInProgress, updated.Status.Message)
+	}
+
+	pod, err := r.findPodForDataDownload(context.Background(), f.dd, "openshift-adp")
+	if err != nil {
+		t.Fatalf("failed to find pod: %v", err)
+	}
+	if pod == nil {
+		t.Fatal("expected downloader pod to be created")
+	}
+	if len(pod.Spec.Containers[0].VolumeDevices) != 1 {
+		t.Fatalf("expected exactly 1 volumeDevice, got %d", len(pod.Spec.Containers[0].VolumeDevices))
+	}
+	if pod.Spec.Containers[0].VolumeDevices[0].Name != restoreOutputVolumeName {
+		t.Errorf("volumeDevice name = %q, want %q", pod.Spec.Containers[0].VolumeDevices[0].Name, restoreOutputVolumeName)
+	}
+
+	var foundWorkVolume, foundOutputVolume bool
+	for _, v := range pod.Spec.Volumes {
+		if v.PersistentVolumeClaim == nil {
+			continue
+		}
+		switch v.PersistentVolumeClaim.ClaimName {
+		case "work-pvc-1":
+			foundWorkVolume = true
+		case "output-pvc-1":
+			foundOutputVolume = true
+		}
+	}
+	if !foundWorkVolume {
+		t.Error("expected pod to have a volume sourced from the work PVC")
+	}
+	if !foundOutputVolume {
+		t.Error("expected pod to have a volume sourced from the output PVC")
+	}
+
+	var isBlockDeviceEnv string
+	for _, env := range pod.Spec.Containers[0].Env {
+		if env.Name == downloader.EnvTargetIsBlockDevice {
+			isBlockDeviceEnv = env.Value
+			break
+		}
+	}
+	if isBlockDeviceEnv != "true" {
+		t.Errorf("env %s = %q, want %q", downloader.EnvTargetIsBlockDevice, isBlockDeviceEnv, "true")
+	}
 }
 
 func TestHandleInProgressDataDownload(t *testing.T) {
@@ -1976,6 +2203,85 @@ func TestCompleteSuccessfulDownload_EmitsRetainedPVEvent(t *testing.T) {
 	}
 }
 
+// TestCompleteSuccessfulDownload_BlockMode_RebindsOutputPVCAndDeletesWorkPVC
+// covers the Block-mode restore path: only the output PVC/PV (which holds the
+// final flattened raw image) gets rebound onto the target -- the work PVC
+// (which only ever staged the qcow2 chain) must be deleted afterward rather
+// than left behind or rebound itself.
+func TestCompleteSuccessfulDownload_BlockMode_RebindsOutputPVCAndDeletesWorkPVC(t *testing.T) {
+	f := newDDTestFixture(t)
+	f.dd.Annotations[AnnotationRestoreBlockMode] = "true"
+	f.targetPVC.Spec.VolumeMode = new(corev1.PersistentVolumeBlock)
+	scheme := ddScheme()
+
+	origInterval, origTimeout := pvRebindPollInterval, pvRebindTimeout
+	pvRebindPollInterval = 10 * time.Millisecond
+	pvRebindTimeout = 2 * time.Second
+	defer func() {
+		pvRebindPollInterval = origInterval
+		pvRebindTimeout = origTimeout
+	}()
+
+	outputPV := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-output"},
+		Spec: corev1.PersistentVolumeSpec{
+			Capacity:                      corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			AccessModes:                   []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimDelete,
+			StorageClassName:              "standard",
+			VolumeMode:                    new(corev1.PersistentVolumeBlock),
+		},
+	}
+	outputPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "output-pvc-1", Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataDownloadUID:   string(f.dd.UID),
+				common.LabelScratchVolumeRole: common.ScratchVolumeRoleOutput,
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName:       "pv-output",
+			StorageClassName: new("standard"),
+			VolumeMode:       new(corev1.PersistentVolumeBlock),
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+	workPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "work-pvc-1", Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataDownloadUID:   string(f.dd.UID),
+				common.LabelScratchVolumeRole: common.ScratchVolumeRoleWork,
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, f.targetPVC, outputPV, outputPVC, workPVC).Build()
+	r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+	defer startFakeBinder(t, fakeClient, outputPV, f.targetPVC, pvRebindTimeout)()
+
+	if _, err := r.completeSuccessfulDownload(context.Background(), logr.Discard(), f.dd, "openshift-adp"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var updated velerov2alpha1.DataDownload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: f.dd.Name, Namespace: f.dd.Namespace}, &updated); err != nil {
+		t.Fatalf("failed to get DataDownload: %v", err)
+	}
+	if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseCompleted {
+		t.Fatalf("phase = %q, want %q (message: %s)", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseCompleted, updated.Status.Message)
+	}
+
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: workPVC.Name, Namespace: workPVC.Namespace}, &corev1.PersistentVolumeClaim{}); !errors.IsNotFound(err) {
+		t.Errorf("expected work PVC to be deleted after a successful Block-mode restore, get returned: %v", err)
+	}
+}
+
 // TestEmitPodLogsDataDownload_TruncatesLongOutput covers #154: a downloader
 // pod that produced a very large log (e.g. a crash loop with verbose output)
 // must not flood the controller's own logs unbounded -- only the last
@@ -2172,6 +2478,58 @@ func TestHandleCancelingDataDownload(t *testing.T) {
 	}
 }
 
+// TestHandleCancelingDataDownload_BlockMode_CleansUpBothWorkAndOutputPVCs
+// covers cancellation of a Block-mode restore, which provisioned two scratch
+// PVCs instead of one -- both the work and output PVCs must be cleaned up,
+// not just whichever one an UID-label-only lookup happens to find first.
+func TestHandleCancelingDataDownload_BlockMode_CleansUpBothWorkAndOutputPVCs(t *testing.T) {
+	f := newDDTestFixture(t)
+	f.dd.Annotations[AnnotationRestoreBlockMode] = "true"
+	scheme := ddScheme()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "downloader-pod", Namespace: "openshift-adp",
+			Labels: map[string]string{common.LabelDataDownloadUID: string(f.dd.UID)},
+		},
+	}
+	workPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "work-pvc-1", Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataDownloadUID:   string(f.dd.UID),
+				common.LabelScratchVolumeRole: common.ScratchVolumeRoleWork,
+			},
+		},
+	}
+	outputPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "output-pvc-1", Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataDownloadUID:   string(f.dd.UID),
+				common.LabelScratchVolumeRole: common.ScratchVolumeRoleOutput,
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, pod, workPVC, outputPVC).Build()
+	r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+	if _, err := r.handleCanceling(context.Background(), logr.Discard(), f.dd); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var updated velerov2alpha1.DataDownload
+	_ = fakeClient.Get(context.Background(), types.NamespacedName{Name: f.dd.Name, Namespace: f.dd.Namespace}, &updated)
+	if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseCanceled {
+		t.Errorf("phase = %q, want %q", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseCanceled)
+	}
+
+	var pvcs corev1.PersistentVolumeClaimList
+	_ = fakeClient.List(context.Background(), &pvcs)
+	if len(pvcs.Items) != 0 {
+		t.Errorf("expected both work and output PVCs to be cleaned up, found %d", len(pvcs.Items))
+	}
+}
+
 // TestHandleCancelingDataDownload_PodCleanupFailureDoesNotPersistCanceled
 // covers a case Canceled being terminal makes important: if the pod can't be
 // stopped, handleCanceling must return an error (so it retries) rather than
@@ -2245,7 +2603,7 @@ func TestBuildDownloaderPodConfig(t *testing.T) {
 	}
 	vmRef := &common.VMReference{Name: "test-vm", Namespace: "vm-ns"}
 
-	cfg, err := r.buildDownloaderPodConfig(f.dd, f.bsl, vmRef, "scratch-pvc-1", "disk1")
+	cfg, err := r.buildDownloaderPodConfig(f.dd, f.bsl, vmRef, "scratch-pvc-1", "", "disk1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

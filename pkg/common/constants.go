@@ -111,6 +111,28 @@ const (
 
 	// LabelVeleroRestoreName is the label key for the Velero restore name.
 	LabelVeleroRestoreName = "velero.io/restore-name"
+
+	// LabelScratchVolumeRole distinguishes a DataDownload's scratch PVCs when
+	// a Block-mode restore target needs two: a Filesystem "work" PVC staging
+	// the downloaded qcow2 chain, and a Block "output" PVC receiving the
+	// final flattened image (which gets rebound onto the restore target).
+	// Unset on the single scratch PVC used by a Filesystem-mode restore
+	// target, which needs only one and serves both roles.
+	LabelScratchVolumeRole = "kubevirt-datamover.io/scratch-volume-role"
+)
+
+// Scratch volume role values used with LabelScratchVolumeRole. Only present
+// on a Block-mode restore target's two scratch PVCs -- a Filesystem-mode
+// target's single scratch PVC carries no role label.
+const (
+	// ScratchVolumeRoleWork identifies the Filesystem-mode PVC that stages
+	// the downloaded qcow2 chain.
+	ScratchVolumeRoleWork = "work"
+
+	// ScratchVolumeRoleOutput identifies the Block-mode PVC that receives
+	// the final flattened raw disk image and gets rebound onto the restore
+	// target.
+	ScratchVolumeRoleOutput = "output"
 )
 
 // Naming conventions for resources

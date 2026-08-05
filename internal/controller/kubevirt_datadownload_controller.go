@@ -57,6 +57,15 @@ const DefaultScratchPVCSize = "10Gi"
 // from S3. Mirrors DataUpload's AnnotationVMBTName pattern.
 const AnnotationTargetDiskName = "kubevirt-datamover.io/target-disk-name"
 
+// AnnotationRestoreBlockMode records whether dd's restore target PVC is Block
+// volumeMode, decided once in handleAccepted from the target PVC's own
+// VolumeMode (immutable once a PVC is created) and persisted across
+// reconciles so later phases (handlePrepared, completeSuccessfulDownload)
+// know whether a single Filesystem-mode scratch PVC or a work+output PVC pair
+// was provisioned, without needing the target PVC object themselves. See
+// isBlockModeRestore and DatamoverPodConfig.OutputPVCName's doc comment.
+const AnnotationRestoreBlockMode = "kubevirt-datamover.io/restore-block-mode"
+
 // AnnotationDownloaderPodSucceeded records that this DataDownload's downloader
 // pod reached PodSucceeded, persisted on the DataDownload BEFORE the pod is
 // deleted ahead of the rebind. Without it, the success is only recorded in the
@@ -392,21 +401,6 @@ func (r *KubeVirtDataDownloadReconciler) handleAccepted(ctx context.Context, log
 		return ctrl.Result{}, fmt.Errorf("failed to get target PVC: %w", err)
 	}
 
-	// Block-mode target volumes aren't supported yet: buildDatamoverPod mounts
-	// ScratchPVCName as a filesystem volumeMount in OperationModeDownload, not a
-	// block volumeDevice, so a Block-mode scratch PVC (built with VolumeMode
-	// copied from targetPVC below) would fail obscurely at pod-mount time rather
-	// than with a clear, attributable error. Reject it as soon as the target PVC's
-	// VolumeMode is known, before any BSL/object-store/manifest work.
-	if targetPVC.Spec.VolumeMode != nil && *targetPVC.Spec.VolumeMode == corev1.PersistentVolumeBlock {
-		if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed,
-			fmt.Sprintf("target PVC %s/%s is Block volumeMode, which is not yet supported for restore",
-				dd.Spec.TargetVolume.Namespace, dd.Spec.TargetVolume.PVC)); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
-	}
-
 	// The final rebind patches the scratch PV's claimRef onto this PVC. A selector
 	// on the target PVC must match the rebound PV's labels, so reject it now,
 	// before any download work, instead of after a full download fails to bind.
@@ -523,10 +517,28 @@ func (r *KubeVirtDataDownloadReconciler) handleAccepted(ctx context.Context, log
 	if req, ok := targetPVC.Spec.Resources.Requests[corev1.ResourceStorage]; ok {
 		targetDiskCapacity = req
 	}
-	scratchPVCSize := calculateScratchPVCSize(logger, vmIndex, manifest.CheckpointChain, targetVolume, files, targetDiskCapacity)
-
-	if _, err := r.ensureScratchPVC(ctx, logger, dd, targetPVC, scratchPVCSize); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to ensure scratch PVC: %w", err)
+	// A Block-mode target needs two scratch PVCs instead of one -- see
+	// DatamoverPodConfig.ScratchPVCName/OutputPVCName's doc comments for the
+	// work/output split rationale. Sizing splits the same way: the work PVC
+	// only needs room for the qcow2 chain (no final-image component), and the
+	// output PVC only needs room for the flattened raw image (no chain-file
+	// component), whereas a Filesystem-mode target's single scratch PVC needs
+	// both at once (calculateScratchPVCSize's existing behavior, unchanged).
+	isBlockTarget := targetPVC.Spec.VolumeMode != nil && *targetPVC.Spec.VolumeMode == corev1.PersistentVolumeBlock
+	if isBlockTarget {
+		workSize := calculateWorkPVCSize(logger, files)
+		if _, err := r.ensureWorkPVC(ctx, logger, dd, targetPVC, workSize); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to ensure work PVC: %w", err)
+		}
+		outputSize := calculateOutputPVCSize(logger, vmIndex, manifest.CheckpointChain, targetVolume, targetDiskCapacity)
+		if _, err := r.ensureOutputPVC(ctx, logger, dd, targetPVC, outputSize); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to ensure output PVC: %w", err)
+		}
+	} else {
+		scratchPVCSize := calculateScratchPVCSize(logger, vmIndex, manifest.CheckpointChain, targetVolume, files, targetDiskCapacity)
+		if _, err := r.ensureScratchPVC(ctx, logger, dd, targetPVC, scratchPVCSize); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to ensure scratch PVC: %w", err)
+		}
 	}
 
 	// Persist the resolved disk name so handlePrepared (a later, separate reconcile)
@@ -538,6 +550,9 @@ func (r *KubeVirtDataDownloadReconciler) handleAccepted(ctx context.Context, log
 		dd.Annotations = make(map[string]string)
 	}
 	dd.Annotations[AnnotationTargetDiskName] = targetVolume
+	if isBlockTarget {
+		dd.Annotations[AnnotationRestoreBlockMode] = "true"
+	}
 
 	if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhasePrepared, "Checkpoint chain resolved, scratch PVC ready"); err != nil {
 		return ctrl.Result{}, err
@@ -616,25 +631,7 @@ func calculateScratchPVCSize(logger logr.Logger, vmIndex uploader.VMIndex, chain
 	minSize := resource.MustParse("1Gi")
 	defaultSize := resource.MustParse(DefaultScratchPVCSize)
 
-	chainSet := make(map[string]bool, len(chain))
-	for _, id := range chain {
-		chainSet[id] = true
-	}
-
-	maxDiskSize := targetDiskCapacity
-	for _, entry := range vmIndex.Checkpoints {
-		if !chainSet[entry.ID] {
-			continue
-		}
-		for i, f := range entry.Files {
-			if f.DiskName != targetVolume || i >= len(entry.PVCSizes) {
-				continue
-			}
-			if entry.PVCSizes[i].Cmp(maxDiskSize) > 0 {
-				maxDiskSize = entry.PVCSizes[i]
-			}
-		}
-	}
+	maxDiskSize := maxDiskSizeFromIndex(vmIndex, chain, targetVolume, targetDiskCapacity)
 
 	var totalFileSize int64
 	for _, f := range files {
@@ -677,26 +674,127 @@ func calculateScratchPVCSize(logger logr.Logger, vmIndex uploader.VMIndex, chain
 	return finalSize
 }
 
-// findScratchPVC finds the unique scratch PVC associated with a DataDownload, if
-// any. Tries the cached client first; if it finds nothing, retries via APIReader
-// (an uncached read) before the caller concludes none exists -- the informer
-// cache is only eventually consistent, so a PVC created moments ago in an
-// earlier reconcile may not yet be visible to a cached List.
-func (r *KubeVirtDataDownloadReconciler) findScratchPVC(ctx context.Context, dd *velerov2alpha1.DataDownload) (*corev1.PersistentVolumeClaim, error) {
-	pvc, err := listScratchPVC(ctx, r.Client, r.getPodNamespace(dd), dd)
+// maxDiskSizeFromIndex returns the largest known original-disk capacity for
+// targetVolume across the matched checkpoint chain (CheckpointEntry.PVCSizes,
+// index-aligned with Files per pkg/uploader.updateVMIndex), floored by
+// targetDiskCapacity -- the restore target PVC's own authoritative requested
+// size. Shared by calculateScratchPVCSize (Filesystem-mode target, where this
+// is the raw-disk-size component of the single scratch PVC) and
+// calculateOutputPVCSize (Block-mode target, where it's the entire output
+// PVC size before overhead).
+func maxDiskSizeFromIndex(vmIndex uploader.VMIndex, chain []string, targetVolume string, targetDiskCapacity resource.Quantity) resource.Quantity {
+	chainSet := make(map[string]bool, len(chain))
+	for _, id := range chain {
+		chainSet[id] = true
+	}
+
+	maxDiskSize := targetDiskCapacity
+	for _, entry := range vmIndex.Checkpoints {
+		if !chainSet[entry.ID] {
+			continue
+		}
+		for i, f := range entry.Files {
+			if f.DiskName != targetVolume || i >= len(entry.PVCSizes) {
+				continue
+			}
+			if entry.PVCSizes[i].Cmp(maxDiskSize) > 0 {
+				maxDiskSize = entry.PVCSizes[i]
+			}
+		}
+	}
+	return maxDiskSize
+}
+
+// calculateWorkPVCSize sizes the Filesystem-mode work PVC that stages the
+// downloaded qcow2 chain for a Block-mode restore target (see
+// DatamoverPodConfig.ScratchPVCName's doc comment). Unlike
+// calculateScratchPVCSize, this drops the raw-disk-size component entirely --
+// the final flattened image lands on the separate output PVC instead, so this
+// volume only ever needs to hold the chain files. Sized from the sum of the
+// resolved checkpoint files' sizes, floored at 1Gi, plus sizeOverheadPercent
+// headroom.
+func calculateWorkPVCSize(logger logr.Logger, files []uploader.CheckpointFile) resource.Quantity {
+	minSize := resource.MustParse("1Gi")
+
+	var totalFileSize int64
+	for _, f := range files {
+		totalFileSize += f.Size
+	}
+
+	withOverhead := addOverhead(*resource.NewQuantity(totalFileSize, resource.BinarySI), sizeOverheadPercent)
+	finalSize := withOverhead
+	if withOverhead.Cmp(minSize) < 0 {
+		finalSize = minSize
+	}
+
+	logger.Info("Sizing Block-mode restore's work PVC from checkpoint chain file sizes",
+		"totalCheckpointFileSize", totalFileSize,
+		"overheadPercent", sizeOverheadPercent,
+		"finalSize", finalSize.String())
+	return finalSize
+}
+
+// calculateOutputPVCSize sizes the Block-mode output PVC that receives the
+// final flattened raw disk image for a Block-mode restore target (see
+// DatamoverPodConfig.OutputPVCName's doc comment). Unlike
+// calculateScratchPVCSize, this drops the chain-file component entirely --
+// the qcow2 chain lives on the separate work PVC instead, so this volume only
+// ever needs to hold the flattened raw image. Sized from the max original-disk
+// capacity (maxDiskSizeFromIndex, floored by targetDiskCapacity) plus
+// sizeOverheadPercent headroom. Falls back to DefaultScratchPVCSize (logged
+// loudly) if neither PVCSizes metadata nor targetDiskCapacity are populated.
+func calculateOutputPVCSize(logger logr.Logger, vmIndex uploader.VMIndex, chain []string, targetVolume string, targetDiskCapacity resource.Quantity) resource.Quantity {
+	minSize := resource.MustParse("1Gi")
+	defaultSize := resource.MustParse(DefaultScratchPVCSize)
+
+	maxDiskSize := maxDiskSizeFromIndex(vmIndex, chain, targetVolume, targetDiskCapacity)
+	if maxDiskSize.IsZero() {
+		logger.Info("No PVC size or target capacity metadata available, falling back to default output PVC size",
+			"targetVolume", targetVolume, "finalSize", defaultSize.String())
+		return defaultSize
+	}
+
+	withOverhead := addOverhead(maxDiskSize, sizeOverheadPercent)
+	finalSize := withOverhead
+	if withOverhead.Cmp(minSize) < 0 {
+		finalSize = minSize
+	}
+
+	logger.Info("Sizing Block-mode restore's output PVC from checkpoint chain metadata",
+		"targetVolume", targetVolume,
+		"maxDiskSize", maxDiskSize.String(),
+		"overheadPercent", sizeOverheadPercent,
+		"finalSize", finalSize.String())
+	return finalSize
+}
+
+// findScratchPVC finds the unique scratch PVC associated with a DataDownload
+// carrying the given role label, if any. role is "" for the legacy, unlabeled
+// single scratch PVC a Filesystem-mode restore target uses (see
+// common.LabelScratchVolumeRole's doc comment for the Block-mode work/output
+// split). Tries the cached client first; if it finds nothing, retries via
+// APIReader (an uncached read) before the caller concludes none exists -- the
+// informer cache is only eventually consistent, so a PVC created moments ago
+// in an earlier reconcile may not yet be visible to a cached List.
+func (r *KubeVirtDataDownloadReconciler) findScratchPVC(ctx context.Context, dd *velerov2alpha1.DataDownload, role string) (*corev1.PersistentVolumeClaim, error) {
+	pvc, err := listScratchPVC(ctx, r.Client, r.getPodNamespace(dd), dd, role)
 	if err != nil || pvc != nil || r.APIReader == nil {
 		return pvc, err
 	}
-	return listScratchPVC(ctx, r.APIReader, r.getPodNamespace(dd), dd)
+	return listScratchPVC(ctx, r.APIReader, r.getPodNamespace(dd), dd, role)
 }
 
-func listScratchPVC(ctx context.Context, reader client.Reader, namespace string, dd *velerov2alpha1.DataDownload) (*corev1.PersistentVolumeClaim, error) {
+func listScratchPVC(ctx context.Context, reader client.Reader, namespace string, dd *velerov2alpha1.DataDownload, role string) (*corev1.PersistentVolumeClaim, error) {
+	matchLabels := client.MatchingLabels{common.LabelDataDownloadUID: string(dd.UID)}
+	if role != "" {
+		matchLabels[common.LabelScratchVolumeRole] = role
+	}
 	pvcList := &corev1.PersistentVolumeClaimList{}
-	if err := reader.List(ctx, pvcList, client.InNamespace(namespace), client.MatchingLabels{common.LabelDataDownloadUID: string(dd.UID)}); err != nil {
+	if err := reader.List(ctx, pvcList, client.InNamespace(namespace), matchLabels); err != nil {
 		return nil, fmt.Errorf("failed to list scratch PVCs: %w", err)
 	}
 	if len(pvcList.Items) > 1 {
-		return nil, fmt.Errorf("found multiple scratch PVCs for DataDownload %s", dd.Name)
+		return nil, fmt.Errorf("found multiple scratch PVCs for DataDownload %s (role %q)", dd.Name, role)
 	}
 	if len(pvcList.Items) == 0 {
 		return nil, nil
@@ -704,22 +802,36 @@ func listScratchPVC(ctx context.Context, reader client.Reader, namespace string,
 	return &pvcList.Items[0], nil
 }
 
-// cleanupScratchPVCIfPresent best-effort deletes this DataDownload's scratch PVC, if
-// any is still found. Used by short-circuit completion paths (idempotent-resume,
-// cancel-after-provisioned) where a prior attempt may have already gotten the rebind
-// done (which deletes the scratch PVC as part of its own flow) without persisting
+// listAllScratchPVCs lists every scratch PVC associated with a DataDownload
+// regardless of role label -- a Filesystem-mode restore target has one
+// (unlabeled), a Block-mode target has two (role-labeled "work" and
+// "output"). Used by cleanup paths that need to remove all of them without
+// caring which role each one carries.
+func (r *KubeVirtDataDownloadReconciler) listAllScratchPVCs(ctx context.Context, dd *velerov2alpha1.DataDownload) ([]corev1.PersistentVolumeClaim, error) {
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	if err := r.List(ctx, pvcList, client.InNamespace(r.getPodNamespace(dd)), client.MatchingLabels{common.LabelDataDownloadUID: string(dd.UID)}); err != nil {
+		return nil, fmt.Errorf("failed to list scratch PVCs: %w", err)
+	}
+	return pvcList.Items, nil
+}
+
+// cleanupScratchPVCIfPresent best-effort deletes all of this DataDownload's
+// scratch PVCs, if any are still found (one for a Filesystem-mode restore
+// target, two for a Block-mode target -- see listAllScratchPVCs). Used by
+// short-circuit completion paths (idempotent-resume, cancel-after-provisioned)
+// where a prior attempt may have already gotten the rebind done (which
+// deletes the rebound scratch PVC as part of its own flow) without persisting
 // the terminal phase update afterward -- in the common case this finds nothing.
 func (r *KubeVirtDataDownloadReconciler) cleanupScratchPVCIfPresent(ctx context.Context, dd *velerov2alpha1.DataDownload, logger logr.Logger) {
-	scratchPVC, err := r.findScratchPVC(ctx, dd)
+	pvcs, err := r.listAllScratchPVCs(ctx, dd)
 	if err != nil {
-		logger.Error(err, "Failed to find scratch PVC for cleanup")
+		logger.Error(err, "Failed to list scratch PVCs for cleanup")
 		return
 	}
-	if scratchPVC == nil {
-		return
-	}
-	if err := r.Delete(ctx, scratchPVC); err != nil && !errors.IsNotFound(err) {
-		logger.Error(err, "Failed to delete scratch PVC", "pvc", scratchPVC.Name)
+	for i := range pvcs {
+		if err := r.Delete(ctx, &pvcs[i]); err != nil && !errors.IsNotFound(err) {
+			logger.Error(err, "Failed to delete scratch PVC", "pvc", pvcs[i].Name)
+		}
 	}
 }
 
@@ -770,10 +882,28 @@ func (r *KubeVirtDataDownloadReconciler) isRestoreAlreadyProvisioned(ctx context
 	return targetPVC.UID == matched.Spec.ClaimRef.UID, nil
 }
 
-// ensureScratchPVC creates or retrieves the read-write scratch PVC that stages the
-// downloaded qcow2 chain and holds the final flattened raw disk image. StorageClassName
-// and VolumeMode are derived from the restore target PVC so the eventual rebind
-// (Completed transition) is compatible by construction.
+// isBlockModeRestore reports whether dd's restore target PVC was Block
+// volumeMode, which determines whether this DataDownload provisioned a single
+// Filesystem-mode scratch PVC (ensureScratchPVC) or a work+output PVC pair
+// (ensureWorkPVC/ensureOutputPVC) -- see DatamoverPodConfig.OutputPVCName's
+// doc comment. Reads the AnnotationRestoreBlockMode marker handleAccepted set
+// from the target PVC's own VolumeMode (immutable once a PVC is created)
+// rather than re-fetching the target PVC on every later-phase call: several
+// call sites (handlePrepared, completeSuccessfulDownload) have no other need
+// for the target PVC object, so this avoids adding one just to answer this
+// one question, mirroring AnnotationTargetDiskName's own rationale.
+func isBlockModeRestore(dd *velerov2alpha1.DataDownload) bool {
+	return dd.Annotations[AnnotationRestoreBlockMode] == "true"
+}
+
+// ensureScratchPVC creates or retrieves the read-write scratch PVC that stages
+// the downloaded qcow2 chain for a Filesystem-mode restore target. For a
+// Filesystem-mode target, this single, unlabeled PVC also holds the final
+// flattened raw disk image and is the volume rebound onto the target
+// (unchanged from before Block-mode support existed). StorageClassName and
+// VolumeMode are derived from the restore target PVC so the eventual rebind
+// (Completed transition) is compatible by construction. A Block-mode target
+// instead calls ensureWorkPVC/ensureOutputPVC below.
 func (r *KubeVirtDataDownloadReconciler) ensureScratchPVC(
 	ctx context.Context,
 	logger logr.Logger,
@@ -781,26 +911,83 @@ func (r *KubeVirtDataDownloadReconciler) ensureScratchPVC(
 	targetPVC *corev1.PersistentVolumeClaim,
 	size resource.Quantity,
 ) (*corev1.PersistentVolumeClaim, error) {
-	if existing, err := r.findScratchPVC(ctx, dd); err != nil {
+	return r.ensureScratchPVCWithRole(ctx, logger, dd, "", targetPVC.Spec.AccessModes, targetPVC.Spec.StorageClassName, targetPVC.Spec.VolumeMode, size)
+}
+
+// ensureWorkPVC creates or retrieves the Filesystem-mode work PVC that stages
+// the downloaded qcow2 chain for a Block-mode restore target (see
+// DatamoverPodConfig.ScratchPVCName's doc comment). Always Filesystem mode
+// regardless of the target's own VolumeMode: the downloader stages multiple
+// named chain files on it, which a Block-mode volume has no way to hold.
+func (r *KubeVirtDataDownloadReconciler) ensureWorkPVC(
+	ctx context.Context,
+	logger logr.Logger,
+	dd *velerov2alpha1.DataDownload,
+	targetPVC *corev1.PersistentVolumeClaim,
+	size resource.Quantity,
+) (*corev1.PersistentVolumeClaim, error) {
+	filesystemMode := corev1.PersistentVolumeFilesystem
+	return r.ensureScratchPVCWithRole(ctx, logger, dd, common.ScratchVolumeRoleWork, targetPVC.Spec.AccessModes, targetPVC.Spec.StorageClassName, &filesystemMode, size)
+}
+
+// ensureOutputPVC creates or retrieves the Block-mode output PVC that
+// receives the final flattened raw disk image for a Block-mode restore target
+// (see DatamoverPodConfig.OutputPVCName's doc comment). This is the PVC/PV
+// completeSuccessfulDownload rebinds onto the target, not the work PVC.
+func (r *KubeVirtDataDownloadReconciler) ensureOutputPVC(
+	ctx context.Context,
+	logger logr.Logger,
+	dd *velerov2alpha1.DataDownload,
+	targetPVC *corev1.PersistentVolumeClaim,
+	size resource.Quantity,
+) (*corev1.PersistentVolumeClaim, error) {
+	blockMode := corev1.PersistentVolumeBlock
+	return r.ensureScratchPVCWithRole(ctx, logger, dd, common.ScratchVolumeRoleOutput, targetPVC.Spec.AccessModes, targetPVC.Spec.StorageClassName, &blockMode, size)
+}
+
+// ensureScratchPVCWithRole is the shared implementation behind
+// ensureScratchPVC/ensureWorkPVC/ensureOutputPVC: creates or retrieves a
+// scratch PVC labeled with the given role ("" for the legacy unlabeled
+// single-PVC Filesystem-mode path), with an explicit VolumeMode rather than
+// always copying the restore target's own -- a Block-mode target's work PVC
+// must stay Filesystem mode even though the target itself is Block mode.
+func (r *KubeVirtDataDownloadReconciler) ensureScratchPVCWithRole(
+	ctx context.Context,
+	logger logr.Logger,
+	dd *velerov2alpha1.DataDownload,
+	role string,
+	accessModesIn []corev1.PersistentVolumeAccessMode,
+	storageClassName *string,
+	volumeMode *corev1.PersistentVolumeMode,
+	size resource.Quantity,
+) (*corev1.PersistentVolumeClaim, error) {
+	if existing, err := r.findScratchPVC(ctx, dd, role); err != nil {
 		return nil, err
 	} else if existing != nil {
-		logger.V(1).Info("Scratch PVC already exists", "pvc", existing.Name)
+		logger.V(1).Info("Scratch PVC already exists", "pvc", existing.Name, "role", role)
 		return existing, nil
 	}
 
-	accessModes := targetPVC.Spec.AccessModes
+	accessModes := accessModesIn
 	if len(accessModes) == 0 {
 		accessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+	}
+
+	generateNamePrefix := fmt.Sprintf("%s%s-", common.ScratchPVCNamePrefix, dd.Name)
+	labels := map[string]string{
+		common.LabelDataDownloadUID: string(dd.UID),
+	}
+	if role != "" {
+		generateNamePrefix = fmt.Sprintf("%s%s-%s-", common.ScratchPVCNamePrefix, dd.Name, role)
+		labels[common.LabelScratchVolumeRole] = role
 	}
 
 	podNamespace := r.getPodNamespace(dd)
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: safeGenerateNamePrefix(fmt.Sprintf("%s%s-", common.ScratchPVCNamePrefix, dd.Name), 63),
+			GenerateName: safeGenerateNamePrefix(generateNamePrefix, 63),
 			Namespace:    podNamespace,
-			Labels: map[string]string{
-				common.LabelDataDownloadUID: string(dd.UID),
-			},
+			Labels:       labels,
 			Annotations: map[string]string{
 				common.AnnotationDataDownloadName: dd.Name,
 			},
@@ -812,8 +999,8 @@ func (r *KubeVirtDataDownloadReconciler) ensureScratchPVC(
 					corev1.ResourceStorage: size,
 				},
 			},
-			StorageClassName: targetPVC.Spec.StorageClassName,
-			VolumeMode:       targetPVC.Spec.VolumeMode,
+			StorageClassName: storageClassName,
+			VolumeMode:       volumeMode,
 		},
 	}
 
@@ -827,7 +1014,7 @@ func (r *KubeVirtDataDownloadReconciler) ensureScratchPVC(
 	if err := r.Create(ctx, pvc); err != nil {
 		return nil, fmt.Errorf("failed to create scratch PVC: %w", err)
 	}
-	logger.Info("Created scratch PVC", "generateName", pvc.GenerateName, "namespace", podNamespace, "size", size.String())
+	logger.Info("Created scratch PVC", "generateName", pvc.GenerateName, "namespace", podNamespace, "role", role, "size", size.String())
 	return pvc, nil
 }
 
@@ -871,16 +1058,41 @@ func (r *KubeVirtDataDownloadReconciler) handlePrepared(ctx context.Context, log
 		return ctrl.Result{}, nil
 	}
 
-	scratchPVC, err := r.findScratchPVC(ctx, dd)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to find scratch PVC: %w", err)
-	}
-	if scratchPVC == nil {
-		logger.Error(nil, "Scratch PVC not found for DataDownload")
-		if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed, "Scratch PVC not found"); err != nil {
-			return ctrl.Result{}, err
+	isBlockMode := isBlockModeRestore(dd)
+
+	var scratchPVCName, outputPVCName string
+	if isBlockMode {
+		workPVC, err := r.findScratchPVC(ctx, dd, common.ScratchVolumeRoleWork)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to find work PVC: %w", err)
 		}
-		return ctrl.Result{}, nil
+		outputPVC, err := r.findScratchPVC(ctx, dd, common.ScratchVolumeRoleOutput)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to find output PVC: %w", err)
+		}
+		if workPVC == nil || outputPVC == nil {
+			logger.Error(nil, "Work or output PVC not found for Block-mode DataDownload",
+				"workFound", workPVC != nil, "outputFound", outputPVC != nil)
+			if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed, "Work or output PVC not found"); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+		scratchPVCName = workPVC.Name
+		outputPVCName = outputPVC.Name
+	} else {
+		scratchPVC, err := r.findScratchPVC(ctx, dd, "")
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to find scratch PVC: %w", err)
+		}
+		if scratchPVC == nil {
+			logger.Error(nil, "Scratch PVC not found for DataDownload")
+			if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed, "Scratch PVC not found"); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+		scratchPVCName = scratchPVC.Name
 	}
 
 	targetDiskName := dd.Annotations[AnnotationTargetDiskName]
@@ -893,7 +1105,7 @@ func (r *KubeVirtDataDownloadReconciler) handlePrepared(ctx context.Context, log
 		return ctrl.Result{}, nil
 	}
 
-	podConfig, err := r.buildDownloaderPodConfig(dd, bsl, vmRef, scratchPVC.Name, targetDiskName)
+	podConfig, err := r.buildDownloaderPodConfig(dd, bsl, vmRef, scratchPVCName, outputPVCName, targetDiskName)
 	if err != nil {
 		logger.Error(err, "Failed to build downloader pod config")
 		if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed, fmt.Sprintf("Failed to build pod config: %v", err)); err != nil {
@@ -933,11 +1145,15 @@ func (r *KubeVirtDataDownloadReconciler) handlePrepared(ctx context.Context, log
 // in handleAccepted (NOT dd.Spec.TargetVolume.PVC, which is a PVC/claim name) --
 // it's what the pod's KUBEVIRT_DM_TARGET_VOLUME env var must carry, since
 // pkg/downloader.ResolveCheckpointFiles matches on CheckpointFile.DiskName.
+// outputPVCName is "" for a Filesystem-mode restore target (scratchPVCName
+// alone serves both roles); for a Block-mode target it names the separate
+// output PVC (see DatamoverPodConfig.OutputPVCName's doc comment).
 func (r *KubeVirtDataDownloadReconciler) buildDownloaderPodConfig(
 	dd *velerov2alpha1.DataDownload,
 	bsl *velerov1.BackupStorageLocation,
 	vmRef *common.VMReference,
 	scratchPVCName string,
+	outputPVCName string,
 	targetDiskName string,
 ) (*DatamoverPodConfig, error) {
 	cfg, err := uploader.ExtractBSLConfig(bsl)
@@ -988,6 +1204,7 @@ func (r *KubeVirtDataDownloadReconciler) buildDownloaderPodConfig(
 		UIDLabelKey:                    common.LabelDataDownloadUID,
 		NameAnnotationKey:              common.AnnotationDataDownloadName,
 		ScratchPVCName:                 scratchPVCName,
+		OutputPVCName:                  outputPVCName,
 		TargetVolume:                   targetDiskName,
 		Labels:                         make(map[string]string),
 	}, nil
@@ -1118,11 +1335,21 @@ func (r *KubeVirtDataDownloadReconciler) handleInProgress(ctx context.Context, l
 // cleanup, or from the pod-absent branch via the AnnotationDownloaderPodSucceeded
 // marker when a prior reconcile deleted the pod but didn't get this far.
 func (r *KubeVirtDataDownloadReconciler) completeSuccessfulDownload(ctx context.Context, logger logr.Logger, dd *velerov2alpha1.DataDownload, podNamespace string) (ctrl.Result, error) {
-	scratchPVC, err := r.findScratchPVC(ctx, dd)
+	isBlockMode := isBlockModeRestore(dd)
+
+	// A Filesystem-mode target's single scratch PVC is what gets rebound (role
+	// ""); a Block-mode target instead rebinds the separate output PVC -- the
+	// work PVC (staging the qcow2 chain) is never rebound and gets deleted
+	// below once the rebind succeeds.
+	rebindRole := ""
+	if isBlockMode {
+		rebindRole = common.ScratchVolumeRoleOutput
+	}
+	reboundPVC, err := r.findScratchPVC(ctx, dd, rebindRole)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to find scratch PVC: %w", err)
 	}
-	if scratchPVC == nil {
+	if reboundPVC == nil {
 		err := fmt.Errorf("scratch PVC not found for completed DataDownload %s", dd.Name)
 		logger.Error(err, "Cannot rebind restored volume")
 		if updateErr := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed, err.Error()); updateErr != nil {
@@ -1133,7 +1360,7 @@ func (r *KubeVirtDataDownloadReconciler) completeSuccessfulDownload(ctx context.
 
 	rebindResult, err := rebindPVToNamespace(
 		ctx, r.Client, logger,
-		scratchPVC.Name, podNamespace, dd.Spec.TargetVolume.Namespace,
+		reboundPVC.Name, podNamespace, dd.Spec.TargetVolume.Namespace,
 		dd.Name, string(dd.UID),
 		common.LabelDataDownloadUID, common.AnnotationDataDownloadName,
 		BindTargetExisting, dd.Spec.TargetVolume.PVC,
@@ -1150,6 +1377,20 @@ func (r *KubeVirtDataDownloadReconciler) completeSuccessfulDownload(ctx context.
 	}
 	logger.Info("Successfully provisioned restored volume to target namespace",
 		"pvc", rebindResult.NewPVCName, "pv", rebindResult.PVName)
+
+	// The work PVC staged the qcow2 chain and is never rebound (only the
+	// output PVC above is) -- delete it now that the download is done. Best-
+	// effort: a leftover work PVC is just extra storage usage, not worth
+	// failing an otherwise-successful restore over.
+	if isBlockMode {
+		if workPVC, err := r.findScratchPVC(ctx, dd, common.ScratchVolumeRoleWork); err != nil {
+			logger.Error(err, "Failed to find work PVC for cleanup")
+		} else if workPVC != nil {
+			if err := r.Delete(ctx, workPVC); err != nil && !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to delete work PVC", "pvc", workPVC.Name)
+			}
+		}
+	}
 
 	// The rebound PV is intentionally left with the Retain policy rebindPVToNamespace
 	// sets on it (rebindResult.OriginalReclaimPolicy is not restored here, unlike
