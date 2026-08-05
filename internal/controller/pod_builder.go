@@ -57,10 +57,14 @@ type DatamoverPodConfig struct {
 	BSLRegion   string
 
 	// S3-compatible storage provider settings
-	BSLS3URL                 string
-	BSLS3ForcePathStyle      string
-	BSLInsecureSkipTLSVerify string
-	BSLCACert                string
+	BSLS3URL                     string
+	BSLS3ForcePathStyle          string
+	BSLInsecureSkipTLSVerify     string
+	BSLCACert                    string
+	BSLServerSideEncryption      string
+	BSLKMSKeyID                  string
+	BSLChecksumAlgorithm         string
+	BSLCustomerKeyEncryptionFile string
 
 	// GCP-specific storage provider settings
 	BSLServiceAccount string
@@ -142,6 +146,10 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 		{Name: common.EnvBSLS3ForcePathStyle, Value: config.BSLS3ForcePathStyle},
 		{Name: common.EnvBSLInsecureSkipTLSVerify, Value: config.BSLInsecureSkipTLSVerify},
 		{Name: common.EnvBSLCACert, Value: config.BSLCACert},
+		{Name: common.EnvBSLServerSideEncryption, Value: config.BSLServerSideEncryption},
+		{Name: common.EnvBSLKMSKeyID, Value: config.BSLKMSKeyID},
+		{Name: common.EnvBSLChecksumAlgorithm, Value: config.BSLChecksumAlgorithm},
+		{Name: common.EnvBSLCustomerKeyEncryptionFile, Value: config.BSLCustomerKeyEncryptionFile},
 		{Name: common.EnvBSLServiceAccount, Value: config.BSLServiceAccount},
 		{Name: common.EnvBSLKMSKeyName, Value: config.BSLKMSKeyName},
 		{Name: common.EnvBSLResourceGroup, Value: config.BSLResourceGroup},
