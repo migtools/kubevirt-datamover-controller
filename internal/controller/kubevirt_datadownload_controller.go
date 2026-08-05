@@ -806,10 +806,23 @@ func listScratchPVC(ctx context.Context, reader client.Reader, namespace string,
 // regardless of role label -- a Filesystem-mode restore target has one
 // (unlabeled), a Block-mode target has two (role-labeled "work" and
 // "output"). Used by cleanup paths that need to remove all of them without
-// caring which role each one carries.
+// caring which role each one carries. Tries the cached client first; if it
+// finds nothing, retries via APIReader (an uncached read) before the caller
+// concludes none exist -- the informer cache is only eventually consistent,
+// so a PVC created moments ago in an earlier reconcile may not yet be visible
+// to a cached List, and deleteAllScratchPVCs's caller (handleCanceling) is a
+// terminal path where missing one here means it's never cleaned up at all.
 func (r *KubeVirtDataDownloadReconciler) listAllScratchPVCs(ctx context.Context, dd *velerov2alpha1.DataDownload) ([]corev1.PersistentVolumeClaim, error) {
+	pvcs, err := listAllScratchPVCsFrom(ctx, r.Client, r.getPodNamespace(dd), dd)
+	if err != nil || len(pvcs) > 0 || r.APIReader == nil {
+		return pvcs, err
+	}
+	return listAllScratchPVCsFrom(ctx, r.APIReader, r.getPodNamespace(dd), dd)
+}
+
+func listAllScratchPVCsFrom(ctx context.Context, reader client.Reader, namespace string, dd *velerov2alpha1.DataDownload) ([]corev1.PersistentVolumeClaim, error) {
 	pvcList := &corev1.PersistentVolumeClaimList{}
-	if err := r.List(ctx, pvcList, client.InNamespace(r.getPodNamespace(dd)), client.MatchingLabels{common.LabelDataDownloadUID: string(dd.UID)}); err != nil {
+	if err := reader.List(ctx, pvcList, client.InNamespace(namespace), client.MatchingLabels{common.LabelDataDownloadUID: string(dd.UID)}); err != nil {
 		return nil, fmt.Errorf("failed to list scratch PVCs: %w", err)
 	}
 	return pvcList.Items, nil

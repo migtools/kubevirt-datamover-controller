@@ -90,33 +90,48 @@ type PVRebindResult struct {
 }
 
 // resolveSourcePV implements rebindPVToNamespace's Step 1: get the source PVC
-// and its bound PV. If the source PVC is genuinely missing, recovers via a
-// UID-label PV search (#153) instead of failing outright -- this could be a
-// prior invocation that crashed after Step 3 deleted the source PVC but before
-// Step 5 completed the claimRef patch, and the label is unique to this
-// resource's own rebind operation, so the PV is findable this way regardless
-// of exactly how far that prior invocation got. Returns sourcePVCAlreadyGone
-// true in that recovered case, telling the caller to skip Step 1.5's
-// leftover-cleanup delete and Step 3's delete-and-wait entirely (the returned
-// sourcePVC is a zero-value placeholder then, not a real object).
+// and its bound PV. Tolerates two crash-recovery states instead of failing
+// outright:
+//   - Source PVC still present but ClaimLost (not just ClaimBound): a prior
+//     invocation completed Step 5 (PV claimRef repointed to the destination)
+//     but crashed before Step 3 deleted this PVC. Step 1.5's BindTargetExisting
+//     idempotent-short-circuit is what actually detects and finishes this case;
+//     this function only needs to not fail before reaching it.
+//   - Source PVC genuinely missing (#153): recovers via a UID-label PV search
+//     instead -- this could be a prior invocation that crashed after Step 3
+//     deleted the source PVC but before Step 5 completed the claimRef patch,
+//     and the label is unique to this resource's own rebind operation, so the
+//     PV is findable this way regardless of exactly how far that prior
+//     invocation got. Returns sourcePVCAlreadyGone true in that recovered
+//     case, telling the caller to skip Step 1.5's leftover-cleanup delete and
+//     Step 3's delete-and-wait entirely (the returned sourcePVC is a
+//     zero-value placeholder then, not a real object).
 func resolveSourcePV(ctx context.Context, k8sClient client.Client, logger logr.Logger, sourcePVCName, sourceNamespace, uidLabelKey, resourceUID string) (pv *corev1.PersistentVolume, pvName string, sourcePVC *corev1.PersistentVolumeClaim, sourcePVCAlreadyGone bool, err error) {
 	sourcePVC = &corev1.PersistentVolumeClaim{}
 	getErr := k8sClient.Get(ctx, types.NamespacedName{Name: sourcePVCName, Namespace: sourceNamespace}, sourcePVC)
 
 	switch {
 	case getErr == nil:
-		if sourcePVC.Status.Phase != corev1.ClaimBound {
+		// ClaimLost (not just ClaimBound) is also acceptable here: it's exactly
+		// the state a source PVC ends up in if a prior invocation completed
+		// Step 5 (PV claimRef repointed to the destination) but crashed before
+		// Step 3 deleted this PVC -- the PV controller marks an orphaned PVC
+		// Lost once its bound PV's claimRef no longer names it. Spec.VolumeName
+		// is still trustworthy in that state, and Step 1.5's BindTargetExisting
+		// idempotent-short-circuit is exactly what detects and finishes that
+		// case; failing outright here would prevent ever reaching it.
+		if sourcePVC.Status.Phase != corev1.ClaimBound && sourcePVC.Status.Phase != corev1.ClaimLost {
 			return nil, "", nil, false, fmt.Errorf("source PVC %s/%s is not bound (phase: %s)", sourceNamespace, sourcePVCName, sourcePVC.Status.Phase)
 		}
 		pvName = sourcePVC.Spec.VolumeName
 		if pvName == "" {
-			return nil, "", nil, false, fmt.Errorf("source PVC %s/%s has no volume name", sourceNamespace, sourcePVCName)
+			return nil, "", nil, false, fmt.Errorf("source PVC %s/%s has no volume name (phase: %s)", sourceNamespace, sourcePVCName, sourcePVC.Status.Phase)
 		}
 		pv = &corev1.PersistentVolume{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
 			return nil, "", nil, false, fmt.Errorf("failed to get PV %s: %w", pvName, err)
 		}
-		logger.Info("Found PV bound to source PVC", "pv", pvName, "sourcePVC", sourcePVCName)
+		logger.Info("Found PV bound to source PVC", "pv", pvName, "sourcePVC", sourcePVCName, "sourcePVCPhase", sourcePVC.Status.Phase)
 		return pv, pvName, sourcePVC, false, nil
 
 	case errors.IsNotFound(getErr):

@@ -457,6 +457,86 @@ func TestRebindPVToNamespace_AlreadyBoundIdempotentShortCircuit(t *testing.T) {
 	}
 }
 
+// TestRebindPVToNamespace_AlreadyBoundIdempotentShortCircuit_SourcePVCClaimLost
+// covers the same idempotent-short-circuit scenario as the test above, but
+// with the source PVC's Status.Phase realistically set to ClaimLost rather
+// than ClaimBound -- the actual phase a real Kubernetes PV controller sets on
+// an orphaned PVC once its bound PV's claimRef points elsewhere (exactly this
+// scenario: a prior invocation completed Step 5's claimRef repoint but
+// crashed before Step 3 deleted this PVC). resolveSourcePV must tolerate this
+// phase instead of failing with "source PVC ... is not bound (phase: Lost)"
+// before Step 1.5 ever gets a chance to detect and finish the rebind.
+func TestRebindPVToNamespace_AlreadyBoundIdempotentShortCircuit_SourcePVCClaimLost(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	sourcePV := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-scratch"},
+		Spec: corev1.PersistentVolumeSpec{
+			Capacity:                      corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			AccessModes:                   []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain,
+			StorageClassName:              "standard",
+			VolumeMode:                    new(corev1.PersistentVolumeFilesystem),
+			ClaimRef: &corev1.ObjectReference{
+				Kind:      "PersistentVolumeClaim",
+				Name:      "restored-disk",
+				Namespace: "restore-ns",
+			},
+		},
+	}
+	sourcePVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "scratch-pvc", Namespace: "oadp-ns"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			VolumeName:       "pv-scratch",
+			StorageClassName: new("standard"),
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimLost},
+	}
+	targetPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "restored-disk", Namespace: "restore-ns"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			VolumeName:       "pv-scratch",
+			StorageClassName: new("standard"),
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sourcePV, sourcePVC, targetPVC).
+		Build()
+
+	result, err := rebindPVToNamespace(
+		context.Background(), fakeClient, logr.Discard(),
+		sourcePVC.Name, sourcePVC.Namespace, targetPVC.Namespace,
+		"test-dd", "uid-123",
+		"velero.io/datadownload-uid", "velero.io/datadownload-name",
+		BindTargetExisting, targetPVC.Name,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.NewPVCName != targetPVC.Name || result.NewPVCNamespace != targetPVC.Namespace || result.PVName != sourcePV.Name {
+		t.Errorf("result = %+v, want NewPVCName=%q NewPVCNamespace=%q PVName=%q",
+			result, targetPVC.Name, targetPVC.Namespace, sourcePV.Name)
+	}
+
+	// The leftover (now-Lost) source PVC must have been cleaned up.
+	err = fakeClient.Get(context.Background(), types.NamespacedName{Name: sourcePVC.Name, Namespace: sourcePVC.Namespace}, &corev1.PersistentVolumeClaim{})
+	if !errors.IsNotFound(err) {
+		t.Errorf("expected leftover source PVC to be deleted, get returned: %v", err)
+	}
+}
+
 // TestRebindPVToNamespace_EmptyExistingPVCName tests validation of an empty
 // existingPVCName.
 func TestRebindPVToNamespace_EmptyExistingPVCName(t *testing.T) {
