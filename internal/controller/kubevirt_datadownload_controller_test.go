@@ -742,6 +742,56 @@ func TestHandleNewDataDownload(t *testing.T) {
 	}
 }
 
+// TestHandleNewDataDownload_BSLTransientError_RequeuesWithoutFailing covers
+// #123: a transient error from the BSL lookup (API hiccup, cache-not-yet-synced
+// -- anything other than a genuine NotFound) must not terminally fail the
+// DataDownload the way a real "BSL doesn't exist" does. It should be returned
+// so controller-runtime retries with backoff, since the condition may resolve
+// on its own.
+func TestHandleNewDataDownload_BSLTransientError_RequeuesWithoutFailing(t *testing.T) {
+	scheme := ddScheme()
+
+	dd := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "dd-bsl-transient", Namespace: "openshift-adp",
+			Annotations: map[string]string{common.AnnotationVMName: "vm-1"},
+		},
+		Spec: velerov2alpha1.DataDownloadSpec{
+			DataMover: common.DataMoverKubeVirt, BackupStorageLocation: "default",
+			SourceNamespace: "vm-ns",
+			TargetVolume:    velerov2alpha1.TargetVolumeSpec{PVC: "restored-disk-1", Namespace: "restore-ns"},
+		},
+	}
+
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd).Build()
+	transientErr := fmt.Errorf("simulated transient API error")
+	interceptedClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*velerov1.BackupStorageLocation); ok {
+				return transientErr
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	r := &KubeVirtDataDownloadReconciler{Client: interceptedClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+	_, err := r.handleNew(context.Background(), logr.Discard(), dd)
+	if err == nil {
+		t.Fatal("expected the transient error to be returned for retry, got nil")
+	}
+	if !strings.Contains(err.Error(), transientErr.Error()) {
+		t.Errorf("error = %v, want it to contain %v", err, transientErr)
+	}
+
+	var updated velerov2alpha1.DataDownload
+	if getErr := baseClient.Get(context.Background(), types.NamespacedName{Name: dd.Name, Namespace: dd.Namespace}, &updated); getErr != nil {
+		t.Fatalf("failed to get DataDownload: %v", getErr)
+	}
+	if updated.Status.Phase == velerov2alpha1.DataDownloadPhaseFailed {
+		t.Error("phase must not be Failed on a transient BSL lookup error -- only a genuine NotFound is terminal")
+	}
+}
+
 func TestCalculateScratchPVCSize(t *testing.T) {
 	vmIndex := uploader.VMIndex{
 		VMName:    "vm-1",

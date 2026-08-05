@@ -4458,6 +4458,62 @@ func TestHandleAccepted_BSLNotAccessible_FailsDataUpload(t *testing.T) {
 	}
 }
 
+// TestHandleAccepted_BSLTransientError_RequeuesWithoutFailing covers #123: a
+// transient error from the BSL lookup (API hiccup, cache-not-yet-synced --
+// anything other than a genuine NotFound) must not terminally fail the
+// DataUpload the way a real "BSL doesn't exist" does. It should be returned so
+// controller-runtime retries with backoff, since the condition may resolve on
+// its own.
+func TestHandleAccepted_BSLTransientError_RequeuesWithoutFailing(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-du-bsl-transient", Namespace: "test-ns", UID: types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      "test-vm",
+				common.AnnotationVMNamespace: "test-ns",
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt, SourceNamespace: "test-ns", BackupStorageLocation: "my-bsl",
+		},
+		Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseAccepted},
+	}
+
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).Build()
+	transientErr := fmt.Errorf("simulated transient API error")
+	interceptedClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*velerov1.BackupStorageLocation); ok {
+				return transientErr
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	r := &KubeVirtDataUploadReconciler{Client: interceptedClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "test-ns"}
+
+	_, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err == nil {
+		t.Fatal("expected the transient error to be returned for retry, got nil")
+	}
+	if !strings.Contains(err.Error(), transientErr.Error()) {
+		t.Errorf("error = %v, want it to contain %v", err, transientErr)
+	}
+
+	var updated velerov2alpha1.DataUpload
+	if getErr := baseClient.Get(context.Background(), types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, &updated); getErr != nil {
+		t.Fatalf("failed to get DataUpload: %v", getErr)
+	}
+	if updated.Status.Phase == velerov2alpha1.DataUploadPhaseFailed {
+		t.Error("phase must not be Failed on a transient BSL lookup error -- only a genuine NotFound is terminal")
+	}
+}
+
 func TestLookupCheckpointFromBSL_MissingBucket(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov1.AddToScheme(scheme)

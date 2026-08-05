@@ -367,6 +367,9 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	if du.Spec.BackupStorageLocation != "" {
 		bslObj, err := r.getBackupStorageLocationForDU(ctx, du)
 		if err != nil {
+			if isTransientBSLLookupError(err, du.Spec.BackupStorageLocation) {
+				return ctrl.Result{}, fmt.Errorf("failed to get BackupStorageLocation: %w", err)
+			}
 			logger.Error(err, "BackupStorageLocation not accessible")
 			if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
 				fmt.Sprintf("BackupStorageLocation not accessible: %v", err)); updateErr != nil {
@@ -863,6 +866,9 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	// Get BackupStorageLocation
 	bsl, err := r.getBackupStorageLocationForDU(ctx, du)
 	if err != nil {
+		if isTransientBSLLookupError(err, du.Spec.BackupStorageLocation) {
+			return ctrl.Result{}, fmt.Errorf("failed to get BackupStorageLocation: %w", err)
+		}
 		logger.Error(err, "Failed to get BackupStorageLocation")
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Failed to get BSL: %v", err)); err != nil {
 			return ctrl.Result{}, err

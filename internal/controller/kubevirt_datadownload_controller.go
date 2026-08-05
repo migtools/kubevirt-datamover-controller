@@ -272,6 +272,9 @@ func (r *KubeVirtDataDownloadReconciler) handleNew(ctx context.Context, logger l
 
 	bsl, err := r.getBackupStorageLocationForDD(ctx, dd)
 	if err != nil {
+		if isTransientBSLLookupError(err, dd.Spec.BackupStorageLocation) {
+			return ctrl.Result{}, fmt.Errorf("failed to get BackupStorageLocation: %w", err)
+		}
 		logger.Error(err, "BackupStorageLocation not accessible")
 		if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed,
 			fmt.Sprintf("BackupStorageLocation not accessible: %v", err)); err != nil {
@@ -433,6 +436,9 @@ func (r *KubeVirtDataDownloadReconciler) handleAccepted(ctx context.Context, log
 
 	bsl, err := r.getBackupStorageLocationForDD(ctx, dd)
 	if err != nil {
+		if isTransientBSLLookupError(err, dd.Spec.BackupStorageLocation) {
+			return ctrl.Result{}, fmt.Errorf("failed to get BackupStorageLocation: %w", err)
+		}
 		logger.Error(err, "Failed to get BackupStorageLocation")
 		if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed, fmt.Sprintf("Failed to get BSL: %v", err)); err != nil {
 			return ctrl.Result{}, err
@@ -854,6 +860,9 @@ func (r *KubeVirtDataDownloadReconciler) handlePrepared(ctx context.Context, log
 
 	bsl, err := r.getBackupStorageLocationForDD(ctx, dd)
 	if err != nil {
+		if isTransientBSLLookupError(err, dd.Spec.BackupStorageLocation) {
+			return ctrl.Result{}, fmt.Errorf("failed to get BackupStorageLocation: %w", err)
+		}
 		logger.Error(err, "Failed to get BackupStorageLocation")
 		if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed, fmt.Sprintf("Failed to get BSL: %v", err)); err != nil {
 			return ctrl.Result{}, err

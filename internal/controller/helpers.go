@@ -163,6 +163,20 @@ func getBackupStorageLocation(ctx context.Context, k8sClient client.Client, bslN
 	return bsl, nil
 }
 
+// isTransientBSLLookupError reports whether an error from getBackupStorageLocation
+// (or its ...ForDU/...ForDD wrappers) is worth retrying (a transient API
+// hiccup or cache-not-yet-synced 404) rather than a definitive "BSL doesn't
+// exist" failure. An empty bslName is always definitive -- a spec-configuration
+// error retrying can never fix -- regardless of what the error itself says.
+// A genuine apierrors.NotFound (the BSL object doesn't exist) is also
+// definitive. Anything else (timeouts, throttling, other API errors) is
+// treated as transient so the caller returns the error for controller-runtime
+// to retry with backoff, instead of terminally failing on something that might
+// resolve on its own.
+func isTransientBSLLookupError(err error, bslName string) bool {
+	return bslName != "" && !errors.IsNotFound(err)
+}
+
 // findPodByUID finds the unique datamover pod associated with a resource UID.
 // Tries the cached client first; if it finds nothing, retries via apiReader
 // (an uncached read) before the caller concludes the pod is genuinely absent --
