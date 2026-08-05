@@ -21,6 +21,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/downloader"
@@ -65,6 +66,16 @@ const scratchDataVolumeName = "scratch-data"
 
 // backupDataVolumeName is the upload-mode source PVC volume/mount name.
 const backupDataVolumeName = "backup-data"
+
+// restoreOutputVolumeName is the Block-mode target's second scratch volume
+// name (a raw block device, mounted as a volumeDevice rather than a
+// volumeMount) -- see DatamoverPodConfig.OutputPVCName.
+const restoreOutputVolumeName = "restore-output"
+
+// defaultOutputDevicePath is the default path inside the container
+// restoreOutputVolumeName's volumeDevice is mapped to, used when
+// DatamoverPodConfig.OutputDevicePath is unset.
+const defaultOutputDevicePath = "/dev/restore-output"
 
 // DatamoverPodConfig contains configuration for building a datamover pod.
 type DatamoverPodConfig struct {
@@ -136,9 +147,24 @@ type DatamoverPodConfig struct {
 	// Source PVC (upload mode only): the app PVC being backed up, mounted read-only.
 	SourcePVCName string
 
-	// ScratchPVCName (download mode only): read-write PVC that stages the downloaded
-	// qcow2 chain and holds the final flattened raw disk image.
+	// ScratchPVCName (download mode only): read-write Filesystem-mode PVC that
+	// stages the downloaded qcow2 chain. For a Filesystem-mode target volume,
+	// this also holds the final flattened raw disk image and is the volume
+	// rebound onto the target PVC. For a Block-mode target volume, the final
+	// image instead goes onto OutputPVCName -- this PVC only ever holds the
+	// qcow2 chain and is discarded (never rebound) after the pod completes.
 	ScratchPVCName string
+
+	// OutputPVCName (download mode, Block-mode target only): a second,
+	// Block-mode PVC that receives only the final flattened raw disk image,
+	// mounted as a raw volumeDevice rather than a filesystem mount. This is
+	// the volume rebound onto the target PVC on completion. Empty for a
+	// Filesystem-mode target, where ScratchPVCName alone serves both roles.
+	OutputPVCName string
+
+	// OutputDevicePath (download mode, Block-mode target only): the path
+	// inside the container OutputPVCName's volumeDevice is mapped to.
+	OutputDevicePath string
 
 	// TargetVolume (download mode only): the disk/PVC name being restored, used to
 	// filter the checkpoint chain down to the matching file.
@@ -192,9 +218,10 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 	var envVars []corev1.EnvVar
 	var volumes []corev1.Volume
 	var volumeMounts []corev1.VolumeMount
+	var volumeDevices []corev1.VolumeDevice
 
 	if mode == OperationModeDownload {
-		envVars, volumes, volumeMounts = buildDownloadPodResources(config)
+		envVars, volumes, volumeMounts, volumeDevices = buildDownloadPodResources(config)
 	} else {
 		envVars, volumes, volumeMounts = buildUploadPodResources(config)
 	}
@@ -241,6 +268,7 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 					Command:         []string{"/manager", string(mode)},
 					Env:             envVars,
 					VolumeMounts:    volumeMounts,
+					VolumeDevices:   volumeDevices,
 					SecurityContext: &corev1.SecurityContext{
 						ReadOnlyRootFilesystem: &readOnlyRootFilesystem,
 					},
@@ -295,9 +323,26 @@ func buildSharedBSLEnvVars(config *DatamoverPodConfig) []corev1.EnvVar {
 	}
 }
 
-// buildDownloadPodResources returns the env vars, volumes, and volume mounts
-// for a download-mode (OperationModeDownload) datamover pod.
-func buildDownloadPodResources(config *DatamoverPodConfig) ([]corev1.EnvVar, []corev1.Volume, []corev1.VolumeMount) {
+// buildDownloadPodResources returns the env vars, volumes, volume mounts, and
+// (Block-mode target only) volume devices for a download-mode
+// (OperationModeDownload) datamover pod.
+func buildDownloadPodResources(config *DatamoverPodConfig) ([]corev1.EnvVar, []corev1.Volume, []corev1.VolumeMount, []corev1.VolumeDevice) {
+	// For a Filesystem-mode target, the final raw image is written into the
+	// scratch volume itself (matching CDI/KubeVirt's disk.img convention,
+	// since this same volume's PV is rebound directly as the restore target).
+	// For a Block-mode target, it instead goes onto the separate OutputPVCName
+	// device -- the scratch volume only ever holds the qcow2 chain then, and
+	// is discarded (never rebound) once the pod completes.
+	targetIsBlockDevice := config.OutputPVCName != ""
+	targetPath := path.Join(downloader.DefaultScratchPath, downloadTargetFilename)
+	outputDevicePath := config.OutputDevicePath
+	if outputDevicePath == "" {
+		outputDevicePath = defaultOutputDevicePath
+	}
+	if targetIsBlockDevice {
+		targetPath = outputDevicePath
+	}
+
 	envVars := append(buildSharedBSLEnvVars(config),
 		corev1.EnvVar{Name: downloader.EnvVMName, Value: config.VMName},
 		corev1.EnvVar{Name: downloader.EnvVMNamespace, Value: config.VMNamespace},
@@ -306,7 +351,8 @@ func buildDownloadPodResources(config *DatamoverPodConfig) ([]corev1.EnvVar, []c
 		corev1.EnvVar{Name: downloader.EnvDataDownloadUID, Value: config.ResourceUID},
 		corev1.EnvVar{Name: downloader.EnvTargetVolume, Value: config.TargetVolume},
 		corev1.EnvVar{Name: downloader.EnvScratchPath, Value: downloader.DefaultScratchPath},
-		corev1.EnvVar{Name: downloader.EnvTargetPath, Value: path.Join(downloader.DefaultScratchPath, downloadTargetFilename)},
+		corev1.EnvVar{Name: downloader.EnvTargetPath, Value: targetPath},
+		corev1.EnvVar{Name: downloader.EnvTargetIsBlockDevice, Value: strconv.FormatBool(targetIsBlockDevice)},
 	)
 
 	volumes := []corev1.Volume{
@@ -331,7 +377,25 @@ func buildDownloadPodResources(config *DatamoverPodConfig) ([]corev1.EnvVar, []c
 		buildBoundSATokenVolumeMount(),
 	}
 
-	return envVars, volumes, volumeMounts
+	var volumeDevices []corev1.VolumeDevice
+	if targetIsBlockDevice {
+		volumes = append(volumes, corev1.Volume{
+			Name: restoreOutputVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: config.OutputPVCName,
+				},
+			},
+		})
+		volumeDevices = []corev1.VolumeDevice{
+			{
+				Name:       restoreOutputVolumeName,
+				DevicePath: outputDevicePath,
+			},
+		}
+	}
+
+	return envVars, volumes, volumeMounts, volumeDevices
 }
 
 // buildCredentialsVolume returns the BSL credentials secret volume shared by

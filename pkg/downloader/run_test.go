@@ -193,6 +193,44 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		}
 	})
 
+	t.Run("block device target: TargetPath required, no default, filesystem-root check skipped", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv(EnvTargetIsBlockDevice, "true")
+		t.Setenv(EnvTargetPath, "/dev/restore-output")
+
+		cfg, err := LoadConfigFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.TargetIsBlockDevice {
+			t.Error("expected TargetIsBlockDevice = true")
+		}
+		if cfg.TargetPath != "/dev/restore-output" {
+			t.Errorf("TargetPath = %q, want %q", cfg.TargetPath, "/dev/restore-output")
+		}
+	})
+
+	t.Run("block device target with no TargetPath returns error (no default device path)", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv(EnvTargetIsBlockDevice, "true")
+
+		_, err := LoadConfigFromEnv()
+		if err == nil {
+			t.Fatal("expected error when TargetIsBlockDevice is true but TargetPath is unset")
+		}
+	})
+
+	t.Run("block device target with a relative TargetPath returns error", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv(EnvTargetIsBlockDevice, "true")
+		t.Setenv(EnvTargetPath, "relative-device")
+
+		_, err := LoadConfigFromEnv()
+		if err == nil {
+			t.Fatal("expected error for a relative block device path")
+		}
+	})
+
 	requiredVars := []string{
 		common.EnvBSLProvider, common.EnvBSLBucket,
 		EnvVMName, EnvVMNamespace, EnvVeleroBackupName, EnvTargetVolume,

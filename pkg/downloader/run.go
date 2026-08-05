@@ -42,7 +42,13 @@ func Run(ctx context.Context, logger logr.Logger) error {
 		"backup", config.VeleroBackupName,
 		"targetVolume", config.TargetVolume)
 
-	if err := prepareTargetDir(config.TargetPath); err != nil {
+	if config.TargetIsBlockDevice {
+		// The target is a raw block device (a rebound Block-mode PV mounted as
+		// a volumeDevice), not a path inside a mounted filesystem -- there's no
+		// containing directory to prepare, and attempting to would try to
+		// MkdirAll/chmod something like "/dev" itself.
+		logger.Info("Target is a block device, skipping target directory preparation", "target", config.TargetPath)
+	} else if err := prepareTargetDir(config.TargetPath); err != nil {
 		return err
 	}
 	if err := prepareDir(config.ScratchPath); err != nil {
@@ -106,24 +112,35 @@ func Run(ctx context.Context, logger logr.Logger) error {
 	}
 
 	tip := localPaths[len(localPaths)-1]
-	tmpFile, err := os.CreateTemp(filepath.Dir(config.TargetPath), "."+filepath.Base(config.TargetPath)+".tmp-*")
-	if err != nil {
-		return fmt.Errorf("failed to create temporary target: %w", err)
-	}
-	tmpTargetPath := tmpFile.Name()
-	if err := tmpFile.Close(); err != nil {
-		_ = os.Remove(tmpTargetPath)
-		return fmt.Errorf("failed to create temporary target: %w", err)
-	}
-	// Best-effort: after a successful rename below this is already gone, so
-	// the removal here is a no-op that only matters on the error paths.
-	defer func() { _ = os.Remove(tmpTargetPath) }()
 
-	if err := flattenToRaw(ctx, tip, tmpTargetPath); err != nil {
-		return fmt.Errorf("failed to flatten checkpoint chain to raw: %w", err)
-	}
-	if err := os.Rename(tmpTargetPath, config.TargetPath); err != nil {
-		return fmt.Errorf("failed to publish restored disk image: %w", err)
+	if config.TargetIsBlockDevice {
+		// No atomic temp-file+rename publish for a device node: renaming a
+		// regular file onto a device special-file path would just replace the
+		// directory entry, not write bytes onto the device, and the device
+		// node provides no atomicity of its own to preserve. Write directly.
+		if err := flattenToRaw(ctx, tip, config.TargetPath, true); err != nil {
+			return fmt.Errorf("failed to flatten checkpoint chain to raw: %w", err)
+		}
+	} else {
+		tmpFile, err := os.CreateTemp(filepath.Dir(config.TargetPath), "."+filepath.Base(config.TargetPath)+".tmp-*")
+		if err != nil {
+			return fmt.Errorf("failed to create temporary target: %w", err)
+		}
+		tmpTargetPath := tmpFile.Name()
+		if err := tmpFile.Close(); err != nil {
+			_ = os.Remove(tmpTargetPath)
+			return fmt.Errorf("failed to create temporary target: %w", err)
+		}
+		// Best-effort: after a successful rename below this is already gone, so
+		// the removal here is a no-op that only matters on the error paths.
+		defer func() { _ = os.Remove(tmpTargetPath) }()
+
+		if err := flattenToRaw(ctx, tip, tmpTargetPath, false); err != nil {
+			return fmt.Errorf("failed to flatten checkpoint chain to raw: %w", err)
+		}
+		if err := os.Rename(tmpTargetPath, config.TargetPath); err != nil {
+			return fmt.Errorf("failed to publish restored disk image: %w", err)
+		}
 	}
 
 	logger.Info("Download completed successfully", "target", config.TargetPath)
@@ -189,24 +206,36 @@ func LoadConfigFromEnv() (*DownloaderConfig, error) {
 			BSLActiveDirectoryAuthorityURI: os.Getenv(common.EnvBSLActiveDirectoryAuthorityURI),
 			CredentialsFile:                os.Getenv(common.EnvCredentialsFile),
 		},
-		VMName:           os.Getenv(EnvVMName),
-		VMNamespace:      os.Getenv(EnvVMNamespace),
-		VeleroBackupName: os.Getenv(EnvVeleroBackupName),
-		DataDownloadName: os.Getenv(EnvDataDownloadName),
-		DataDownloadUID:  os.Getenv(EnvDataDownloadUID),
-		TargetVolume:     os.Getenv(EnvTargetVolume),
-		TargetPath:       os.Getenv(EnvTargetPath),
-		ScratchPath:      os.Getenv(EnvScratchPath),
+		VMName:              os.Getenv(EnvVMName),
+		VMNamespace:         os.Getenv(EnvVMNamespace),
+		VeleroBackupName:    os.Getenv(EnvVeleroBackupName),
+		DataDownloadName:    os.Getenv(EnvDataDownloadName),
+		DataDownloadUID:     os.Getenv(EnvDataDownloadUID),
+		TargetVolume:        os.Getenv(EnvTargetVolume),
+		TargetPath:          os.Getenv(EnvTargetPath),
+		TargetIsBlockDevice: common.ParseBool(os.Getenv(EnvTargetIsBlockDevice)),
+		ScratchPath:         os.Getenv(EnvScratchPath),
 	}
 
-	if config.TargetPath == "" {
-		config.TargetPath = DefaultTargetPath
-	}
-	if !filepath.IsAbs(config.TargetPath) {
-		return nil, fmt.Errorf("%s must be an absolute path", EnvTargetPath)
-	}
-	if filepath.Dir(config.TargetPath) == "/" {
-		return nil, fmt.Errorf("%s must not resolve to the filesystem root", EnvTargetPath)
+	if config.TargetIsBlockDevice {
+		// No sensible default for a raw device path -- the controller must
+		// provide the exact volumeDevice path it configured on the pod.
+		if config.TargetPath == "" {
+			return nil, fmt.Errorf("%s is required when %s is true", EnvTargetPath, EnvTargetIsBlockDevice)
+		}
+		if !filepath.IsAbs(config.TargetPath) {
+			return nil, fmt.Errorf("%s must be an absolute path", EnvTargetPath)
+		}
+	} else {
+		if config.TargetPath == "" {
+			config.TargetPath = DefaultTargetPath
+		}
+		if !filepath.IsAbs(config.TargetPath) {
+			return nil, fmt.Errorf("%s must be an absolute path", EnvTargetPath)
+		}
+		if filepath.Dir(config.TargetPath) == "/" {
+			return nil, fmt.Errorf("%s must not resolve to the filesystem root", EnvTargetPath)
+		}
 	}
 	if config.ScratchPath == "" {
 		config.ScratchPath = DefaultScratchPath

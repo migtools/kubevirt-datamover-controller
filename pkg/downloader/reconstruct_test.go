@@ -217,7 +217,7 @@ func TestFlattenToRaw(t *testing.T) {
 			gotArgs = args
 			return "", "", nil
 		})
-		if err := flattenToRaw(context.Background(), "tip.qcow2", outputPath); err != nil {
+		if err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, false); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		want := []string{"convert", "-p", "-f", "qcow2", "-O", "raw", "tip.qcow2", outputPath}
@@ -241,7 +241,7 @@ func TestFlattenToRaw(t *testing.T) {
 			called = true
 			return "", fakeBoomErr, errors.New("qemu-img failed")
 		})
-		err := flattenToRaw(context.Background(), "tip.qcow2", outputPath)
+		err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, false)
 		if err == nil {
 			t.Fatal("expected error from failing qemu-img convert")
 		}
@@ -259,12 +259,32 @@ func TestFlattenToRaw(t *testing.T) {
 		withFakeQemuImg(t, func(_ context.Context, _ ...string) (string, string, error) {
 			return "", fakeBoomErr, errors.New("qemu-img failed")
 		})
-		if err := flattenToRaw(context.Background(), "tip.qcow2", outputPath); err == nil {
+		if err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, false); err == nil {
 			t.Fatal("expected error from failing qemu-img convert")
 		}
 
 		if _, statErr := os.Stat(outputPath); !os.IsNotExist(statErr) {
 			t.Errorf("expected partial output file to be removed, stat err = %v", statErr)
+		}
+	})
+
+	t.Run("skipRemoveOnError leaves the output path alone on failure", func(t *testing.T) {
+		// Models a raw block device target: unlinking it would destroy the
+		// pod's only path to that volume, unlike a disposable regular file.
+		outputPath := filepath.Join(t.TempDir(), "disk.raw")
+		if err := os.WriteFile(outputPath, []byte("partial"), 0o600); err != nil {
+			t.Fatalf("failed to seed partial output file: %v", err)
+		}
+
+		withFakeQemuImg(t, func(_ context.Context, _ ...string) (string, string, error) {
+			return "", fakeBoomErr, errors.New("qemu-img failed")
+		})
+		if err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, true); err == nil {
+			t.Fatal("expected error from failing qemu-img convert")
+		}
+
+		if _, statErr := os.Stat(outputPath); statErr != nil {
+			t.Errorf("expected output path to be left alone (skipRemoveOnError=true), stat err = %v", statErr)
 		}
 	})
 }
@@ -299,7 +319,7 @@ func TestRebaseChainAndFlattenToRawWithRealQemuImg(t *testing.T) {
 	if err := rebaseChain(context.Background(), []string{fullPath, incPath}); err != nil {
 		t.Fatalf("rebaseChain failed against real qemu-img: %v", err)
 	}
-	if err := flattenToRaw(context.Background(), incPath, outputPath); err != nil {
+	if err := flattenToRaw(context.Background(), incPath, outputPath, false); err != nil {
 		t.Fatalf("flattenToRaw failed against real qemu-img: %v", err)
 	}
 

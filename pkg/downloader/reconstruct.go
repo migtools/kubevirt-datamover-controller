@@ -118,37 +118,54 @@ func inspectQcow2(ctx context.Context, path string) (qcow2Info, error) {
 // single flat raw disk image. qemu-img convert transparently follows the
 // backing chain, so this handles both a lone full backup (chain length 1)
 // and a full-plus-incrementals chain uniformly.
-func flattenToRaw(ctx context.Context, chainTipPath, outputPath string) error {
+// flattenToRaw converts the tip of the (now-rebased) backing chain into a
+// single flat raw disk image. qemu-img convert transparently follows the
+// backing chain, so this handles both a lone full backup (chain length 1)
+// and a full-plus-incrementals chain uniformly.
+//
+// skipRemoveOnError must be true when outputPath is a raw block device (not a
+// regular file inside a mounted filesystem): unlinking a device special-file
+// node destroys the pod's only path to that volume for the rest of its
+// lifetime, unlike a disposable regular file that's safe to remove and retry.
+func flattenToRaw(ctx context.Context, chainTipPath, outputPath string, skipRemoveOnError bool) error {
+	removeOnError := func() {
+		if !skipRemoveOnError {
+			_ = os.Remove(outputPath)
+		}
+	}
+
 	// Pre-create the output file with restrictive permissions: qemu-img
 	// convert writes into an existing file in place rather than recreating
 	// it, so this avoids a window where the restored VM disk briefly exists
 	// with the process's default (more permissive) umask. O_TRUNC and an
 	// explicit Chmod make this correct even if outputPath already existed
 	// with different content or permissions — the O_CREATE mode argument
-	// alone is only applied when the file doesn't already exist.
+	// alone is only applied when the file doesn't already exist. Both
+	// O_CREATE and O_TRUNC are safe no-ops against an existing block device
+	// node (the kernel ignores truncate semantics for special files).
 	f, err := os.OpenFile(outputPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("failed to pre-create raw image %q: %w", outputPath, err)
 	}
 	if err := f.Chmod(0o600); err != nil {
 		_ = f.Close()
-		_ = os.Remove(outputPath)
+		removeOnError()
 		return fmt.Errorf("failed to pre-create raw image %q: %w", outputPath, err)
 	}
 	if err := f.Close(); err != nil {
-		_ = os.Remove(outputPath)
+		removeOnError()
 		return fmt.Errorf("failed to pre-create raw image %q: %w", outputPath, err)
 	}
 
 	_, stderr, err := runQemuImg(ctx, "convert", "-p", "-f", "qcow2", "-O", "raw", chainTipPath, outputPath)
 	if err != nil {
-		_ = os.Remove(outputPath)
+		removeOnError()
 		return fmt.Errorf("failed to flatten %q to raw %q: %w (%s)", chainTipPath, outputPath, err, stderr)
 	}
 	// Kept as defense in depth in case convert ever recreates the file
 	// instead of writing in place.
 	if err := os.Chmod(outputPath, 0o600); err != nil {
-		_ = os.Remove(outputPath)
+		removeOnError()
 		return fmt.Errorf("failed to restrict permissions on raw image %q: %w", outputPath, err)
 	}
 	return nil

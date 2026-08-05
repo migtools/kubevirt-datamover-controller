@@ -611,6 +611,111 @@ func TestBuildDatamoverPod(t *testing.T) {
 	}
 }
 
+// TestBuildDatamoverPod_BlockModeTarget covers the two-scratch-volume design
+// for restoring into a Block-mode target: OutputPVCName set means a second,
+// Block-mode volume is added as a raw volumeDevice (not a filesystem mount),
+// EnvTargetPath points at its device path instead of a file inside the
+// (still-present, Filesystem-mode) scratch volume, and
+// EnvTargetIsBlockDevice is "true" so the downloader knows to skip the
+// temp-file+rename publish dance.
+func TestBuildDatamoverPod_BlockModeTarget(t *testing.T) {
+	config := &DatamoverPodConfig{
+		OperationMode:        OperationModeDownload,
+		Name:                 "test-dl-block",
+		Namespace:            "test-ns",
+		Image:                "test-image",
+		CredentialSecretName: "cloud-creds",
+		CredentialSecretKey:  "credentials",
+		ScratchPVCName:       "scratch-work-pvc",
+		OutputPVCName:        "scratch-output-pvc",
+	}
+
+	pod := buildDatamoverPod(config)
+	container := pod.Spec.Containers[0]
+
+	if len(container.VolumeMounts) != 3 {
+		t.Fatalf("expected 3 volume mounts (scratch work, credentials, sa-token), got %d", len(container.VolumeMounts))
+	}
+	foundScratchMount := false
+	for _, m := range container.VolumeMounts {
+		if m.Name == scratchDataVolumeName {
+			foundScratchMount = true
+			if m.MountPath != downloader.DefaultScratchPath {
+				t.Errorf("scratch mount path = %q, want %q", m.MountPath, downloader.DefaultScratchPath)
+			}
+		}
+	}
+	if !foundScratchMount {
+		t.Error("expected the Filesystem-mode scratch (qcow2 staging) volume mount to still be present")
+	}
+
+	if len(container.VolumeDevices) != 1 {
+		t.Fatalf("expected exactly 1 volume device, got %d", len(container.VolumeDevices))
+	}
+	if container.VolumeDevices[0].Name != restoreOutputVolumeName {
+		t.Errorf("volume device name = %q, want %q", container.VolumeDevices[0].Name, restoreOutputVolumeName)
+	}
+	if container.VolumeDevices[0].DevicePath != defaultOutputDevicePath {
+		t.Errorf("volume device path = %q, want %q", container.VolumeDevices[0].DevicePath, defaultOutputDevicePath)
+	}
+
+	var foundOutputVolume bool
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == restoreOutputVolumeName {
+			foundOutputVolume = true
+			if v.PersistentVolumeClaim == nil || v.PersistentVolumeClaim.ClaimName != config.OutputPVCName {
+				t.Errorf("output volume PVC = %+v, want claimName %q", v.PersistentVolumeClaim, config.OutputPVCName)
+			}
+		}
+	}
+	if !foundOutputVolume {
+		t.Error("expected a pod volume for OutputPVCName")
+	}
+
+	var targetPathEnv, isBlockDeviceEnv string
+	for _, e := range container.Env {
+		switch e.Name {
+		case downloader.EnvTargetPath:
+			targetPathEnv = e.Value
+		case downloader.EnvTargetIsBlockDevice:
+			isBlockDeviceEnv = e.Value
+		}
+	}
+	if targetPathEnv != defaultOutputDevicePath {
+		t.Errorf("%s = %q, want %q", downloader.EnvTargetPath, targetPathEnv, defaultOutputDevicePath)
+	}
+	if isBlockDeviceEnv != "true" {
+		t.Errorf("%s = %q, want %q", downloader.EnvTargetIsBlockDevice, isBlockDeviceEnv, "true")
+	}
+}
+
+// TestBuildDatamoverPod_FilesystemModeTarget_NoVolumeDevices covers the
+// unchanged Filesystem-mode path: OutputPVCName unset means no volume device
+// is added at all, and EnvTargetIsBlockDevice is "false".
+func TestBuildDatamoverPod_FilesystemModeTarget_NoVolumeDevices(t *testing.T) {
+	config := &DatamoverPodConfig{
+		OperationMode:        OperationModeDownload,
+		Name:                 "test-dl-fs",
+		Namespace:            "test-ns",
+		Image:                "test-image",
+		CredentialSecretName: "cloud-creds",
+		CredentialSecretKey:  "credentials",
+		ScratchPVCName:       "scratch-pvc",
+	}
+
+	pod := buildDatamoverPod(config)
+	container := pod.Spec.Containers[0]
+
+	if len(container.VolumeDevices) != 0 {
+		t.Errorf("expected no volume devices for a Filesystem-mode target, got %+v", container.VolumeDevices)
+	}
+	for _, e := range container.Env {
+		if e.Name == downloader.EnvTargetIsBlockDevice && e.Value != "false" {
+			t.Errorf("%s = %q, want %q", downloader.EnvTargetIsBlockDevice, e.Value, "false")
+		}
+	}
+}
+
 func TestDatamoverPodConfigDefaults(t *testing.T) {
 	config := &DatamoverPodConfig{
 		Name:                 "test",
