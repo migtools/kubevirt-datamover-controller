@@ -235,8 +235,7 @@ func uploadQcow2Files(
 			return fmt.Errorf("failed to upload %s: %w", path, uploadErr)
 		}
 
-		// Extract disk name from filename (e.g., "vmb-xxx-disk1.qcow2" -> "disk1")
-		diskName := extractDiskName(d.Name())
+		diskName := extractDiskName(d.Name(), config.VMBName)
 
 		files = append(files, CheckpointFile{
 			Filename:   d.Name(),
@@ -256,18 +255,44 @@ func uploadQcow2Files(
 }
 
 // extractDiskName extracts the disk name from a qcow2 filename.
-// E.g., "vmb-xxx-disk1.qcow2" -> "disk1"
-func extractDiskName(filename string) string {
-	// Remove .qcow2 extension
+// Virt-handler names checkpoint files as "{vmbName}-{diskName}.qcow2".
+// When the VMB name is available, it is stripped as a prefix to correctly
+// handle hyphenated disk names (e.g., "datadisk-1"). Falls back to taking
+// the substring after the last dash for backward compatibility.
+func extractDiskName(filename, vmbName string) string {
 	name := strings.TrimSuffix(filename, ".qcow2")
 	name = strings.TrimSuffix(name, ".QCOW2")
 
-	// Find the last dash and extract everything after it
-	parts := strings.Split(name, "-")
-	if len(parts) > 0 {
-		return parts[len(parts)-1]
+	// Primary: strip the VMB name prefix ("{vmbName}-")
+	if vmbName != "" {
+		prefix := vmbName + "-"
+		if strings.HasPrefix(name, prefix) {
+			return name[len(prefix):]
+		}
+	}
+
+	// Fallback: take the substring after the last dash
+	if idx := strings.LastIndex(name, "-"); idx >= 0 {
+		return name[idx+1:]
 	}
 	return name
+}
+
+// resolveDiskNameFromVolumes reverse-matches a qcow2 filename against the
+// VM's known volume names. It returns the longest volume name that appears
+// as a "-{name}.qcow2" suffix in the filename, or "" if none match.
+func resolveDiskNameFromVolumes(filename string, volumeMap map[string]string) string {
+	lower := strings.ToLower(filename)
+	name := strings.TrimSuffix(lower, ".qcow2")
+
+	var best string
+	for volName := range volumeMap {
+		suffix := "-" + strings.ToLower(volName)
+		if strings.HasSuffix(name, suffix) && len(volName) > len(best) {
+			best = volName
+		}
+	}
+	return best
 }
 
 // updateVMIndex creates or updates the per-VM index.json file.
@@ -293,15 +318,22 @@ func updateVMIndex(
 	}
 	volumeMap := common.GetVolumeMapForVm(vm)
 
-	// Extract PVC/disk names from uploaded files
+	// Resolve disk names against the VM's volume map. If the extracted disk
+	// name doesn't match any volume, try a reverse-match: check which known
+	// volume name the filename ends with. This handles cases where the VMB
+	// name wasn't available during extraction or the filename format changed.
 	var pvcNames []string
 	var pvcSizes []resource.Quantity
-	for _, f := range files {
+	for i, f := range files {
 		if f.DiskName != "" {
 			pvcName := volumeMap[f.DiskName]
 			if pvcName == "" {
-				// Erroring out if there's a non-PVC volume
-				return fmt.Errorf("no PVC found for %s", f.DiskName)
+				resolved := resolveDiskNameFromVolumes(f.Filename, volumeMap)
+				if resolved == "" {
+					return fmt.Errorf("no PVC found for %s", f.DiskName)
+				}
+				files[i].DiskName = resolved
+				pvcName = volumeMap[resolved]
 			}
 			pvcNames = append(pvcNames, pvcName)
 			pvc := &corev1.PersistentVolumeClaim{}
