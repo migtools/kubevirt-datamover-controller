@@ -614,6 +614,133 @@ func TestRebindPVToNamespace_BindTargetExisting(t *testing.T) {
 	}
 }
 
+// TestRebindPVToNamespace_RecoversAfterSourcePVCDeletedMidCrash covers #153: a
+// crash between Step 3 (source PVC deleted) and Step 5 (claimRef patched) must
+// be resumable on retry, not fail outright on "source PVC not found" -- Step 1
+// falls back to finding the PV by its UID label instead, then proceeds through
+// the rest of the flow as normal (skipping the now-pointless re-delete/re-wait
+// of a source PVC that's already confirmed gone).
+func TestRebindPVToNamespace_RecoversAfterSourcePVCDeletedMidCrash(t *testing.T) {
+	origInterval, origTimeout := pvRebindPollInterval, pvRebindTimeout
+	pvRebindPollInterval = 10 * time.Millisecond
+	pvRebindTimeout = 2 * time.Second
+	defer func() {
+		pvRebindPollInterval = origInterval
+		pvRebindTimeout = origTimeout
+	}()
+	pvRebindTimeout := pvRebindTimeout
+	binderDone := make(chan struct{})
+	var statusUpdateErr error
+	defer func() {
+		select {
+		case <-binderDone:
+			if statusUpdateErr != nil {
+				t.Errorf("fake-binder goroutine failed to update PVC status: %v", statusUpdateErr)
+			}
+		case <-time.After(pvRebindTimeout + time.Second):
+			t.Log("timed out waiting for fake-binder goroutine to finish")
+		}
+	}()
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	// No source PVC object at all -- simulates a prior invocation whose Step 3
+	// already deleted it. The PV is left exactly as Step 2/3 would have left it:
+	// still Delete-policy (Step 2 never got the chance to patch it to Retain in
+	// this specific crash timing) but carrying the UID label a real Step 5 patch
+	// would eventually also set -- modeling the earliest point in the crash
+	// window Step 1's recovery needs to handle, so the fix must also re-run
+	// Step 2's Retain patch on the recovered PV, not just skip straight to Step 5.
+	sourcePV := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "pv-scratch",
+			Labels: map[string]string{"velero.io/datadownload-uid": "uid-123"},
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			Capacity:                      corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			AccessModes:                   []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimDelete,
+			StorageClassName:              "standard",
+			VolumeMode:                    new(corev1.PersistentVolumeFilesystem),
+		},
+	}
+	targetPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "restored-disk", Namespace: "restore-ns", UID: types.UID("restored-disk-uid")},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			StorageClassName: new("standard"),
+			VolumeMode:       new(corev1.PersistentVolumeFilesystem),
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimPending},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sourcePV, targetPVC).
+		Build()
+
+	go func() {
+		defer close(binderDone)
+		deadline := time.Now().Add(pvRebindTimeout)
+		for time.Now().Before(deadline) {
+			pv := &corev1.PersistentVolume{}
+			if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: sourcePV.Name}, pv); err != nil {
+				statusUpdateErr = fmt.Errorf("get PV: %w", err)
+				return
+			}
+			if pv.Spec.ClaimRef != nil && pv.Spec.ClaimRef.Name == targetPVC.Name && pv.Spec.ClaimRef.Namespace == targetPVC.Namespace {
+				pvc := &corev1.PersistentVolumeClaim{}
+				if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: targetPVC.Name, Namespace: targetPVC.Namespace}, pvc); err != nil {
+					statusUpdateErr = fmt.Errorf("get target PVC: %w", err)
+					return
+				}
+				pvc.Spec.VolumeName = sourcePV.Name
+				if err := fakeClient.Update(context.Background(), pvc); err != nil {
+					statusUpdateErr = fmt.Errorf("update target PVC: %w", err)
+					return
+				}
+				pvc.Status.Phase = corev1.ClaimBound
+				statusUpdateErr = fakeClient.Status().Update(context.Background(), pvc)
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		statusUpdateErr = fmt.Errorf("timed out waiting for PV %s claimRef to name target PVC %s/%s", sourcePV.Name, targetPVC.Namespace, targetPVC.Name)
+	}()
+
+	result, err := rebindPVToNamespace(
+		context.Background(), fakeClient, logr.Discard(),
+		"scratch-pvc", "oadp-ns", targetPVC.Namespace,
+		"test-dd", "uid-123",
+		"velero.io/datadownload-uid", "velero.io/datadownload-name",
+		BindTargetExisting, targetPVC.Name,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.PVName != sourcePV.Name {
+		t.Errorf("PVName = %q, want %q", result.PVName, sourcePV.Name)
+	}
+	if result.NewPVCName != targetPVC.Name || result.NewPVCNamespace != targetPVC.Namespace {
+		t.Errorf("result = %+v, want NewPVCName=%q NewPVCNamespace=%q", result, targetPVC.Name, targetPVC.Namespace)
+	}
+
+	var pv corev1.PersistentVolume
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: sourcePV.Name}, &pv); err != nil {
+		t.Fatalf("failed to get PV: %v", err)
+	}
+	if pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
+		t.Errorf("PV reclaim policy = %q, want %q (Step 2 must still run on the recovered PV)", pv.Spec.PersistentVolumeReclaimPolicy, corev1.PersistentVolumeReclaimRetain)
+	}
+	if pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.Name != targetPVC.Name || pv.Spec.ClaimRef.Namespace != targetPVC.Namespace {
+		t.Errorf("PV claimRef = %+v, want %s/%s", pv.Spec.ClaimRef, targetPVC.Namespace, targetPVC.Name)
+	}
+}
+
 // TestRebindPVToNamespace_DestinationIneligibleAfterSourceDeleted covers Step
 // 5's re-validation: the destination PVC can become ineligible for binding
 // between Step 1.5's initial check and Step 5's re-check (Steps 2-3's Retain

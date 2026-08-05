@@ -89,6 +89,53 @@ type PVRebindResult struct {
 	OriginalReclaimPolicy corev1.PersistentVolumeReclaimPolicy
 }
 
+// resolveSourcePV implements rebindPVToNamespace's Step 1: get the source PVC
+// and its bound PV. If the source PVC is genuinely missing, recovers via a
+// UID-label PV search (#153) instead of failing outright -- this could be a
+// prior invocation that crashed after Step 3 deleted the source PVC but before
+// Step 5 completed the claimRef patch, and the label is unique to this
+// resource's own rebind operation, so the PV is findable this way regardless
+// of exactly how far that prior invocation got. Returns sourcePVCAlreadyGone
+// true in that recovered case, telling the caller to skip Step 1.5's
+// leftover-cleanup delete and Step 3's delete-and-wait entirely (the returned
+// sourcePVC is a zero-value placeholder then, not a real object).
+func resolveSourcePV(ctx context.Context, k8sClient client.Client, logger logr.Logger, sourcePVCName, sourceNamespace, uidLabelKey, resourceUID string) (pv *corev1.PersistentVolume, pvName string, sourcePVC *corev1.PersistentVolumeClaim, sourcePVCAlreadyGone bool, err error) {
+	sourcePVC = &corev1.PersistentVolumeClaim{}
+	getErr := k8sClient.Get(ctx, types.NamespacedName{Name: sourcePVCName, Namespace: sourceNamespace}, sourcePVC)
+
+	switch {
+	case getErr == nil:
+		if sourcePVC.Status.Phase != corev1.ClaimBound {
+			return nil, "", nil, false, fmt.Errorf("source PVC %s/%s is not bound (phase: %s)", sourceNamespace, sourcePVCName, sourcePVC.Status.Phase)
+		}
+		pvName = sourcePVC.Spec.VolumeName
+		if pvName == "" {
+			return nil, "", nil, false, fmt.Errorf("source PVC %s/%s has no volume name", sourceNamespace, sourcePVCName)
+		}
+		pv = &corev1.PersistentVolume{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
+			return nil, "", nil, false, fmt.Errorf("failed to get PV %s: %w", pvName, err)
+		}
+		logger.Info("Found PV bound to source PVC", "pv", pvName, "sourcePVC", sourcePVCName)
+		return pv, pvName, sourcePVC, false, nil
+
+	case errors.IsNotFound(getErr):
+		found, err := findPVByUIDLabel(ctx, k8sClient, logger, uidLabelKey, resourceUID)
+		if err != nil {
+			return nil, "", nil, false, fmt.Errorf("failed to search for PV by label after source PVC %s/%s was not found: %w", sourceNamespace, sourcePVCName, err)
+		}
+		if found == nil {
+			return nil, "", nil, false, fmt.Errorf("failed to get source PVC %s/%s: %w", sourceNamespace, sourcePVCName, getErr)
+		}
+		logger.Info("Source PVC not found but a PV carrying this resource's UID label was -- resuming a prior invocation that crashed after deleting the source PVC",
+			"pv", found.Name)
+		return found, found.Name, sourcePVC, true, nil
+
+	default:
+		return nil, "", nil, false, fmt.Errorf("failed to get source PVC %s/%s: %w", sourceNamespace, sourcePVCName, getErr)
+	}
+}
+
 // rebindPVToNamespace rebinds a PV from a PVC in the source namespace to a PVC in the target namespace.
 // This follows the same pattern as Velero's generic restore exposer, using Patch operations
 // to avoid conflicts with Kubernetes PV controller.
@@ -121,26 +168,10 @@ func rebindPVToNamespace(
 	}
 
 	// Step 1: Get the source PVC and its bound PV
-	sourcePVC := &corev1.PersistentVolumeClaim{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: sourcePVCName, Namespace: sourceNamespace}, sourcePVC); err != nil {
-		return nil, fmt.Errorf("failed to get source PVC %s/%s: %w", sourceNamespace, sourcePVCName, err)
+	pv, pvName, sourcePVC, sourcePVCAlreadyGone, err := resolveSourcePV(ctx, k8sClient, logger, sourcePVCName, sourceNamespace, uidLabelKey, resourceUID)
+	if err != nil {
+		return nil, err
 	}
-
-	if sourcePVC.Status.Phase != corev1.ClaimBound {
-		return nil, fmt.Errorf("source PVC %s/%s is not bound (phase: %s)", sourceNamespace, sourcePVCName, sourcePVC.Status.Phase)
-	}
-
-	pvName := sourcePVC.Spec.VolumeName
-	if pvName == "" {
-		return nil, fmt.Errorf("source PVC %s/%s has no volume name", sourceNamespace, sourcePVCName)
-	}
-
-	pv := &corev1.PersistentVolume{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
-		return nil, fmt.Errorf("failed to get PV %s: %w", pvName, err)
-	}
-
-	logger.Info("Found PV bound to source PVC", "pv", pvName, "sourcePVC", sourcePVCName)
 
 	// Step 1.5 (BindTargetExisting only): validate destination compatibility BEFORE
 	// mutating the source (Steps 2-3), so an incompatible pairing fails fast without
@@ -182,9 +213,14 @@ func rebindPVToNamespace(
 				// The PV's claimRef already points at the destination, so the source PVC
 				// (found still present in Step 1, meaning a prior invocation's Step 3
 				// delete either never ran or didn't finish) is now just leftover cruft --
-				// safe to delete since the PV itself is no longer bound to it.
-				if err := k8sClient.Delete(ctx, sourcePVC); err != nil && !errors.IsNotFound(err) {
-					return nil, fmt.Errorf("failed to delete leftover source PVC %s/%s: %w", sourceNamespace, sourcePVCName, err)
+				// safe to delete since the PV itself is no longer bound to it. Skipped
+				// entirely when sourcePVCAlreadyGone: sourcePVC is a zero-value
+				// placeholder in that case (Step 1's Get returned NotFound), not a real
+				// object to delete.
+				if !sourcePVCAlreadyGone {
+					if err := k8sClient.Delete(ctx, sourcePVC); err != nil && !errors.IsNotFound(err) {
+						return nil, fmt.Errorf("failed to delete leftover source PVC %s/%s: %w", sourceNamespace, sourcePVCName, err)
+					}
 				}
 				return &PVRebindResult{
 					NewPVCName:            targetPVC.Name,
@@ -210,15 +246,18 @@ func rebindPVToNamespace(
 		logger.Info("Set PV reclaim policy to Retain", "pv", pvName, "originalPolicy", originalReclaimPolicy)
 	}
 
-	// Step 3: Delete the source PVC
-	if err := k8sClient.Delete(ctx, sourcePVC); err != nil && !errors.IsNotFound(err) {
-		return nil, fmt.Errorf("failed to delete source PVC %s/%s: %w", sourceNamespace, sourcePVCName, err)
-	}
-	logger.Info("Deleted source PVC", "pvc", sourcePVCName, "namespace", sourceNamespace)
+	// Step 3: Delete the source PVC -- skipped entirely when sourcePVCAlreadyGone
+	// (Step 1 already confirmed it's gone via NotFound; sourcePVC is a zero-value
+	// placeholder, not a real object, and there's nothing left to wait out).
+	if !sourcePVCAlreadyGone {
+		if err := k8sClient.Delete(ctx, sourcePVC); err != nil && !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to delete source PVC %s/%s: %w", sourceNamespace, sourcePVCName, err)
+		}
+		logger.Info("Deleted source PVC", "pvc", sourcePVCName, "namespace", sourceNamespace)
 
-	// Wait for PVC to be fully deleted
-	if err := waitForPVCDeletion(ctx, k8sClient, sourcePVCName, sourceNamespace); err != nil {
-		return nil, fmt.Errorf("failed waiting for source PVC deletion: %w", err)
+		if err := waitForPVCDeletion(ctx, k8sClient, sourcePVCName, sourceNamespace); err != nil {
+			return nil, fmt.Errorf("failed waiting for source PVC deletion: %w", err)
+		}
 	}
 
 	// Step 4: Obtain the destination PVC in the target namespace. BindTargetExisting
@@ -644,6 +683,29 @@ func waitForPVCBound(ctx context.Context, k8sClient client.Client, pvcName, name
 	})
 }
 
+// findPVByUIDLabel finds a PV carrying the given UID label -- used both to
+// recover a rebind operation's PV when the source PVC that would normally
+// resolve it is gone (#153), and to locate a rebound PV for cleanup once its
+// PVC is already deleted. The label is set no later than Step 5's
+// patchPVBinding and Step 2's Retain patch runs before Step 3's delete, so a PV
+// carrying this exact resourceUID's label is reliably findable this way
+// regardless of how far a prior, interrupted invocation got. Returns (nil, nil)
+// if no PV carries the label -- not an error, since callers use this as a
+// fallback path where "none found" is a valid, meaningful outcome.
+func findPVByUIDLabel(ctx context.Context, k8sClient client.Client, logger logr.Logger, uidLabelKey, resourceUID string) (*corev1.PersistentVolume, error) {
+	pvList := &corev1.PersistentVolumeList{}
+	if err := k8sClient.List(ctx, pvList, client.MatchingLabels{uidLabelKey: resourceUID}); err != nil {
+		return nil, fmt.Errorf("failed to list PVs by label: %w", err)
+	}
+	if len(pvList.Items) == 0 {
+		return nil, nil
+	}
+	if len(pvList.Items) > 1 {
+		logger.Info("Warning: multiple PVs found with label, using first one", "count", len(pvList.Items), "label", uidLabelKey)
+	}
+	return &pvList.Items[0], nil
+}
+
 // cleanupReboundPVCAndPV deletes the rebound PVC and PV after a datamover operation completes.
 // The resourceUID is used to find the PV by label if the PVC is already gone,
 // preventing storage leakage.
@@ -689,18 +751,15 @@ func cleanupReboundPVCAndPV(
 			return fmt.Errorf("failed to get PV %s: %w", pvName, err)
 		}
 	} else {
-		pvList := &corev1.PersistentVolumeList{}
-		if err := k8sClient.List(ctx, pvList, client.MatchingLabels{uidLabelKey: resourceUID}); err != nil {
+		found, err := findPVByUIDLabel(ctx, k8sClient, logger, uidLabelKey, resourceUID)
+		if err != nil {
 			return fmt.Errorf("failed to list PVs by label: %w", err)
 		}
-		if len(pvList.Items) == 0 {
+		if found == nil {
 			logger.V(1).Info("No PV found with label, already cleaned up", "label", uidLabelKey, "value", resourceUID)
 			return nil
 		}
-		if len(pvList.Items) > 1 {
-			logger.Info("Warning: multiple PVs found with label, cleaning up first one", "count", len(pvList.Items))
-		}
-		pv = &pvList.Items[0]
+		pv = found
 		pvName = pv.Name
 		logger.Info("Found PV by label", "pv", pvName, "label", uidLabelKey)
 	}
