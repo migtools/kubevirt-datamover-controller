@@ -920,6 +920,82 @@ func TestUpdatePhase(t *testing.T) {
 	}
 }
 
+// TestUpdatePhase_TimestampsSet covers #155: updatePhase must populate
+// Status.StartTimestamp on entering InProgress and Status.CompletionTimestamp
+// on entering any terminal phase, matching Velero's own built-in data movers
+// so `velero backup/restore describe` reports timing consistently. Both must
+// be idempotent -- set once, not reset on a later call with an already-set
+// value.
+func TestUpdatePhase_TimestampsSet(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+
+	t.Run("StartTimestamp set on entering InProgress", func(t *testing.T) {
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-du", Namespace: "openshift-adp"},
+			Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+			Status:     velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhasePrepared},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).Build()
+		r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		if err := r.updatePhase(context.Background(), du, velerov2alpha1.DataUploadPhaseInProgress, "Datamover pod launched"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if du.Status.StartTimestamp == nil {
+			t.Fatal("expected StartTimestamp to be set")
+		}
+	})
+
+	t.Run("CompletionTimestamp set on entering a terminal phase", func(t *testing.T) {
+		for _, phase := range []velerov2alpha1.DataUploadPhase{
+			velerov2alpha1.DataUploadPhaseCompleted,
+			velerov2alpha1.DataUploadPhaseFailed,
+			velerov2alpha1.DataUploadPhaseCanceled,
+		} {
+			du := &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-du-" + string(phase), Namespace: "openshift-adp"},
+				Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+				Status:     velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseInProgress},
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).Build()
+			r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+			if err := r.updatePhase(context.Background(), du, phase, "done"); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if du.Status.CompletionTimestamp == nil {
+				t.Errorf("phase %s: expected CompletionTimestamp to be set", phase)
+			}
+		}
+	})
+
+	t.Run("timestamps are idempotent, not reset by a later call", func(t *testing.T) {
+		earlier := metav1.NewTime(time.Now().Add(-time.Hour))
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-du", Namespace: "openshift-adp"},
+			Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataUploadStatus{
+				Phase:               velerov2alpha1.DataUploadPhaseInProgress,
+				StartTimestamp:      &earlier,
+				CompletionTimestamp: &earlier,
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).Build()
+		r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		if err := r.updatePhase(context.Background(), du, velerov2alpha1.DataUploadPhaseCompleted, "done"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !du.Status.StartTimestamp.Equal(&earlier) {
+			t.Errorf("StartTimestamp = %v, want it unchanged from %v", du.Status.StartTimestamp, earlier)
+		}
+		if !du.Status.CompletionTimestamp.Equal(&earlier) {
+			t.Errorf("CompletionTimestamp = %v, want it unchanged from %v", du.Status.CompletionTimestamp, earlier)
+		}
+	})
+}
+
 func TestHandleAccepted(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)

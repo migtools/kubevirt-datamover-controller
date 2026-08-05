@@ -628,6 +628,78 @@ func TestDataDownloadUpdatePhase(t *testing.T) {
 	}
 }
 
+// TestDataDownloadUpdatePhase_TimestampsSet covers #155: updatePhase must
+// populate Status.StartTimestamp on entering InProgress and
+// Status.CompletionTimestamp on entering any terminal phase, matching
+// Velero's own built-in data movers so `velero restore describe` reports
+// timing consistently. Both must be idempotent -- set once, not reset on a
+// later call with an already-set value.
+func TestDataDownloadUpdatePhase_TimestampsSet(t *testing.T) {
+	scheme := ddScheme()
+
+	t.Run("StartTimestamp set on entering InProgress", func(t *testing.T) {
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-dd", Namespace: "openshift-adp"},
+			Status:     velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhasePrepared},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+		if err := r.updatePhase(context.Background(), dd, velerov2alpha1.DataDownloadPhaseInProgress, "Downloader pod launched"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if dd.Status.StartTimestamp == nil {
+			t.Fatal("expected StartTimestamp to be set")
+		}
+	})
+
+	t.Run("CompletionTimestamp set on entering a terminal phase", func(t *testing.T) {
+		for _, phase := range []velerov2alpha1.DataDownloadPhase{
+			velerov2alpha1.DataDownloadPhaseCompleted,
+			velerov2alpha1.DataDownloadPhaseFailed,
+			velerov2alpha1.DataDownloadPhaseCanceled,
+		} {
+			dd := &velerov2alpha1.DataDownload{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-dd-" + string(phase), Namespace: "openshift-adp"},
+				Status:     velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseInProgress},
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd).Build()
+			r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+			if err := r.updatePhase(context.Background(), dd, phase, "done"); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if dd.Status.CompletionTimestamp == nil {
+				t.Errorf("phase %s: expected CompletionTimestamp to be set", phase)
+			}
+		}
+	})
+
+	t.Run("timestamps are idempotent, not reset by a later call", func(t *testing.T) {
+		earlier := metav1.NewTime(time.Now().Add(-time.Hour))
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-dd", Namespace: "openshift-adp"},
+			Status: velerov2alpha1.DataDownloadStatus{
+				Phase:               velerov2alpha1.DataDownloadPhaseInProgress,
+				StartTimestamp:      &earlier,
+				CompletionTimestamp: &earlier,
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+		if err := r.updatePhase(context.Background(), dd, velerov2alpha1.DataDownloadPhaseCompleted, "done"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !dd.Status.StartTimestamp.Equal(&earlier) {
+			t.Errorf("StartTimestamp = %v, want it unchanged from %v", dd.Status.StartTimestamp, earlier)
+		}
+		if !dd.Status.CompletionTimestamp.Equal(&earlier) {
+			t.Errorf("CompletionTimestamp = %v, want it unchanged from %v", dd.Status.CompletionTimestamp, earlier)
+		}
+	})
+}
+
 func TestHandleNewDataDownload(t *testing.T) {
 	scheme := ddScheme()
 

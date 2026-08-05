@@ -1258,6 +1258,14 @@ func (r *KubeVirtDataDownloadReconciler) updatePhase(ctx context.Context, dd *ve
 	dd.Status.Phase = phase
 	dd.Status.Message = message
 
+	now := metav1.Now()
+	if phase == velerov2alpha1.DataDownloadPhaseInProgress && dd.Status.StartTimestamp == nil {
+		dd.Status.StartTimestamp = &now
+	}
+	if isTerminalDataDownloadPhase(phase) && dd.Status.CompletionTimestamp == nil {
+		dd.Status.CompletionTimestamp = &now
+	}
+
 	if err := r.Update(ctx, dd); err != nil {
 		logger.Error(err, "Failed to update DataDownload phase",
 			"dataDownload", dd.Name,
@@ -1271,6 +1279,18 @@ func (r *KubeVirtDataDownloadReconciler) updatePhase(ctx context.Context, dd *ve
 		"message", message)
 
 	return nil
+}
+
+// isTerminalDataDownloadPhase reports whether phase is one of DataDownload's
+// terminal phases (Completed/Failed/Canceled), used by updatePhase to know
+// when to set Status.CompletionTimestamp.
+func isTerminalDataDownloadPhase(phase velerov2alpha1.DataDownloadPhase) bool {
+	switch phase {
+	case velerov2alpha1.DataDownloadPhaseCompleted, velerov2alpha1.DataDownloadPhaseFailed, velerov2alpha1.DataDownloadPhaseCanceled:
+		return true
+	default:
+		return false
+	}
 }
 
 // getPodNamespace returns the namespace where downloader pods (and the scratch PVC)

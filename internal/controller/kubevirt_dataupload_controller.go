@@ -1246,6 +1246,14 @@ func (r *KubeVirtDataUploadReconciler) updatePhase(ctx context.Context, du *vele
 	du.Status.Phase = phase
 	du.Status.Message = message
 
+	now := metav1.Now()
+	if phase == velerov2alpha1.DataUploadPhaseInProgress && du.Status.StartTimestamp == nil {
+		du.Status.StartTimestamp = &now
+	}
+	if isTerminalDataUploadPhase(phase) && du.Status.CompletionTimestamp == nil {
+		du.Status.CompletionTimestamp = &now
+	}
+
 	if err := r.Update(ctx, du); err != nil {
 		logger.Error(err, "Failed to update DataUpload phase",
 			"dataUpload", du.Name,
@@ -1259,6 +1267,18 @@ func (r *KubeVirtDataUploadReconciler) updatePhase(ctx context.Context, du *vele
 		"message", message)
 
 	return nil
+}
+
+// isTerminalDataUploadPhase reports whether phase is one of DataUpload's
+// terminal phases (Completed/Failed/Canceled), used by updatePhase to know
+// when to set Status.CompletionTimestamp.
+func isTerminalDataUploadPhase(phase velerov2alpha1.DataUploadPhase) bool {
+	switch phase {
+	case velerov2alpha1.DataUploadPhaseCompleted, velerov2alpha1.DataUploadPhaseFailed, velerov2alpha1.DataUploadPhaseCanceled:
+		return true
+	default:
+		return false
+	}
 }
 
 // getPodNamespace returns the namespace where datamover pods should run.
