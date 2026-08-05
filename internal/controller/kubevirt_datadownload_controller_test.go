@@ -37,6 +37,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -1837,6 +1838,68 @@ func TestHandleInProgressDataDownload(t *testing.T) {
 			t.Errorf("PV claimRef = %+v, want %s/%s", pv.Spec.ClaimRef, f.targetPVC.Namespace, f.targetPVC.Name)
 		}
 	})
+}
+
+// TestCompleteSuccessfulDownload_EmitsRetainedPVEvent covers #152: since the
+// rebound PV is intentionally left in the Retain policy forever (restored user
+// data must survive deletion of the target PVC), there's no other operational
+// signal pointing an operator at it -- completeSuccessfulDownload must emit an
+// Event so it's discoverable without already knowing to look.
+func TestCompleteSuccessfulDownload_EmitsRetainedPVEvent(t *testing.T) {
+	f := newDDTestFixture(t)
+	scheme := ddScheme()
+
+	origInterval, origTimeout := pvRebindPollInterval, pvRebindTimeout
+	pvRebindPollInterval = 10 * time.Millisecond
+	pvRebindTimeout = 2 * time.Second
+	defer func() {
+		pvRebindPollInterval = origInterval
+		pvRebindTimeout = origTimeout
+	}()
+
+	scratchPV := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-scratch"},
+		Spec: corev1.PersistentVolumeSpec{
+			Capacity:                      corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			AccessModes:                   []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimDelete,
+			StorageClassName:              "standard",
+			VolumeMode:                    new(corev1.PersistentVolumeFilesystem),
+		},
+	}
+	scratchPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "scratch-pvc-1", Namespace: "openshift-adp",
+			Labels: map[string]string{common.LabelDataDownloadUID: string(f.dd.UID)},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName:       "pv-scratch",
+			StorageClassName: new("standard"),
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, f.targetPVC, scratchPV, scratchPVC).Build()
+	recorder := record.NewFakeRecorder(10)
+	r := &KubeVirtDataDownloadReconciler{Client: fakeClient, EventRecorder: recorder, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+	defer startFakeBinder(t, fakeClient, scratchPV, f.targetPVC, pvRebindTimeout)()
+
+	if _, err := r.completeSuccessfulDownload(context.Background(), logr.Discard(), f.dd, "openshift-adp"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case event := <-recorder.Events:
+		if !strings.Contains(event, "PVLeftInRetainPolicy") {
+			t.Errorf("event = %q, want it to reference PVLeftInRetainPolicy", event)
+		}
+	default:
+		t.Error("expected an Event to be recorded for the retained PV, got none")
+	}
 }
 
 // TestHandleInProgressDataDownload_PodSucceededDeleteFailureDoesNotPersistCompleted

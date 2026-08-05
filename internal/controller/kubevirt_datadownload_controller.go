@@ -120,6 +120,7 @@ type KubeVirtDataDownloadReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile handles DataDownload resources where Spec.DataMover is "kubevirt"
 func (r *KubeVirtDataDownloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -1155,7 +1156,14 @@ func (r *KubeVirtDataDownloadReconciler) completeSuccessfulDownload(ctx context.
 	// DataUpload's cleanupReboundPVCAndPV): this is restored user data, so it should
 	// survive deletion of the target PVC rather than being auto-deleted. That does
 	// mean deleting the restored PVC later orphans the PV/backing storage until an
-	// operator manually reclaims it.
+	// operator manually reclaims it -- surface that via an Event since there's no
+	// other operational signal pointing at it.
+	if r.EventRecorder != nil {
+		r.EventRecorder.Eventf(dd, corev1.EventTypeWarning, "PVLeftInRetainPolicy",
+			"PV %s retained after restore completion; manual reclaim required if PVC %s/%s is deleted",
+			rebindResult.PVName, dd.Spec.TargetVolume.Namespace, dd.Spec.TargetVolume.PVC)
+	}
+
 	if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseCompleted, "Restored disk provisioned to target volume"); err != nil {
 		return ctrl.Result{}, err
 	}
