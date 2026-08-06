@@ -2211,11 +2211,12 @@ func TestHandleInProgress_PodFailed(t *testing.T) {
 	}
 }
 
-// TestHandleInProgress_PodFailed_CleansUpVMB verifies the fix for
-// https://github.com/migtools/kubevirt-datamover-controller/issues/168:
-// a genuine DataUpload Failed transition must delete the VMB in the VM
-// namespace (the VMBT is preserved, per #32).
-func TestHandleInProgress_PodFailed_CleansUpVMB(t *testing.T) {
+// TestHandleInProgress_PodFailed_PreservesVMB locks in the team's decision
+// (see PR #170 review discussion) to preserve the VMB (and VMBT) on a
+// genuine DataUpload Failed transition for debugging, matching the existing
+// "Skip cleanup on failure to preserve resources for debugging" handling of
+// the datamover pod/PVC/PV in handleInProgress's PodFailed case.
+func TestHandleInProgress_PodFailed_PreservesVMB(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
@@ -2269,21 +2270,9 @@ func TestHandleInProgress_PodFailed_CleansUpVMB(t *testing.T) {
 		},
 	}
 
-	// Unrelated VMB for a different DataUpload's backup of the same VM. Cleanup
-	// filters by DataUpload UID label, so this one must survive.
-	otherVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "vmb-other-du",
-			Namespace: vmNamespace,
-			Labels: map[string]string{
-				common.LabelDataUploadUID: "other-uid",
-			},
-		},
-	}
-
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(du, pod, vmb, vmbt, otherVMB).
+		WithObjects(du, pod, vmb, vmbt).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -2308,31 +2297,19 @@ func TestHandleInProgress_PodFailed_CleansUpVMB(t *testing.T) {
 		t.Errorf("expected phase=%s, got phase=%s", velerov2alpha1.DataUploadPhaseFailed, updatedDU.Status.Phase)
 	}
 
-	// VMB must be deleted on a genuine Failed transition; an unrelated VMB
-	// (different DataUpload UID label) must survive.
-	deletedVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
-	err := fakeClient.Get(context.Background(), types.NamespacedName{
-		Name:      vmb.Name,
-		Namespace: vmNamespace,
-	}, deletedVMB)
-	if !errors.IsNotFound(err) {
-		t.Errorf("expected VMB %s to be deleted on Failed transition, got err=%v", vmb.Name, err)
-	}
-
 	survivingVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
 	if err := fakeClient.Get(context.Background(), types.NamespacedName{
-		Name:      otherVMB.Name,
+		Name:      vmb.Name,
 		Namespace: vmNamespace,
 	}, survivingVMB); err != nil {
-		t.Errorf("expected unrelated VMB %s to survive, got err=%v", otherVMB.Name, err)
+		t.Errorf("expected VMB to be preserved on Failed transition, got err=%v", err)
 	}
 
-	// VMBT must be preserved so KubeVirt can reuse it across VM lifecycle events.
-	updatedVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+	survivingVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
 	if err := fakeClient.Get(context.Background(), types.NamespacedName{
 		Name:      vmbt.Name,
 		Namespace: vmNamespace,
-	}, updatedVMBT); err != nil {
+	}, survivingVMBT); err != nil {
 		t.Errorf("expected VMBT to be preserved, but it was deleted or errored: %v", err)
 	}
 }
