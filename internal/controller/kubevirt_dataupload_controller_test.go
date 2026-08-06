@@ -1926,9 +1926,24 @@ func TestHandleInProgress_PodSucceeded_DefersCleanupWhileTerminating(t *testing.
 		},
 	}
 
+	reboundPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.SafeResourceName(common.ReboundPVCNamePrefix, du.Name),
+			Namespace: "openshift-adp",
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(du, pod).
+		WithObjects(du, pod, reboundPVC).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -1960,6 +1975,16 @@ func TestHandleInProgress_PodSucceeded_DefersCleanupWhileTerminating(t *testing.
 	}
 	if updatedDU.Annotations[common.AnnotationDatamoverPodSucceeded] != "true" {
 		t.Errorf("expected %s annotation to be set to record the pod's success", common.AnnotationDatamoverPodSucceeded)
+	}
+
+	// The rebound PVC must survive round 1: cleanup deferred while the pod
+	// is still terminating.
+	survivingPVC := &corev1.PersistentVolumeClaim{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      reboundPVC.Name,
+		Namespace: reboundPVC.Namespace,
+	}, survivingPVC); err != nil {
+		t.Errorf("expected rebound PVC to survive while pod cleanup is deferred, got err=%v", err)
 	}
 
 	// Simulate kubelet finishing termination: clear the finalizer, which lets
@@ -1994,6 +2019,16 @@ func TestHandleInProgress_PodSucceeded_DefersCleanupWhileTerminating(t *testing.
 	}
 	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseCompleted {
 		t.Errorf("expected phase=%s once cleanup finishes, got phase=%s", velerov2alpha1.DataUploadPhaseCompleted, updatedDU.Status.Phase)
+	}
+
+	// The rebound PVC must be cleaned up once the pod cleanup completes.
+	deletedPVC := &corev1.PersistentVolumeClaim{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      reboundPVC.Name,
+		Namespace: reboundPVC.Namespace,
+	}, deletedPVC)
+	if !errors.IsNotFound(err) {
+		t.Errorf("expected rebound PVC to be deleted once cleanup completes, got err=%v", err)
 	}
 }
 
