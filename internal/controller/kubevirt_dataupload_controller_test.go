@@ -1996,6 +1996,9 @@ func TestHandleInProgress_PodSucceeded_DefersCleanupWhileTerminating(t *testing.
 	}, terminatingPod); err != nil {
 		t.Fatalf("failed to get terminating pod: %v", err)
 	}
+	if terminatingPod.DeletionTimestamp == nil {
+		t.Fatalf("expected handleInProgress to have requested datamover pod deletion in round 1")
+	}
 	terminatingPod.Finalizers = nil
 	if err := fakeClient.Update(context.Background(), terminatingPod); err != nil {
 		t.Fatalf("failed to clear pod finalizer: %v", err)
@@ -2068,6 +2071,9 @@ func TestHandleCanceling_DefersCleanupWhileTerminating(t *testing.T) {
 				common.LabelDataUploadUID: string(du.UID),
 			},
 			Finalizers: []string{"test.io/still-terminating"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
 		},
 	}
 
@@ -2317,8 +2323,12 @@ func TestHandleInProgress_PodFailed_PreservesVMB(t *testing.T) {
 		OADPNamespace: "openshift-adp",
 	}
 
-	if _, err := r.handleInProgress(context.Background(), logr.Discard(), du); err != nil {
+	result, err := r.handleInProgress(context.Background(), logr.Discard(), du)
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue when pod failed, got RequeueAfter=%v", result.RequeueAfter)
 	}
 
 	updatedDU := &velerov2alpha1.DataUpload{}
