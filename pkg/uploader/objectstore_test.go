@@ -731,7 +731,7 @@ func TestInitSSECMutualExclusivityWithSSE(t *testing.T) {
 }
 
 func TestInitSSECKeyFileWithNewline(t *testing.T) {
-	key := make([]byte, 32)
+	key := make([]byte, 32, 33)
 	for i := range key {
 		key[i] = byte(i)
 	}
@@ -748,6 +748,24 @@ func TestInitSSECKeyFileWithNewline(t *testing.T) {
 	}
 	if store.sseCustomerAlgorithm != testSSEAES256 {
 		t.Errorf("sseCustomerAlgorithm = %q, want %q", store.sseCustomerAlgorithm, testSSEAES256)
+	}
+}
+
+func TestInitSSECKeyFileExact32BytesEndingInNewline(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	key[31] = '\n'
+	keyFile := writeSSECKeyFile(t, key)
+
+	store := &S3ObjectStore{}
+	err := store.Init(map[string]string{
+		"bucket":                    "test-bucket",
+		"customerKeyEncryptionFile": keyFile,
+	})
+	if err != nil {
+		t.Fatalf("valid 32-byte key ending in 0x0A should not be trimmed, got error: %v", err)
 	}
 }
 

@@ -442,7 +442,9 @@ func loadSSECKey(path string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read SSE-C key file %q: %w", path, err)
 	}
-	data = bytes.TrimRight(data, "\r\n")
+	if len(data) != 32 {
+		data = bytes.TrimRight(data, "\r\n")
+	}
 	if len(data) != 32 {
 		return nil, fmt.Errorf("SSE-C key must be exactly 32 bytes, got %d", len(data))
 	}
