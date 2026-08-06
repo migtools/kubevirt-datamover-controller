@@ -98,6 +98,11 @@ type KubeVirtDataUploadReconciler struct {
 	// before forcing a full backup. 0 means unlimited.
 	MaxIncrementalBackups int
 
+	// StaleDataUploadThreshold is the duration after which a DataUpload in an
+	// active phase is considered stale and will no longer block younger
+	// DataUploads for the same VM.
+	StaleDataUploadThreshold time.Duration
+
 	// ObjectStoreFactory creates an ObjectStore from an ObjectStoreConfig.
 	// Defaults to uploader.InitObjectStore if nil. Override in tests to inject mocks.
 	ObjectStoreFactory func(cfg *common.ObjectStoreConfig) (velero.ObjectStore, error)
@@ -1609,7 +1614,10 @@ func isVMBTerminal(vmb *kubevirtbackupv1alpha1.VirtualMachineBackup) bool {
 // backups per VM so that each backup completes (including S3 upload) before the
 // next one starts, enabling incremental backups through checkpoint chaining.
 // The oldest DU (by CreationTimestamp, then UID) always wins.
+// DUs older than StaleDataUploadThreshold are skipped to prevent a stuck DU
+// from permanently blocking all future backups for a VM.
 func (r *KubeVirtDataUploadReconciler) hasOlderActiveDUForVM(ctx context.Context, du *velerov2alpha1.DataUpload) (bool, string, error) {
+	logger := log.FromContext(ctx)
 	vmName := du.Annotations[common.AnnotationVMName]
 	if vmName == "" {
 		return false, "", nil
@@ -1653,6 +1661,13 @@ func (r *KubeVirtDataUploadReconciler) hasOlderActiveDUForVM(ctx context.Context
 			velerov2alpha1.DataUploadPhasePrepared,
 			velerov2alpha1.DataUploadPhaseInProgress:
 		default:
+			continue
+		}
+
+		if r.StaleDataUploadThreshold > 0 && time.Since(other.CreationTimestamp.Time) > r.StaleDataUploadThreshold {
+			logger.Info("Ignoring stale DataUpload that is no longer blocking",
+				"staleDU", other.Name, "phase", other.Status.Phase,
+				"age", time.Since(other.CreationTimestamp.Time).Round(time.Second))
 			continue
 		}
 
