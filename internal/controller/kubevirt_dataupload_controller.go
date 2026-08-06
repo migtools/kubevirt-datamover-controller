@@ -169,6 +169,17 @@ func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.R
 	timeoutBound := isDataUploadTimeoutBound(dataUpload.Status.Phase)
 	if timeoutBound {
 		if failed, err := r.checkOperationTimeout(ctx, logger, dataUpload); err != nil {
+			if stderrors.Is(err, ErrPodsStillTerminating) {
+				// Expected, self-resolving: kubelet just hasn't finished tearing the
+				// stalled pod down yet. Requeue quickly without logging a reconcile
+				// error or triggering controller-runtime's exponential backoff for
+				// something that isn't wrong -- matches handleCanceling's treatment
+				// of the same error. The DataUpload isn't marked Failed yet; the next
+				// reconcile re-enters this same timeout check and retries the fail
+				// callback (including re-persisting Failed) once cleanup succeeds.
+				logger.V(1).Info("Datamover pod(s) still terminating during timeout cleanup, will retry", "error", err)
+				return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+			}
 			return ctrl.Result{}, err
 		} else if failed {
 			return ctrl.Result{}, nil

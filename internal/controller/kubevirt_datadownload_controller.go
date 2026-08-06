@@ -213,6 +213,17 @@ func (r *KubeVirtDataDownloadReconciler) Reconcile(ctx context.Context, req ctrl
 		}
 		if !provisioned {
 			if failed, err := r.checkOperationTimeout(ctx, logger, dataDownload); err != nil {
+				if stderrors.Is(err, ErrPodsStillTerminating) {
+					// Expected, self-resolving: kubelet just hasn't finished tearing the
+					// stalled pod down yet. Requeue quickly without logging a reconcile
+					// error or triggering controller-runtime's exponential backoff for
+					// something that isn't wrong -- matches handleCanceling's treatment
+					// of the same error. The DataDownload isn't marked Failed yet; the
+					// next reconcile re-enters this same timeout check and retries the
+					// fail callback (including re-persisting Failed) once cleanup succeeds.
+					logger.V(1).Info("Datamover pod(s) still terminating during timeout cleanup, will retry", "error", err)
+					return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+				}
 				return ctrl.Result{}, err
 			} else if failed {
 				return ctrl.Result{}, nil
@@ -594,6 +605,7 @@ func resolveTargetDiskName(vmIndex uploader.VMIndex, chain []string, targetPVCNa
 	}
 
 	var diskName string
+	var lastErr error
 	for _, id := range chain {
 		entry, ok := entriesByID[id]
 		if !ok {
@@ -604,10 +616,12 @@ func resolveTargetDiskName(vmIndex uploader.VMIndex, chain []string, targetPVCNa
 				continue
 			}
 			if i >= len(entry.Files) {
-				return "", fmt.Errorf("checkpoint %q has PVC %q at index %d but no matching file entry", entry.ID, targetPVCName, i)
+				lastErr = fmt.Errorf("checkpoint %q has PVC %q at index %d but no matching file entry", entry.ID, targetPVCName, i)
+				break
 			}
 			if entry.Files[i].DiskName == "" {
-				return "", fmt.Errorf("checkpoint %q has PVC %q at index %d with an empty disk name", entry.ID, targetPVCName, i)
+				lastErr = fmt.Errorf("checkpoint %q has PVC %q at index %d with an empty disk name", entry.ID, targetPVCName, i)
+				break
 			}
 			diskName = entry.Files[i].DiskName
 			break
@@ -615,6 +629,9 @@ func resolveTargetDiskName(vmIndex uploader.VMIndex, chain []string, targetPVCNa
 	}
 
 	if diskName == "" {
+		if lastErr != nil {
+			return "", lastErr
+		}
 		return "", fmt.Errorf("target PVC %q not found in any checkpoint's PVCs list", targetPVCName)
 	}
 	return diskName, nil
@@ -858,15 +875,33 @@ func (r *KubeVirtDataDownloadReconciler) listAllScratchPVCs(ctx context.Context,
 	// separate handleAccepted Create call, moments apart), so finding *some*
 	// PVCs isn't proof the list is complete the way it is for a Filesystem-mode
 	// target's single PVC. Retry via APIReader whenever the cached count is
-	// under the expected total, not just when it's entirely empty.
+	// under the expected total, not just when it's entirely empty. A role-labeled
+	// PVC in the cached result is also treated as Block-mode even when
+	// isBlockModeRestore's annotation isn't persisted yet (e.g. a Cancel racing
+	// in after handleAccepted created the first scratch PVC but before it
+	// persisted AnnotationRestoreBlockMode) -- otherwise the still-invisible
+	// second PVC would never trigger the APIReader retry.
 	expected := 1
-	if isBlockModeRestore(dd) {
+	if isBlockModeRestore(dd) || hasRoleLabeledPVC(pvcs) {
 		expected = 2
 	}
 	if len(pvcs) >= expected {
 		return pvcs, nil
 	}
 	return listAllScratchPVCsFrom(ctx, r.APIReader, r.getPodNamespace(dd), dd)
+}
+
+// hasRoleLabeledPVC reports whether any listed scratch PVC carries a role
+// label, which only a Block-mode restore's work/output pair does. Used as a
+// fallback signal in listAllScratchPVCs when AnnotationRestoreBlockMode
+// hasn't been persisted yet.
+func hasRoleLabeledPVC(pvcs []corev1.PersistentVolumeClaim) bool {
+	for i := range pvcs {
+		if pvcs[i].Labels[common.LabelScratchVolumeRole] != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func listAllScratchPVCsFrom(ctx context.Context, reader client.Reader, namespace string, dd *velerov2alpha1.DataDownload) ([]corev1.PersistentVolumeClaim, error) {

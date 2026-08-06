@@ -165,11 +165,13 @@ func resolveSourcePV(ctx context.Context, k8sClient client.Client, logger logr.L
 //  5. Reset PV binding: set claimRef to destination PVC, add labels (using Patch)
 //  6. Wait for PV to bind to the destination PVC
 //
-// nearly every step, not deeply nested conditional logic -- splitting it
-// further would scatter the step-by-step narrative this function's own
-// numbered comment (and its callers) depend on.
+// This function is intentionally long: it is a linear multi-step sequence
+// with crash-recovery branches at nearly every step, not deeply nested
+// conditional logic -- splitting it further would scatter the step-by-step
+// narrative this function's own numbered comment (and its callers) depend
+// on.
 //
-//nolint:gocyclo // Linear multi-step sequence with crash-recovery branches at
+//nolint:gocyclo // Linear multi-step sequence with crash-recovery branches at nearly every step.
 func rebindPVToNamespace(
 	ctx context.Context,
 	k8sClient client.Client,
@@ -241,6 +243,9 @@ func rebindPVToNamespace(
 				if !sourcePVCAlreadyGone {
 					if err := k8sClient.Delete(ctx, sourcePVC); err != nil && !errors.IsNotFound(err) {
 						return nil, fmt.Errorf("failed to delete leftover source PVC %s/%s: %w", sourceNamespace, sourcePVCName, err)
+					}
+					if err := waitForPVCDeletion(ctx, k8sClient, sourcePVCName, sourceNamespace); err != nil {
+						return nil, fmt.Errorf("failed waiting for leftover source PVC %s/%s deletion: %w", sourceNamespace, sourcePVCName, err)
 					}
 				}
 				return &PVRebindResult{

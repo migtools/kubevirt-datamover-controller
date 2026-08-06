@@ -645,6 +645,64 @@ func TestReconcile_OperationTimeout(t *testing.T) {
 	})
 }
 
+// TestReconcile_OperationTimeout_PodStillTerminatingRequeuesWithoutError
+// covers the same expected, self-resolving ErrPodsStillTerminating the
+// timeout fail callback's pod cleanup can hit as handleCanceling's own
+// cleanup -- kubelet just hasn't finished tearing the pod down yet. Must
+// requeue quietly, not log a reconcile error and fall into
+// controller-runtime's (much slower) exponential backoff. Split out from
+// TestReconcile_OperationTimeout for the same gocyclo reason as
+// TestReconcile_OperationTimeout_CleanupFailureDoesNotPersistFailed above.
+func TestReconcile_OperationTimeout_PodStillTerminatingRequeuesWithoutError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	get := func(t *testing.T, c client.Client, name, namespace string) *velerov2alpha1.DataUpload {
+		t.Helper()
+		var out velerov2alpha1.DataUpload
+		if err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: namespace}, &out); err != nil {
+			t.Fatalf("failed to get DataUpload: %v", err)
+		}
+		return &out
+	}
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "du-timeout-pod-terminating", Namespace: "openshift-adp",
+			UID: types.UID("du-timeout-pod-terminating-uid"),
+		},
+		Spec: velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase:             velerov2alpha1.DataUploadPhaseInProgress,
+			AcceptedTimestamp: ptrTime(time.Now().Add(-(DefaultOperationTimeout + time.Minute))),
+		},
+	}
+	terminatingPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "du-timeout-pod-terminating-pod", Namespace: "openshift-adp",
+			Labels:     map[string]string{common.LabelDataUploadUID: string(du.UID)},
+			Finalizers: []string{"example.com/still-cleaning-up"},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du, terminatingPod).Build()
+	r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: du.Name, Namespace: du.Namespace}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Error("expected a short requeue while the datamover pod is still terminating")
+	}
+
+	updated := get(t, fakeClient, du.Name, du.Namespace)
+	if updated.Status.Phase == velerov2alpha1.DataUploadPhaseFailed {
+		t.Error("phase must not be persisted Failed until pod cleanup actually succeeds")
+	}
+}
+
 // TestReconcile_OperationTimeout_CleanupFailureDoesNotPersistFailed covers
 // checkOperationTimeoutCore's fail-before-persist contract: it stops the
 // still-running pod BEFORE marking the resource Failed specifically so a

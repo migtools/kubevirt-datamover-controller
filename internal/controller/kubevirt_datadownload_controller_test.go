@@ -591,6 +591,48 @@ func TestDataDownloadReconcile_OperationTimeout(t *testing.T) {
 			t.Errorf("expected downloader pod to be deleted after timeout failure, got err=%v", err)
 		}
 	})
+
+	t.Run("timeout failure requeues quietly instead of erroring while the downloader pod is still terminating", func(t *testing.T) {
+		// The pod-cleanup step inside the timeout fail callback can hit the same
+		// expected, self-resolving ErrPodsStillTerminating as handleCanceling's own
+		// cleanup -- kubelet just hasn't finished tearing the pod down yet. Must be
+		// treated the same way: a quiet short requeue, not a logged reconcile error
+		// with controller-runtime's (much slower) exponential backoff.
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "dd-timeout-pod-terminating", Namespace: "openshift-adp",
+				UID: types.UID("dd-timeout-pod-terminating-uid"),
+			},
+			Spec: velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataDownloadStatus{
+				Phase:             velerov2alpha1.DataDownloadPhaseInProgress,
+				AcceptedTimestamp: ptrTime(time.Now().Add(-(DefaultOperationTimeout + time.Minute))),
+			},
+		}
+		terminatingPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "dd-timeout-pod-terminating-pod", Namespace: "openshift-adp",
+				Labels:     map[string]string{common.LabelDataDownloadUID: string(dd.UID)},
+				Finalizers: []string{"example.com/still-cleaning-up"},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, terminatingPod).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: dd.Name, Namespace: dd.Namespace}})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.RequeueAfter == 0 {
+			t.Error("expected a short requeue while the downloader pod is still terminating")
+		}
+
+		updated := get(t, fakeClient, dd.Name, dd.Namespace)
+		if updated.Status.Phase == velerov2alpha1.DataDownloadPhaseFailed {
+			t.Error("phase must not be persisted Failed until pod cleanup actually succeeds")
+		}
+	})
 }
 
 func TestDataDownloadUpdatePhase(t *testing.T) {
@@ -1107,6 +1149,42 @@ func TestResolveTargetDiskName_ChainTipWins(t *testing.T) {
 	}
 }
 
+// TestResolveTargetDiskName_SkipsMalformedOlderEntry covers a checkpoint
+// chain where an OLDER (non-authoritative) entry's mapping for the target
+// PVC is malformed -- must not abort the scan there: a later, chain-tip
+// entry with a valid mapping for the same PVC should still resolve, per
+// this function's own "newest checkpoint is authoritative" design.
+func TestResolveTargetDiskName_SkipsMalformedOlderEntry(t *testing.T) {
+	vmIndex := uploader.VMIndex{
+		VMName:    "vm-1",
+		Namespace: "vm-ns",
+		Checkpoints: []uploader.CheckpointEntry{
+			{
+				ID:   "cp-full",
+				PVCs: []string{"restored-disk"},
+				Files: []uploader.CheckpointFile{
+					{DiskName: ""}, // malformed: empty disk name
+				},
+			},
+			{
+				ID:   "cp-incremental",
+				PVCs: []string{"restored-disk"},
+				Files: []uploader.CheckpointFile{
+					{DiskName: "new-disk-name"},
+				},
+			},
+		},
+	}
+
+	got, err := resolveTargetDiskName(vmIndex, []string{"cp-full", "cp-incremental"}, "restored-disk")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "new-disk-name" {
+		t.Errorf("resolveTargetDiskName() = %q, want %q (later valid entry, despite the earlier malformed one)", got, "new-disk-name")
+	}
+}
+
 func TestResolveTargetDiskName_Errors(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -1484,6 +1562,46 @@ func TestListAllScratchPVCs_APIReaderFallback(t *testing.T) {
 		outputPVC := &corev1.PersistentVolumeClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "output-pvc-1", Namespace: "openshift-adp",
+				Labels: map[string]string{
+					common.LabelDataDownloadUID:   string(f.dd.UID),
+					common.LabelScratchVolumeRole: common.ScratchVolumeRoleOutput,
+				},
+			},
+		}
+		cached := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, workPVC.DeepCopy()).Build()
+		apiReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, workPVC.DeepCopy(), outputPVC.DeepCopy()).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: cached, APIReader: apiReader, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		got, err := r.listAllScratchPVCs(context.Background(), f.dd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 2 {
+			t.Errorf("expected both work and output PVCs via APIReader retry, got %d: %+v", len(got), got)
+		}
+	})
+
+	t.Run("Block-mode target with only one of two PVCs cached retries via APIReader even without AnnotationRestoreBlockMode yet", func(t *testing.T) {
+		// AnnotationRestoreBlockMode deliberately left unset here: a Cancel can
+		// race in after handleAccepted created the first scratch PVC but before
+		// it persisted the annotation. The cached, role-labeled work PVC alone
+		// must still be enough to know a second (output) PVC might exist and is
+		// worth an APIReader retry for -- not just the annotation. Explicitly
+		// cleared rather than assumed unset: the previous subtest set it on this
+		// same shared fixture.
+		delete(f.dd.Annotations, AnnotationRestoreBlockMode)
+		workPVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "work-pvc-2", Namespace: "openshift-adp",
+				Labels: map[string]string{
+					common.LabelDataDownloadUID:   string(f.dd.UID),
+					common.LabelScratchVolumeRole: common.ScratchVolumeRoleWork,
+				},
+			},
+		}
+		outputPVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "output-pvc-2", Namespace: "openshift-adp",
 				Labels: map[string]string{
 					common.LabelDataDownloadUID:   string(f.dd.UID),
 					common.LabelScratchVolumeRole: common.ScratchVolumeRoleOutput,
