@@ -1032,8 +1032,8 @@ func (r *KubeVirtDataUploadReconciler) emitPodLogs(ctx context.Context, logger l
 // a later reconcile retry once the pod is confirmed gone.
 // See https://github.com/migtools/kubevirt-datamover-controller/issues/171.
 func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, podNamespace string) bool {
-	if podsStillPresent := cleanupPodsByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), podNamespace, logger); podsStillPresent {
-		logger.Info("Datamover pod still terminating, deferring PVC/PV cleanup to next reconcile")
+	if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), podNamespace, logger); cleanupNotReady {
+		logger.Info("Datamover pod still terminating (or its status couldn't be confirmed), deferring PVC/PV cleanup to next reconcile")
 		return false
 	}
 

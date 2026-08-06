@@ -69,11 +69,12 @@ func findPodByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid
 }
 
 // cleanupPodsByUID deletes all pods matching a UID label in the given namespace
-// and reports whether any still exist afterward. Delete only requests removal —
-// kubelet must still terminate containers and unmount volumes before the pod
-// object actually disappears, so callers that need the pod fully gone (e.g.
-// before deleting a PVC it mounts) should treat a true return as "not yet safe
-// to proceed" and retry on a later reconcile.
+// and reports whether it's NOT yet safe to proceed as though they're gone.
+// A true return folds together two distinct cases callers should treat the
+// same way (retry on a later reconcile): pods still present (Delete only
+// requests removal — kubelet must still terminate containers and unmount
+// volumes before the pod object actually disappears) and a List failure
+// (unknown state, so conservatively assume cleanup isn't done yet).
 func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid, namespace string, logger logr.Logger) bool {
 	podList := &corev1.PodList{}
 	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
