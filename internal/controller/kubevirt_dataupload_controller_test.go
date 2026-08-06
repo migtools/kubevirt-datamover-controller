@@ -1938,12 +1938,24 @@ func TestHandleInProgress_PodSucceeded_DefersCleanupWhileTerminating(t *testing.
 					corev1.ResourceStorage: resource.MustParse("1Gi"),
 				},
 			},
+			VolumeName: "pv-test-du",
+		},
+	}
+
+	// The bound PV: cleanupReboundPVCAndPV also patches its reclaim policy to
+	// Delete and deletes it after the PVC, so round 2 must clean this up too.
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pv-test-du",
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain,
 		},
 	}
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(du, pod, reboundPVC).
+		WithObjects(du, pod, reboundPVC, pv).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -2032,6 +2044,15 @@ func TestHandleInProgress_PodSucceeded_DefersCleanupWhileTerminating(t *testing.
 	}, deletedPVC)
 	if !errors.IsNotFound(err) {
 		t.Errorf("expected rebound PVC to be deleted once cleanup completes, got err=%v", err)
+	}
+
+	// Its bound PV must be cleaned up too.
+	deletedPV := &corev1.PersistentVolume{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: pv.Name,
+	}, deletedPV)
+	if !errors.IsNotFound(err) {
+		t.Errorf("expected bound PV to be deleted once cleanup completes, got err=%v", err)
 	}
 }
 
@@ -2359,6 +2380,16 @@ func TestHandleInProgress_PodFailed_PreservesVMB(t *testing.T) {
 		Namespace: vmNamespace,
 	}, survivingVMBT); err != nil {
 		t.Errorf("expected VMBT to be preserved, but it was deleted or errored: %v", err)
+	}
+
+	// The failed datamover pod itself must also survive (per the existing
+	// "skip cleanup on failure to preserve resources for debugging" handling).
+	survivingPod := &corev1.Pod{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      pod.Name,
+		Namespace: pod.Namespace,
+	}, survivingPod); err != nil {
+		t.Errorf("expected datamover pod to be preserved on Failed transition, got err=%v", err)
 	}
 }
 
