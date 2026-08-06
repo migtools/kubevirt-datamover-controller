@@ -152,7 +152,11 @@ func flattenToRaw(ctx context.Context, chainTipPath, outputPath string, outputIs
 		if err != nil {
 			return fmt.Errorf("output block device %q not found: %w", outputPath, err)
 		}
-		if info.Mode()&os.ModeDevice == 0 {
+		// os.ModeDevice alone matches BOTH block and character device
+		// special files -- a character device isn't a valid raw-disk write
+		// target, so it must be explicitly excluded rather than accepted
+		// alongside genuine block devices.
+		if info.Mode()&os.ModeDevice == 0 || info.Mode()&os.ModeCharDevice != 0 {
 			return fmt.Errorf("output path %q is not a block device", outputPath)
 		}
 	}

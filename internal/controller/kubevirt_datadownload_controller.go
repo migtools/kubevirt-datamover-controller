@@ -33,7 +33,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
@@ -804,12 +806,27 @@ func (r *KubeVirtDataDownloadReconciler) findScratchPVC(ctx context.Context, dd 
 }
 
 func listScratchPVC(ctx context.Context, reader client.Reader, namespace string, dd *velerov2alpha1.DataDownload, role string) (*corev1.PersistentVolumeClaim, error) {
-	matchLabels := client.MatchingLabels{common.LabelDataDownloadUID: string(dd.UID)}
-	if role != "" {
-		matchLabels[common.LabelScratchVolumeRole] = role
+	selector := labels.SelectorFromSet(labels.Set{common.LabelDataDownloadUID: string(dd.UID)})
+	// role == "" means the single Filesystem-mode PVC, which carries no role
+	// label at all -- require the label's absence rather than leaving it
+	// unconstrained, so this can't also match a Block-mode target's
+	// role-labeled "work"/"output" PVC if the other one has already been
+	// cleaned up (leaving just one to accidentally satisfy an unconstrained
+	// UID-only match).
+	var requirement *labels.Requirement
+	var err error
+	if role == "" {
+		requirement, err = labels.NewRequirement(common.LabelScratchVolumeRole, selection.DoesNotExist, nil)
+	} else {
+		requirement, err = labels.NewRequirement(common.LabelScratchVolumeRole, selection.Equals, []string{role})
 	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to build scratch PVC role selector: %w", err)
+	}
+	selector = selector.Add(*requirement)
+
 	pvcList := &corev1.PersistentVolumeClaimList{}
-	if err := reader.List(ctx, pvcList, client.InNamespace(namespace), matchLabels); err != nil {
+	if err := reader.List(ctx, pvcList, client.InNamespace(namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
 		return nil, fmt.Errorf("failed to list scratch PVCs: %w", err)
 	}
 	if len(pvcList.Items) > 1 {
@@ -1042,12 +1059,12 @@ func (r *KubeVirtDataDownloadReconciler) ensureScratchPVCWithRole(
 	}
 
 	generateNamePrefix := fmt.Sprintf("%s%s-", common.ScratchPVCNamePrefix, dd.Name)
-	labels := map[string]string{
+	pvcLabels := map[string]string{
 		common.LabelDataDownloadUID: string(dd.UID),
 	}
 	if role != "" {
 		generateNamePrefix = fmt.Sprintf("%s%s-%s-", common.ScratchPVCNamePrefix, dd.Name, role)
-		labels[common.LabelScratchVolumeRole] = role
+		pvcLabels[common.LabelScratchVolumeRole] = role
 	}
 
 	podNamespace := r.getPodNamespace(dd)
@@ -1055,7 +1072,7 @@ func (r *KubeVirtDataDownloadReconciler) ensureScratchPVCWithRole(
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: safeGenerateNamePrefix(generateNamePrefix, 63),
 			Namespace:    podNamespace,
-			Labels:       labels,
+			Labels:       pvcLabels,
 			Annotations: map[string]string{
 				common.AnnotationDataDownloadName: dd.Name,
 			},

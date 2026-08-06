@@ -787,12 +787,13 @@ func TestRebindPVToNamespace_RecoversAfterSourcePVCDeletedMidCrash(t *testing.T)
 	_ = corev1.AddToScheme(scheme)
 
 	// No source PVC object at all -- simulates a prior invocation whose Step 3
-	// already deleted it. The PV is left exactly as Step 2/3 would have left it:
-	// still Delete-policy (Step 2 never got the chance to patch it to Retain in
-	// this specific crash timing) but carrying the UID label a real Step 5 patch
-	// would eventually also set -- modeling the earliest point in the crash
-	// window Step 1's recovery needs to handle, so the fix must also re-run
-	// Step 2's Retain patch on the recovered PV, not just skip straight to Step 5.
+	// already deleted it. Still Delete-policy with the UID label already
+	// present isn't a state Step 2 itself would leave behind (it patches
+	// Retain, then stamps the label, both before Step 3 ever runs) -- this
+	// is a defensive worst-case for Step 1's label-based recovery, which
+	// doesn't know or assume how the label got there. It confirms recovery
+	// still re-runs the Retain patch on the recovered PV rather than
+	// assuming that's already done just because the label is present.
 	sourcePV := &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "pv-scratch",

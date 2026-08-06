@@ -36,13 +36,17 @@ func withFakeQemuImg(t *testing.T, fn func(ctx context.Context, args ...string) 
 }
 
 // fakeDeviceFileInfo implements os.FileInfo for a path that isn't a real
-// device node (mknod isn't portable in a test), reporting os.ModeDevice set
-// so flattenToRaw's block-device validation treats it as one.
-type fakeDeviceFileInfo struct{ name string }
+// device node (mknod isn't portable in a test), reporting a caller-chosen
+// mode so flattenToRaw's block-device validation can be exercised against
+// both a genuine block device and a character device.
+type fakeDeviceFileInfo struct {
+	name string
+	mode os.FileMode
+}
 
 func (f fakeDeviceFileInfo) Name() string       { return f.name }
 func (f fakeDeviceFileInfo) Size() int64        { return 0 }
-func (f fakeDeviceFileInfo) Mode() os.FileMode  { return os.ModeDevice }
+func (f fakeDeviceFileInfo) Mode() os.FileMode  { return f.mode }
 func (f fakeDeviceFileInfo) ModTime() time.Time { return time.Time{} }
 func (f fakeDeviceFileInfo) IsDir() bool        { return false }
 func (f fakeDeviceFileInfo) Sys() any           { return nil }
@@ -52,10 +56,17 @@ func (f fakeDeviceFileInfo) Sys() any           { return nil }
 // flattenToRaw's outputIsBlockDevice branches without a real device node.
 func withFakeBlockDevice(t *testing.T, path string) {
 	t.Helper()
+	withFakeStatMode(t, path, os.ModeDevice)
+}
+
+// withFakeStatMode stubs statOutputPath so path reports mode, letting tests
+// simulate device nodes (block or character) without a real one.
+func withFakeStatMode(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
 	original := statOutputPath
 	statOutputPath = func(p string) (os.FileInfo, error) {
 		if p == path {
-			return fakeDeviceFileInfo{name: filepath.Base(path)}, nil
+			return fakeDeviceFileInfo{name: filepath.Base(path), mode: mode}, nil
 		}
 		return original(p)
 	}
@@ -343,6 +354,25 @@ func TestFlattenToRaw(t *testing.T) {
 		err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, true)
 		if err == nil {
 			t.Fatal("expected error for non-device output path")
+		}
+		if !strings.Contains(err.Error(), "not a block device") {
+			t.Errorf("error = %q, want it to reference the device-type mismatch", err)
+		}
+	})
+
+	t.Run("outputIsBlockDevice rejects a character device", func(t *testing.T) {
+		// os.ModeDevice alone doesn't distinguish block from character
+		// devices -- a character device (e.g. /dev/null-like special file)
+		// isn't a valid raw-disk write target and must be rejected too.
+		outputPath := filepath.Join(t.TempDir(), "char-device.raw")
+		if err := os.WriteFile(outputPath, []byte("placeholder"), 0o600); err != nil {
+			t.Fatalf("failed to seed placeholder file: %v", err)
+		}
+		withFakeStatMode(t, outputPath, os.ModeDevice|os.ModeCharDevice)
+
+		err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, true)
+		if err == nil {
+			t.Fatal("expected error for character-device output path")
 		}
 		if !strings.Contains(err.Error(), "not a block device") {
 			t.Errorf("error = %q, want it to reference the device-type mismatch", err)

@@ -1386,6 +1386,43 @@ func TestFindScratchPVC_APIReaderFallback(t *testing.T) {
 	})
 }
 
+// TestListScratchPVC_EmptyRoleExcludesRoleLabeled covers a Block-mode restore
+// where the unlabeled Filesystem-style lookup (role == "") must not
+// accidentally match a role-labeled "work"/"output" PVC -- e.g. if its
+// sibling scratch PVC has already been cleaned up, leaving just the one
+// role-labeled PVC to satisfy an unconstrained UID-only match.
+func TestListScratchPVC_EmptyRoleExcludesRoleLabeled(t *testing.T) {
+	f := newDDTestFixture(t)
+	scheme := ddScheme()
+
+	roleLabeledPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "scratch-pvc-work", Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataDownloadUID:   string(f.dd.UID),
+				common.LabelScratchVolumeRole: common.ScratchVolumeRoleWork,
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, roleLabeledPVC).Build()
+
+	got, err := listScratchPVC(context.Background(), fakeClient, "openshift-adp", f.dd, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected role=\"\" lookup to find nothing when only a role-labeled PVC exists, got %+v", got)
+	}
+
+	gotRoleLabeled, err := listScratchPVC(context.Background(), fakeClient, "openshift-adp", f.dd, common.ScratchVolumeRoleWork)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotRoleLabeled == nil || gotRoleLabeled.Name != roleLabeledPVC.Name {
+		t.Errorf("expected role=%q lookup to find the role-labeled PVC, got %+v", common.ScratchVolumeRoleWork, gotRoleLabeled)
+	}
+}
+
 // TestListAllScratchPVCs_APIReaderFallback covers the same informer-cache-lag
 // case as TestFindScratchPVC_APIReaderFallback, but for listAllScratchPVCs --
 // used by handleCanceling's deleteAllScratchPVCs, a terminal path where a

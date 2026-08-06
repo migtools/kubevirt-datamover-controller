@@ -164,6 +164,12 @@ func resolveSourcePV(ctx context.Context, k8sClient client.Client, logger logr.L
 //     exact name (bindMode == BindTargetExisting, existingPVCName required)
 //  5. Reset PV binding: set claimRef to destination PVC, add labels (using Patch)
 //  6. Wait for PV to bind to the destination PVC
+//
+// nearly every step, not deeply nested conditional logic -- splitting it
+// further would scatter the step-by-step narrative this function's own
+// numbered comment (and its callers) depend on.
+//
+//nolint:gocyclo // Linear multi-step sequence with crash-recovery branches at
 func rebindPVToNamespace(
 	ctx context.Context,
 	k8sClient client.Client,
@@ -259,6 +265,22 @@ func rebindPVToNamespace(
 			return nil, fmt.Errorf("failed to set PV %s reclaim policy to Retain: %w", pvName, err)
 		}
 		logger.Info("Set PV reclaim policy to Retain", "pv", pvName, "originalPolicy", originalReclaimPolicy)
+	}
+
+	// Stamp the UID label now, before Step 3 deletes the source PVC: findPVByUIDLabel's
+	// crash-recovery path (used by resolveSourcePV and the Cancel/timeout-vs-provisioned
+	// guards) can only find this PV by that label, so it must already be present for
+	// any crash from this point on to be recoverable -- previously the label was only
+	// set in Step 5, leaving the Step 3-to-5 window unrecoverable if a crash landed
+	// there (source PVC gone, PV unlabeled, nothing to resolve it by).
+	if pv.Labels[uidLabelKey] != resourceUID {
+		if err := patchPVLabels(ctx, k8sClient, pv, map[string]string{uidLabelKey: resourceUID}); err != nil {
+			return nil, fmt.Errorf("failed to stamp UID label on PV %s: %w", pvName, err)
+		}
+		if pv.Labels == nil {
+			pv.Labels = make(map[string]string)
+		}
+		pv.Labels[uidLabelKey] = resourceUID
 	}
 
 	// Step 3: Delete the source PVC -- skipped entirely when sourcePVCAlreadyGone
@@ -598,6 +620,53 @@ func doPatchPVOriginalReclaimPolicyAnnotation(ctx context.Context, k8sClient cli
 	return k8sClient.Patch(ctx, pv, client.RawPatch(types.MergePatchType, patchBytes))
 }
 
+// patchPVLabels merges extra into the PV's existing labels (like
+// patchPVOriginalReclaimPolicyAnnotation, but for labels rather than an
+// annotation). Includes retry logic for transient errors, matching
+// patchPVReclaimPolicy.
+func patchPVLabels(ctx context.Context, k8sClient client.Client, pv *corev1.PersistentVolume, extra map[string]string) error {
+	var lastErr error
+	for attempt := 1; attempt <= PatchRetryAttempts; attempt++ {
+		err := doPatchPVLabels(ctx, k8sClient, pv, extra)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt < PatchRetryAttempts {
+			time.Sleep(PatchRetryInterval)
+			if fetchErr := k8sClient.Get(ctx, types.NamespacedName{Name: pv.Name}, pv); fetchErr != nil {
+				return fmt.Errorf("failed to re-fetch PV after patch error: %w", fetchErr)
+			}
+		}
+	}
+	return fmt.Errorf("failed after %d attempts: %w", PatchRetryAttempts, lastErr)
+}
+
+func doPatchPVLabels(ctx context.Context, k8sClient client.Client, pv *corev1.PersistentVolume, extra map[string]string) error {
+	origBytes, err := json.Marshal(pv)
+	if err != nil {
+		return fmt.Errorf("error marshaling original PV: %w", err)
+	}
+
+	updated := pv.DeepCopy()
+	if updated.Labels == nil {
+		updated.Labels = make(map[string]string)
+	}
+	maps.Copy(updated.Labels, extra)
+
+	updatedBytes, err := json.Marshal(updated)
+	if err != nil {
+		return fmt.Errorf("error marshaling updated PV: %w", err)
+	}
+
+	patchBytes, err := jsonpatch.CreateMergePatch(origBytes, updatedBytes)
+	if err != nil {
+		return fmt.Errorf("error creating merge patch for PV: %w", err)
+	}
+
+	return k8sClient.Patch(ctx, pv, client.RawPatch(types.MergePatchType, patchBytes))
+}
+
 // patchPVReclaimPolicy patches a PV to set its reclaim policy (like Velero's SetPVReclaimPolicy).
 // Includes retry logic for transient errors.
 func patchPVReclaimPolicy(ctx context.Context, k8sClient client.Client, pv *corev1.PersistentVolume, policy corev1.PersistentVolumeReclaimPolicy) error {
@@ -741,10 +810,10 @@ func waitForPVCBound(ctx context.Context, k8sClient client.Client, pvcName, name
 // findPVByUIDLabel finds a PV carrying the given UID label -- used both to
 // recover a rebind operation's PV when the source PVC that would normally
 // resolve it is gone (#153), and to locate a rebound PV for cleanup once its
-// PVC is already deleted. The label is set no later than Step 5's
-// patchPVBinding and Step 2's Retain patch runs before Step 3's delete, so a PV
-// carrying this exact resourceUID's label is reliably findable this way
-// regardless of how far a prior, interrupted invocation got. Returns (nil, nil)
+// PVC is already deleted. Step 2 stamps the label (alongside the Retain
+// patch) before Step 3 deletes the source PVC, so a PV carrying this exact
+// resourceUID's label is reliably findable this way regardless of how far a
+// prior, interrupted invocation got. Returns (nil, nil)
 // if no PV carries the label -- not an error, since callers use this as a
 // fallback path where "none found" is a valid, meaningful outcome.
 func findPVByUIDLabel(ctx context.Context, k8sClient client.Client, uidLabelKey, resourceUID string) (*corev1.PersistentVolume, error) {
