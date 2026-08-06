@@ -23,7 +23,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 func withFakeQemuImg(t *testing.T, fn func(ctx context.Context, args ...string) (string, string, error)) {
@@ -31,6 +33,33 @@ func withFakeQemuImg(t *testing.T, fn func(ctx context.Context, args ...string) 
 	original := runQemuImg
 	runQemuImg = fn
 	t.Cleanup(func() { runQemuImg = original })
+}
+
+// fakeDeviceFileInfo implements os.FileInfo for a path that isn't a real
+// device node (mknod isn't portable in a test), reporting os.ModeDevice set
+// so flattenToRaw's block-device validation treats it as one.
+type fakeDeviceFileInfo struct{ name string }
+
+func (f fakeDeviceFileInfo) Name() string       { return f.name }
+func (f fakeDeviceFileInfo) Size() int64        { return 0 }
+func (f fakeDeviceFileInfo) Mode() os.FileMode  { return os.ModeDevice }
+func (f fakeDeviceFileInfo) ModTime() time.Time { return time.Time{} }
+func (f fakeDeviceFileInfo) IsDir() bool        { return false }
+func (f fakeDeviceFileInfo) Sys() any           { return nil }
+
+// withFakeBlockDevice stubs statOutputPath so a plain regular file at path
+// is treated as an existing block device, letting tests exercise
+// flattenToRaw's outputIsBlockDevice branches without a real device node.
+func withFakeBlockDevice(t *testing.T, path string) {
+	t.Helper()
+	original := statOutputPath
+	statOutputPath = func(p string) (os.FileInfo, error) {
+		if p == path {
+			return fakeDeviceFileInfo{name: filepath.Base(path)}, nil
+		}
+		return original(p)
+	}
+	t.Cleanup(func() { statOutputPath = original })
 }
 
 const (
@@ -275,6 +304,7 @@ func TestFlattenToRaw(t *testing.T) {
 		if err := os.WriteFile(outputPath, []byte("partial"), 0o600); err != nil {
 			t.Fatalf("failed to seed partial output file: %v", err)
 		}
+		withFakeBlockDevice(t, outputPath)
 
 		withFakeQemuImg(t, func(_ context.Context, _ ...string) (string, string, error) {
 			return "", fakeBoomErr, errors.New("qemu-img failed")
@@ -285,6 +315,37 @@ func TestFlattenToRaw(t *testing.T) {
 
 		if _, statErr := os.Stat(outputPath); statErr != nil {
 			t.Errorf("expected output path to be left alone (outputIsBlockDevice=true), stat err = %v", statErr)
+		}
+	})
+
+	t.Run("outputIsBlockDevice rejects a missing device path", func(t *testing.T) {
+		outputPath := filepath.Join(t.TempDir(), "does-not-exist.raw")
+
+		err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, true)
+		if err == nil {
+			t.Fatal("expected error for missing block device path")
+		}
+		if !strings.Contains(err.Error(), "not found") {
+			t.Errorf("error = %q, want it to reference the missing device", err)
+		}
+	})
+
+	t.Run("outputIsBlockDevice rejects a path that isn't a device node", func(t *testing.T) {
+		// A regular file at the target path (e.g. misconfigured caller)
+		// must be rejected instead of silently written into, since the
+		// whole point of the block-device path is to write directly onto
+		// an existing kubelet/CSI-provisioned device.
+		outputPath := filepath.Join(t.TempDir(), "not-a-device.raw")
+		if err := os.WriteFile(outputPath, []byte("regular file"), 0o600); err != nil {
+			t.Fatalf("failed to seed regular file: %v", err)
+		}
+
+		err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, true)
+		if err == nil {
+			t.Fatal("expected error for non-device output path")
+		}
+		if !strings.Contains(err.Error(), "not a block device") {
+			t.Errorf("error = %q, want it to reference the device-type mismatch", err)
 		}
 	})
 }

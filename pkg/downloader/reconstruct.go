@@ -41,6 +41,12 @@ var runQemuImg = func(ctx context.Context, args ...string) (stdout, stderr strin
 	return outBuf.String(), errBuf.String(), err
 }
 
+// statOutputPath is a package var so tests can simulate a block device
+// target (os.ModeDevice requires a real device node, which isn't portable
+// to create in a test) without shelling out to mknod, mirroring the
+// runQemuImg injection pattern above.
+var statOutputPath = os.Stat
+
 // rebaseChain repoints each qcow2 file's backing-file reference (after the
 // first) onto the local path of its predecessor in the chain. The backing
 // path recorded at backup time refers to a path on the backup pod's
@@ -135,18 +141,41 @@ func flattenToRaw(ctx context.Context, chainTipPath, outputPath string, outputIs
 		}
 	}
 
+	// A block device target must already exist as a device special file --
+	// kubelet/CSI provisions it, not this pod. Omitting O_CREATE below means
+	// a missing path fails loudly here with ENOENT; this Stat additionally
+	// catches the case where something exists at the path but isn't actually
+	// a device node (e.g. a misconfigured test or caller), which a bare
+	// OpenFile wouldn't distinguish from the happy path.
+	if outputIsBlockDevice {
+		info, err := statOutputPath(outputPath)
+		if err != nil {
+			return fmt.Errorf("output block device %q not found: %w", outputPath, err)
+		}
+		if info.Mode()&os.ModeDevice == 0 {
+			return fmt.Errorf("output path %q is not a block device", outputPath)
+		}
+	}
+
 	// Pre-create the output file with restrictive permissions: qemu-img
 	// convert writes into an existing file in place rather than recreating
 	// it, so this avoids a window where the restored VM disk briefly exists
 	// with the process's default (more permissive) umask. O_TRUNC and an
 	// explicit Chmod make this correct even if outputPath already existed
 	// with different content or permissions — the O_CREATE mode argument
-	// alone is only applied when the file doesn't already exist. Both
-	// O_CREATE and O_TRUNC are safe no-ops against an existing block device
-	// node (the kernel ignores truncate semantics for special files); the
-	// Chmod calls below are skipped entirely for a block device target
-	// instead, rather than relying on that being a no-op too.
-	f, err := os.OpenFile(outputPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	// alone is only applied when the file doesn't already exist. A block
+	// device target omits O_CREATE entirely (verified to already exist
+	// above) so a race where it disappears between the Stat and this Open
+	// still fails loudly instead of silently creating a regular file in its
+	// place; O_TRUNC is still a safe no-op against a device node (the kernel
+	// ignores truncate semantics for special files). The Chmod calls below
+	// are skipped entirely for a block device target instead, rather than
+	// relying on that being a no-op too.
+	openFlags := os.O_CREATE | os.O_TRUNC | os.O_WRONLY
+	if outputIsBlockDevice {
+		openFlags = os.O_TRUNC | os.O_WRONLY
+	}
+	f, err := os.OpenFile(outputPath, openFlags, 0o600)
 	if err != nil {
 		return fmt.Errorf("failed to pre-create raw image %q: %w", outputPath, err)
 	}

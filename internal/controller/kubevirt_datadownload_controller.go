@@ -131,6 +131,7 @@ type KubeVirtDataDownloadReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines,verbs=get;update
 
 // Reconcile handles DataDownload resources where Spec.DataMover is "kubevirt"
 func (r *KubeVirtDataDownloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -1565,6 +1566,13 @@ func (r *KubeVirtDataDownloadReconciler) handleCanceling(ctx context.Context, lo
 // (empty {}): it does not, so Status().Update() would be a no-op here, not an
 // equally-valid alternative. checkOperationTimeoutCore's AcceptedTimestamp backfill
 // persist callback uses the same r.Update() for the same reason.
+//
+// When phase and message already match, this returns early WITHOUT calling
+// r.Update -- so any other in-memory field a caller set on dd first (an
+// annotation, a status subfield) is silently discarded rather than persisted.
+// A caller that needs such a field written (e.g. handleAccepted setting an
+// annotation before transitioning phase) must persist it itself rather than
+// relying on this call to do so incidentally.
 func (r *KubeVirtDataDownloadReconciler) updatePhase(ctx context.Context, dd *velerov2alpha1.DataDownload, phase velerov2alpha1.DataDownloadPhase, message string) error {
 	logger := log.FromContext(ctx)
 

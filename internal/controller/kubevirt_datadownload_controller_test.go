@@ -3012,6 +3012,39 @@ func TestRestoreVMRunStateIfAllSiblingsCompleted(t *testing.T) {
 		}
 	})
 
+	t.Run("returns an error for an unrecognized stash source value", func(t *testing.T) {
+		scheme := ddSchemeWithKubeVirt()
+		dd := newDD("dd-1", velerov2alpha1.DataDownloadPhaseCompleted)
+		vm := &kubevirtcorev1.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      vmName,
+				Namespace: vmNamespace,
+				Annotations: map[string]string{
+					common.AnnotationOriginalRunStrategy:       string(kubevirtcorev1.RunStrategyAlways),
+					common.AnnotationOriginalRunStrategySource: "bogus",
+				},
+			},
+			Spec: kubevirtcorev1.VirtualMachineSpec{RunStrategy: new(kubevirtcorev1.RunStrategyHalted)},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, vm).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+		if err := r.restoreVMRunStateIfAllSiblingsCompleted(context.Background(), logr.Discard(), dd); err == nil {
+			t.Fatal("expected error for unrecognized stash source value")
+		}
+
+		var updated kubevirtcorev1.VirtualMachine
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: vmName, Namespace: vmNamespace}, &updated); err != nil {
+			t.Fatalf("failed to get VM: %v", err)
+		}
+		if updated.Spec.RunStrategy == nil || *updated.Spec.RunStrategy != kubevirtcorev1.RunStrategyHalted {
+			t.Errorf("RunStrategy = %v, want unchanged %q (VM should be left untouched on error)", updated.Spec.RunStrategy, kubevirtcorev1.RunStrategyHalted)
+		}
+		if _, ok := updated.Annotations[common.AnnotationOriginalRunStrategy]; !ok {
+			t.Error("stash annotations should not have been removed when the source value is unrecognized")
+		}
+	})
+
 	t.Run("Reconcile wires the flip on the Completed terminal path", func(t *testing.T) {
 		scheme := ddSchemeWithKubeVirt()
 		dd := newDD("dd-1", velerov2alpha1.DataDownloadPhaseCompleted)
