@@ -716,6 +716,41 @@ func TestInitSSECMutualExclusivity(t *testing.T) {
 	}
 }
 
+func TestInitSSECMutualExclusivityWithSSE(t *testing.T) {
+	keyFile := writeSSECKeyFile(t, make([]byte, 32))
+
+	store := &S3ObjectStore{}
+	err := store.Init(map[string]string{
+		"bucket":                    "test-bucket",
+		"customerKeyEncryptionFile": keyFile,
+		"serverSideEncryption":      testSSEAES256,
+	})
+	if err == nil {
+		t.Fatal("expected error when both customerKeyEncryptionFile and serverSideEncryption are set")
+	}
+}
+
+func TestInitSSECKeyFileWithNewline(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	keyWithNewline := append(key, '\n')
+	keyFile := writeSSECKeyFile(t, keyWithNewline)
+
+	store := &S3ObjectStore{}
+	err := store.Init(map[string]string{
+		"bucket":                    "test-bucket",
+		"customerKeyEncryptionFile": keyFile,
+	})
+	if err != nil {
+		t.Fatalf("expected trailing newline to be trimmed, got error: %v", err)
+	}
+	if store.sseCustomerAlgorithm != testSSEAES256 {
+		t.Errorf("sseCustomerAlgorithm = %q, want %q", store.sseCustomerAlgorithm, testSSEAES256)
+	}
+}
+
 func TestInitObjectStoreWithEncryptionSettings(t *testing.T) {
 	cfg := &common.ObjectStoreConfig{
 		BSLProvider:             "aws",

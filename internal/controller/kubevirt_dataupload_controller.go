@@ -1663,7 +1663,8 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		BSLServerSideEncryption:        cfg.ServerSideEncryption,
 		BSLKMSKeyID:                    cfg.KMSKeyID,
 		BSLChecksumAlgorithm:           cfg.ChecksumAlgorithm,
-		BSLCustomerKeyEncryptionFile:   cfg.CustomerKeyEncryptionFile,
+		SSECSecretName:                 sseSecretName(cfg.CustomerKeyEncryptionSecret),
+		SSECSecretKey:                  sseSecretKey(cfg.CustomerKeyEncryptionSecret),
 		BSLServiceAccount:              cfg.ServiceAccount,
 		BSLKMSKeyName:                  cfg.KMSKeyName,
 		BSLResourceGroup:               cfg.ResourceGroup,
@@ -1689,6 +1690,27 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		SourcePVCName:                  "", // overridden by handlePrepared with the rebound PVC name
 		Labels:                         make(map[string]string),
 	}, nil
+}
+
+// sseSecretName parses the secret name from a "secretName/key" reference.
+func sseSecretName(ref string) string {
+	if ref == "" {
+		return ""
+	}
+	parts := strings.SplitN(ref, "/", 2)
+	return parts[0]
+}
+
+// sseSecretKey parses the key from a "secretName/key" reference.
+func sseSecretKey(ref string) string {
+	if ref == "" {
+		return ""
+	}
+	parts := strings.SplitN(ref, "/", 2)
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[1]
 }
 
 // lookupCheckpointFromBSL reads the VM's checkpoint index from the BSL and returns

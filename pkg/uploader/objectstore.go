@@ -437,14 +437,14 @@ type BSLConfig struct {
 	CredentialKey  string
 
 	// S3-compatible storage provider settings
-	S3URL                     string
-	S3ForcePathStyle          bool
-	InsecureSkipTLSVerify     bool
-	CACert                    string
-	ServerSideEncryption      string
-	KMSKeyID                  string
-	ChecksumAlgorithm         string
-	CustomerKeyEncryptionFile string
+	S3URL                       string
+	S3ForcePathStyle            bool
+	InsecureSkipTLSVerify       bool
+	CACert                      string
+	ServerSideEncryption        string
+	KMSKeyID                    string
+	ChecksumAlgorithm           string
+	CustomerKeyEncryptionSecret string
 
 	// GCP-specific storage provider settings
 	ServiceAccount string
@@ -488,7 +488,7 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 	serverSideEncryption := ""
 	kmsKeyID := ""
 	checksumAlgorithm := ""
-	customerKeyEncryptionFile := ""
+	customerKeyEncryptionSecret := ""
 	serviceAccount := ""
 	kmsKeyName := ""
 	resourceGroup := ""
@@ -507,7 +507,7 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 		serverSideEncryption = bsl.Spec.Config["serverSideEncryption"]
 		kmsKeyID = bsl.Spec.Config["kmsKeyId"]
 		checksumAlgorithm = bsl.Spec.Config["checksumAlgorithm"]
-		customerKeyEncryptionFile = bsl.Spec.Config["customerKeyEncryptionFile"]
+		customerKeyEncryptionSecret = bsl.Spec.Config["customerKeyEncryptionSecret"]
 		serviceAccount = bsl.Spec.Config["serviceAccount"]
 		kmsKeyName = bsl.Spec.Config["kmsKeyName"]
 		resourceGroup = bsl.Spec.Config["resourceGroup"]
@@ -542,7 +542,7 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 		ServerSideEncryption:        serverSideEncryption,
 		KMSKeyID:                    kmsKeyID,
 		ChecksumAlgorithm:           checksumAlgorithm,
-		CustomerKeyEncryptionFile:   customerKeyEncryptionFile,
+		CustomerKeyEncryptionSecret: customerKeyEncryptionSecret,
 		ServiceAccount:              serviceAccount,
 		KMSKeyName:                  kmsKeyName,
 		ResourceGroup:               resourceGroup,
@@ -583,18 +583,20 @@ func InitObjectStoreFromBSL(
 	}
 
 	store, err := factory(&common.ObjectStoreConfig{
-		BSLProvider:                    cfg.Provider,
-		BSLBucket:                      cfg.Bucket,
-		BSLPrefix:                      cfg.Prefix,
-		BSLRegion:                      cfg.Region,
-		BSLS3URL:                       cfg.S3URL,
-		BSLS3ForcePathStyle:            cfg.S3ForcePathStyle,
-		BSLInsecureSkipTLSVerify:       cfg.InsecureSkipTLSVerify,
-		BSLCACert:                      cfg.CACert,
-		BSLServerSideEncryption:        cfg.ServerSideEncryption,
-		BSLKMSKeyID:                    cfg.KMSKeyID,
-		BSLChecksumAlgorithm:           cfg.ChecksumAlgorithm,
-		BSLCustomerKeyEncryptionFile:   cfg.CustomerKeyEncryptionFile,
+		BSLProvider:              cfg.Provider,
+		BSLBucket:                cfg.Bucket,
+		BSLPrefix:                cfg.Prefix,
+		BSLRegion:                cfg.Region,
+		BSLS3URL:                 cfg.S3URL,
+		BSLS3ForcePathStyle:      cfg.S3ForcePathStyle,
+		BSLInsecureSkipTLSVerify: cfg.InsecureSkipTLSVerify,
+		BSLCACert:                cfg.CACert,
+		BSLServerSideEncryption:  cfg.ServerSideEncryption,
+		BSLKMSKeyID:              cfg.KMSKeyID,
+		BSLChecksumAlgorithm:     cfg.ChecksumAlgorithm,
+		// BSLCustomerKeyEncryptionFile is not set here — the controller path
+		// (InitObjectStoreFromBSL) doesn't have the SSE-C key file mounted.
+		// SSE-C is only applied in the datamover pod where the secret is volume-mounted.
 		BSLServiceAccount:              cfg.ServiceAccount,
 		BSLKMSKeyName:                  cfg.KMSKeyName,
 		BSLResourceGroup:               cfg.ResourceGroup,

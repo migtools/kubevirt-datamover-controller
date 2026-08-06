@@ -194,6 +194,9 @@ func (s *S3ObjectStore) Init(configMap map[string]string) error {
 		if s.kmsKeyId != "" {
 			return fmt.Errorf("customerKeyEncryptionFile cannot be used with kmsKeyId")
 		}
+		if s.serverSideEncryption != "" {
+			return fmt.Errorf("customerKeyEncryptionFile cannot be used with serverSideEncryption")
+		}
 		sseKey, err := loadSSECKey(customerKeyFile)
 		if err != nil {
 			return fmt.Errorf("failed to load SSE-C key: %w", err)
@@ -439,6 +442,7 @@ func loadSSECKey(path string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read SSE-C key file %q: %w", path, err)
 	}
+	data = bytes.TrimRight(data, "\r\n")
 	if len(data) != 32 {
 		return nil, fmt.Errorf("SSE-C key must be exactly 32 bytes, got %d", len(data))
 	}
