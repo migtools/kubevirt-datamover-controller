@@ -40,6 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -2805,4 +2806,241 @@ func TestBuildDownloaderPodConfig(t *testing.T) {
 	if cfg.BSLActiveDirectoryAuthorityURI != "https://login.microsoftonline.com" {
 		t.Errorf("BSLActiveDirectoryAuthorityURI = %q, want %q", cfg.BSLActiveDirectoryAuthorityURI, "https://login.microsoftonline.com")
 	}
+}
+
+// ddSchemeWithKubeVirt extends ddScheme with kubevirtcorev1, for tests that
+// (unlike handleNew/handleAccepted) legitimately need to fetch/patch a live
+// VirtualMachine object -- the run-state restore flip.
+func ddSchemeWithKubeVirt() *runtime.Scheme {
+	scheme := ddScheme()
+	_ = kubevirtcorev1.AddToScheme(scheme)
+	return scheme
+}
+
+//nolint:gocyclo // Table of independent subtests, not complex control flow
+func TestRestoreVMRunStateIfAllSiblingsCompleted(t *testing.T) {
+	const (
+		vmName      = "test-vm"
+		vmNamespace = "vm-ns"
+		oadpNS      = "openshift-adp"
+	)
+
+	newDD := func(name string, phase velerov2alpha1.DataDownloadPhase) *velerov2alpha1.DataDownload {
+		return &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: oadpNS,
+				Annotations: map[string]string{
+					common.AnnotationVMName:      vmName,
+					common.AnnotationVMNamespace: vmNamespace,
+				},
+			},
+			Spec:   velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataDownloadStatus{Phase: phase},
+		}
+	}
+
+	t.Run("flips RunStrategy-sourced VM back and clears stash annotations", func(t *testing.T) {
+		scheme := ddSchemeWithKubeVirt()
+		dd := newDD("dd-1", velerov2alpha1.DataDownloadPhaseCompleted)
+		vm := &kubevirtcorev1.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      vmName,
+				Namespace: vmNamespace,
+				Annotations: map[string]string{
+					common.AnnotationOriginalRunStrategy:       string(kubevirtcorev1.RunStrategyManual),
+					common.AnnotationOriginalRunStrategySource: common.RunStrategySourceRunStrategy,
+				},
+			},
+			Spec: kubevirtcorev1.VirtualMachineSpec{
+				RunStrategy: new(kubevirtcorev1.RunStrategyHalted),
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, vm).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+		if err := r.restoreVMRunStateIfAllSiblingsCompleted(context.Background(), logr.Discard(), dd); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated kubevirtcorev1.VirtualMachine
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: vmName, Namespace: vmNamespace}, &updated); err != nil {
+			t.Fatalf("failed to get VM: %v", err)
+		}
+		if updated.Spec.RunStrategy == nil || *updated.Spec.RunStrategy != kubevirtcorev1.RunStrategyManual {
+			t.Errorf("RunStrategy = %v, want %q", updated.Spec.RunStrategy, kubevirtcorev1.RunStrategyManual)
+		}
+		if updated.Spec.Running != nil {
+			t.Errorf("Running = %v, want nil", *updated.Spec.Running)
+		}
+		if _, ok := updated.Annotations[common.AnnotationOriginalRunStrategy]; ok {
+			t.Error("AnnotationOriginalRunStrategy should have been deleted")
+		}
+		if _, ok := updated.Annotations[common.AnnotationOriginalRunStrategySource]; ok {
+			t.Error("AnnotationOriginalRunStrategySource should have been deleted")
+		}
+	})
+
+	t.Run("flips Running-sourced VM back to true for Always", func(t *testing.T) {
+		scheme := ddSchemeWithKubeVirt()
+		dd := newDD("dd-1", velerov2alpha1.DataDownloadPhaseCompleted)
+		vm := &kubevirtcorev1.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      vmName,
+				Namespace: vmNamespace,
+				Annotations: map[string]string{
+					common.AnnotationOriginalRunStrategy:       string(kubevirtcorev1.RunStrategyAlways),
+					common.AnnotationOriginalRunStrategySource: common.RunStrategySourceRunning,
+				},
+			},
+			Spec: kubevirtcorev1.VirtualMachineSpec{Running: new(false)},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, vm).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+		if err := r.restoreVMRunStateIfAllSiblingsCompleted(context.Background(), logr.Discard(), dd); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated kubevirtcorev1.VirtualMachine
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: vmName, Namespace: vmNamespace}, &updated); err != nil {
+			t.Fatalf("failed to get VM: %v", err)
+		}
+		if updated.Spec.Running == nil || !*updated.Spec.Running {
+			t.Errorf("Running = %v, want true", updated.Spec.Running)
+		}
+		if updated.Spec.RunStrategy != nil {
+			t.Errorf("RunStrategy = %v, want nil", *updated.Spec.RunStrategy)
+		}
+	})
+
+	t.Run("flips Running-sourced VM back to false for Halted", func(t *testing.T) {
+		scheme := ddSchemeWithKubeVirt()
+		dd := newDD("dd-1", velerov2alpha1.DataDownloadPhaseCompleted)
+		vm := &kubevirtcorev1.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      vmName,
+				Namespace: vmNamespace,
+				Annotations: map[string]string{
+					common.AnnotationOriginalRunStrategy:       string(kubevirtcorev1.RunStrategyHalted),
+					common.AnnotationOriginalRunStrategySource: common.RunStrategySourceRunning,
+				},
+			},
+			Spec: kubevirtcorev1.VirtualMachineSpec{Running: new(false)},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, vm).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+		if err := r.restoreVMRunStateIfAllSiblingsCompleted(context.Background(), logr.Discard(), dd); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated kubevirtcorev1.VirtualMachine
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: vmName, Namespace: vmNamespace}, &updated); err != nil {
+			t.Fatalf("failed to get VM: %v", err)
+		}
+		if updated.Spec.Running == nil || *updated.Spec.Running {
+			t.Errorf("Running = %v, want false", updated.Spec.Running)
+		}
+	})
+
+	t.Run("does not flip while a sibling DataDownload is incomplete", func(t *testing.T) {
+		scheme := ddSchemeWithKubeVirt()
+		dd1 := newDD("dd-1", velerov2alpha1.DataDownloadPhaseCompleted)
+		dd2 := newDD("dd-2", velerov2alpha1.DataDownloadPhaseInProgress)
+		vm := &kubevirtcorev1.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      vmName,
+				Namespace: vmNamespace,
+				Annotations: map[string]string{
+					common.AnnotationOriginalRunStrategy:       string(kubevirtcorev1.RunStrategyAlways),
+					common.AnnotationOriginalRunStrategySource: common.RunStrategySourceRunStrategy,
+				},
+			},
+			Spec: kubevirtcorev1.VirtualMachineSpec{RunStrategy: new(kubevirtcorev1.RunStrategyHalted)},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd1, dd2, vm).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+		if err := r.restoreVMRunStateIfAllSiblingsCompleted(context.Background(), logr.Discard(), dd1); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated kubevirtcorev1.VirtualMachine
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: vmName, Namespace: vmNamespace}, &updated); err != nil {
+			t.Fatalf("failed to get VM: %v", err)
+		}
+		if updated.Spec.RunStrategy == nil || *updated.Spec.RunStrategy != kubevirtcorev1.RunStrategyHalted {
+			t.Errorf("RunStrategy = %v, want still %q (sibling dd-2 not Completed)", updated.Spec.RunStrategy, kubevirtcorev1.RunStrategyHalted)
+		}
+		if _, ok := updated.Annotations[common.AnnotationOriginalRunStrategy]; !ok {
+			t.Error("stash annotation should not have been removed while a sibling is incomplete")
+		}
+	})
+
+	t.Run("tolerates VM already gone", func(t *testing.T) {
+		scheme := ddSchemeWithKubeVirt()
+		dd := newDD("dd-1", velerov2alpha1.DataDownloadPhaseCompleted)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+		if err := r.restoreVMRunStateIfAllSiblingsCompleted(context.Background(), logr.Discard(), dd); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("is a no-op when the VM has no stashed run state (already flipped)", func(t *testing.T) {
+		scheme := ddSchemeWithKubeVirt()
+		dd := newDD("dd-1", velerov2alpha1.DataDownloadPhaseCompleted)
+		vm := &kubevirtcorev1.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{Name: vmName, Namespace: vmNamespace},
+			Spec:       kubevirtcorev1.VirtualMachineSpec{RunStrategy: new(kubevirtcorev1.RunStrategyManual)},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, vm).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+		if err := r.restoreVMRunStateIfAllSiblingsCompleted(context.Background(), logr.Discard(), dd); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated kubevirtcorev1.VirtualMachine
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: vmName, Namespace: vmNamespace}, &updated); err != nil {
+			t.Fatalf("failed to get VM: %v", err)
+		}
+		if updated.Spec.RunStrategy == nil || *updated.Spec.RunStrategy != kubevirtcorev1.RunStrategyManual {
+			t.Errorf("RunStrategy = %v, want unchanged %q", updated.Spec.RunStrategy, kubevirtcorev1.RunStrategyManual)
+		}
+	})
+
+	t.Run("Reconcile wires the flip on the Completed terminal path", func(t *testing.T) {
+		scheme := ddSchemeWithKubeVirt()
+		dd := newDD("dd-1", velerov2alpha1.DataDownloadPhaseCompleted)
+		vm := &kubevirtcorev1.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      vmName,
+				Namespace: vmNamespace,
+				Annotations: map[string]string{
+					common.AnnotationOriginalRunStrategy:       string(kubevirtcorev1.RunStrategyAlways),
+					common.AnnotationOriginalRunStrategySource: common.RunStrategySourceRunStrategy,
+				},
+			},
+			Spec: kubevirtcorev1.VirtualMachineSpec{RunStrategy: new(kubevirtcorev1.RunStrategyHalted)},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, vm).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: dd.Name, Namespace: dd.Namespace},
+		}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated kubevirtcorev1.VirtualMachine
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: vmName, Namespace: vmNamespace}, &updated); err != nil {
+			t.Fatalf("failed to get VM: %v", err)
+		}
+		if updated.Spec.RunStrategy == nil || *updated.Spec.RunStrategy != kubevirtcorev1.RunStrategyAlways {
+			t.Errorf("RunStrategy = %v, want %q", updated.Spec.RunStrategy, kubevirtcorev1.RunStrategyAlways)
+		}
+	})
 }

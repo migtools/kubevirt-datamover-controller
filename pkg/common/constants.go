@@ -81,6 +81,35 @@ const (
 	// the global --max-incremental-backups setting for that VM.
 	// The value must be a non-negative integer string (e.g., "5"). "0" means unlimited.
 	AnnotationMaxIncrementalBackups = "kubevirt-datamover.io/max-incremental-backups"
+
+	// AnnotationOriginalRunStrategy stores a restored VM's pre-restore run
+	// state so the controller can restore it once every DataDownload
+	// targeting the VM reaches Completed. Always one of the
+	// VirtualMachineRunStrategy enum values (Always/RerunOnFailure/Manual/
+	// Once/Halted) -- if the original VM used the deprecated spec.Running
+	// bool instead of spec.RunStrategy, the plugin normalizes it to
+	// "Always"/"Halted" before stashing, so the controller never parses a
+	// bool here. See AnnotationOriginalRunStrategySource for which field to
+	// write the value back to.
+	AnnotationOriginalRunStrategy = "kubevirt-datamover.io/original-run-strategy"
+
+	// AnnotationOriginalRunStrategySource records which field the VM used
+	// pre-restore ("runStrategy" or "running", see the RunStrategySource*
+	// constants) so the controller writes AnnotationOriginalRunStrategy's
+	// value back to the same field the user had, instead of silently
+	// migrating them off the deprecated bool field as a side effect of
+	// restore.
+	AnnotationOriginalRunStrategySource = "kubevirt-datamover.io/original-run-strategy-source"
+)
+
+// Values for AnnotationOriginalRunStrategySource.
+const (
+	// RunStrategySourceRunStrategy indicates the VM used spec.RunStrategy pre-restore.
+	RunStrategySourceRunStrategy = "runStrategy"
+
+	// RunStrategySourceRunning indicates the VM used the deprecated
+	// spec.Running bool pre-restore.
+	RunStrategySourceRunning = "running"
 )
 
 // Label keys for resources created by the controller.

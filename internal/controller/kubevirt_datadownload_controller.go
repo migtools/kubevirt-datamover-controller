@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -234,8 +235,14 @@ func (r *KubeVirtDataDownloadReconciler) Reconcile(ctx context.Context, req ctrl
 	case velerov2alpha1.DataDownloadPhaseCanceling:
 		return r.handleCanceling(ctx, logger, dataDownload)
 
-	case velerov2alpha1.DataDownloadPhaseCompleted,
-		velerov2alpha1.DataDownloadPhaseFailed,
+	case velerov2alpha1.DataDownloadPhaseCompleted:
+		logger.V(1).Info("DataDownload is in terminal state", "phase", dataDownload.Status.Phase)
+		if err := r.restoreVMRunStateIfAllSiblingsCompleted(ctx, logger, dataDownload); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+
+	case velerov2alpha1.DataDownloadPhaseFailed,
 		velerov2alpha1.DataDownloadPhaseCanceled:
 		logger.V(1).Info("DataDownload is in terminal state", "phase", dataDownload.Status.Phase)
 		return ctrl.Result{}, nil
@@ -1604,6 +1611,102 @@ func isTerminalDataDownloadPhase(phase velerov2alpha1.DataDownloadPhase) bool {
 	default:
 		return false
 	}
+}
+
+// restoreVMRunStateIfAllSiblingsCompleted flips a restored VM back to its
+// pre-restore run state once every DataDownload targeting it has reached
+// Completed. This is the controller-side half of the VM-restore race fix: the
+// kubevirt-datamover-plugin halts the VM (RestoreItemActionV2) and stashes its
+// original run state in AnnotationOriginalRunStrategy(+Source) before Velero
+// recreates it, so virt-controller doesn't start the VM -- and rebind the
+// target PVC to the wrong volume -- before this controller has finished
+// restoring the disk. Idempotent: the flip deletes both stash annotations, so
+// a VM with neither present (already flipped, or never stashed) is a no-op.
+// Also tolerates the VM having been deleted since restore.
+func (r *KubeVirtDataDownloadReconciler) restoreVMRunStateIfAllSiblingsCompleted(ctx context.Context, logger logr.Logger, dd *velerov2alpha1.DataDownload) error {
+	vmRef, err := common.GetVMReferenceFromDataDownload(dd)
+	if err != nil {
+		return nil
+	}
+
+	allCompleted, err := r.allSiblingDataDownloadsCompleted(ctx, dd, vmRef)
+	if err != nil {
+		return err
+	}
+	if !allCompleted {
+		return nil
+	}
+
+	vm := &kubevirtcorev1.VirtualMachine{}
+	if err := r.Get(ctx, types.NamespacedName{Name: vmRef.Name, Namespace: vmRef.Namespace}, vm); err != nil {
+		if errors.IsNotFound(err) {
+			logger.V(1).Info("VirtualMachine not found, skipping run-state restore",
+				"vm", vmRef.Name, "namespace", vmRef.Namespace)
+			return nil
+		}
+		return fmt.Errorf("failed to get VirtualMachine %s/%s for run-state restore: %w", vmRef.Namespace, vmRef.Name, err)
+	}
+
+	value, hasValue := vm.Annotations[common.AnnotationOriginalRunStrategy]
+	source, hasSource := vm.Annotations[common.AnnotationOriginalRunStrategySource]
+	if !hasValue || !hasSource {
+		logger.V(1).Info("VirtualMachine has no stashed run state, skipping restore",
+			"vm", vmRef.Name, "namespace", vmRef.Namespace)
+		return nil
+	}
+
+	switch source {
+	case common.RunStrategySourceRunning:
+		running := value == string(kubevirtcorev1.RunStrategyAlways)
+		vm.Spec.Running = &running
+		vm.Spec.RunStrategy = nil
+	case common.RunStrategySourceRunStrategy:
+		strategy := kubevirtcorev1.VirtualMachineRunStrategy(value)
+		vm.Spec.RunStrategy = &strategy
+		vm.Spec.Running = nil
+	default:
+		return fmt.Errorf("VirtualMachine %s/%s has unrecognized %s value %q",
+			vm.Namespace, vm.Name, common.AnnotationOriginalRunStrategySource, source)
+	}
+
+	delete(vm.Annotations, common.AnnotationOriginalRunStrategy)
+	delete(vm.Annotations, common.AnnotationOriginalRunStrategySource)
+
+	if err := r.Update(ctx, vm); err != nil {
+		return fmt.Errorf("failed to restore VirtualMachine %s/%s run state: %w", vm.Namespace, vm.Name, err)
+	}
+	logger.Info("Restored VirtualMachine run state after all DataDownloads completed",
+		"vm", vmRef.Name, "namespace", vmRef.Namespace, "source", source, "value", value)
+	return nil
+}
+
+// allSiblingDataDownloadsCompleted reports whether every kubevirt-datamover
+// DataDownload in dd's namespace correlated to the same VM (via
+// AnnotationVMName/AnnotationVMNamespace -- the same correlation key the
+// plugin stamps on every DataDownload it creates, see pvc/restore.go) has
+// reached Completed. A single sibling that hasn't (including one that failed
+// or was canceled) means the VM's disks aren't all restored yet, so it must
+// stay halted.
+func (r *KubeVirtDataDownloadReconciler) allSiblingDataDownloadsCompleted(ctx context.Context, dd *velerov2alpha1.DataDownload, vmRef *common.VMReference) (bool, error) {
+	ddList := &velerov2alpha1.DataDownloadList{}
+	if err := r.List(ctx, ddList, client.InNamespace(dd.Namespace)); err != nil {
+		return false, fmt.Errorf("failed to list DataDownloads: %w", err)
+	}
+
+	for i := range ddList.Items {
+		other := &ddList.Items[i]
+		if other.Spec.DataMover != common.DataMoverKubeVirt {
+			continue
+		}
+		otherRef, err := common.GetVMReferenceFromDataDownload(other)
+		if err != nil || otherRef.Name != vmRef.Name || otherRef.Namespace != vmRef.Namespace {
+			continue
+		}
+		if other.Status.Phase != velerov2alpha1.DataDownloadPhaseCompleted {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // getPodNamespace returns the namespace where downloader pods (and the scratch PVC)
