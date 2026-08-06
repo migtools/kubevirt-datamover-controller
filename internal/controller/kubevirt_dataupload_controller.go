@@ -183,7 +183,7 @@ func (r *KubeVirtDataUploadReconciler) handleNew(ctx context.Context, logger log
 	vmRef, err := common.GetVMReference(du)
 	if err != nil {
 		logger.Error(err, "Failed to get VM reference from DataUpload")
-		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Missing VM reference: %v", err)); err != nil {
+		if err := r.failDataUpload(ctx, logger, du, fmt.Sprintf("Missing VM reference: %v", err)); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -196,7 +196,7 @@ func (r *KubeVirtDataUploadReconciler) handleNew(ctx context.Context, logger log
 	if err := r.Get(ctx, types.NamespacedName{Name: vmRef.Name, Namespace: vmRef.Namespace}, vm); err != nil {
 		if errors.IsNotFound(err) {
 			logger.Error(err, "VirtualMachine not found")
-			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+			if err := r.failDataUpload(ctx, logger, du,
 				fmt.Sprintf("VirtualMachine %s/%s not found", vmRef.Namespace, vmRef.Name)); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -208,7 +208,7 @@ func (r *KubeVirtDataUploadReconciler) handleNew(ctx context.Context, logger log
 	// Step 3: Validate VM is running and CBT is enabled
 	if err := common.ValidateVMForBackup(vm); err != nil {
 		logger.Error(err, "VM validation failed")
-		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, err.Error()); err != nil {
+		if err := r.failDataUpload(ctx, logger, du, err.Error()); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -235,7 +235,7 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	vmRef, err := common.GetVMReference(du)
 	if err != nil {
 		logger.Error(err, "Failed to get VM reference")
-		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Missing VM reference: %v", err)); err != nil {
+		if err := r.failDataUpload(ctx, logger, du, fmt.Sprintf("Missing VM reference: %v", err)); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -262,7 +262,7 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		bslObj, err := r.getBackupStorageLocationForDU(ctx, du)
 		if err != nil {
 			logger.Error(err, "BackupStorageLocation not accessible")
-			if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+			if updateErr := r.failDataUpload(ctx, logger, du,
 				fmt.Sprintf("BackupStorageLocation not accessible: %v", err)); updateErr != nil {
 				return ctrl.Result{}, updateErr
 			}
@@ -271,7 +271,7 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		if bslObj.Status.Phase != velerov1.BackupStorageLocationPhaseAvailable {
 			logger.Error(nil, "BackupStorageLocation is not in Available phase",
 				"bsl", bslObj.Name, "phase", bslObj.Status.Phase)
-			if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+			if updateErr := r.failDataUpload(ctx, logger, du,
 				fmt.Sprintf("BackupStorageLocation %q is not available (phase: %s)",
 					bslObj.Name, bslObj.Status.Phase)); updateErr != nil {
 				return ctrl.Result{}, updateErr
@@ -287,7 +287,7 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		// instead of retrying forever. errors.IsNotFound matches wrapped errors.
 		if errors.IsNotFound(err) {
 			logger.Error(err, "PVC not found, failing DataUpload")
-			if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+			if updateErr := r.failDataUpload(ctx, logger, du,
 				fmt.Sprintf("Failed to create backup PVC: %v", err)); updateErr != nil {
 				return ctrl.Result{}, updateErr
 			}
@@ -408,7 +408,7 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 			if errors.IsNotFound(err) {
 				logger.Error(nil, "VirtualMachineBackup's BackupTracker was deleted before processing started",
 					"vmb", vmb.Name, "vmbt", vmbtName)
-				if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+				if updateErr := r.failDataUpload(ctx, logger, du,
 					fmt.Sprintf("VMBackup stuck: BackupTracker %s no longer exists", vmbtName)); updateErr != nil {
 					return ctrl.Result{}, updateErr
 				}
@@ -462,7 +462,7 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 			reason, failureMessage := pickFailureDetail(progressingCandidate, doneCond)
 			logger.Error(nil, "VirtualMachineBackup failed (Done=True with failure)",
 				"vmb", vmb.Name, "reason", reason, "message", failureMessage)
-			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+			if err := r.failDataUpload(ctx, logger, du,
 				fmt.Sprintf("VMBackup failed: %s", failureMessage)); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -489,7 +489,7 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 				failureMessage = fmt.Sprintf("VirtualMachineBackup %s failed (Done=False, Progressing=False) with no failure detail reported", vmb.Name)
 			}
 			logger.Error(nil, "VirtualMachineBackup failed", "reason", reason, "message", failureMessage)
-			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+			if err := r.failDataUpload(ctx, logger, du,
 				fmt.Sprintf("VMBackup failed: %s", failureMessage)); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -512,7 +512,7 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 			if errors.IsNotFound(err) {
 				logger.Error(nil, "VirtualMachineBackup's BackupTracker was deleted, failing",
 					"vmb", vmb.Name, "vmbt", vmbtName)
-				if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+				if updateErr := r.failDataUpload(ctx, logger, du,
 					fmt.Sprintf("VMBackup stuck: BackupTracker %s no longer exists", vmbtName)); updateErr != nil {
 					return ctrl.Result{}, updateErr
 				}
@@ -728,7 +728,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	vmRef, err := common.GetVMReference(du)
 	if err != nil {
 		logger.Error(err, "Failed to get VM reference")
-		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Missing VM reference: %v", err)); err != nil {
+		if err := r.failDataUpload(ctx, logger, du, fmt.Sprintf("Missing VM reference: %v", err)); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -758,7 +758,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	bsl, err := r.getBackupStorageLocationForDU(ctx, du)
 	if err != nil {
 		logger.Error(err, "Failed to get BackupStorageLocation")
-		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Failed to get BSL: %v", err)); err != nil {
+		if err := r.failDataUpload(ctx, logger, du, fmt.Sprintf("Failed to get BSL: %v", err)); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -771,7 +771,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	}
 	if vmb == nil {
 		logger.Error(nil, "VirtualMachineBackup not found for DataUpload")
-		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, "VirtualMachineBackup not found"); err != nil {
+		if err := r.failDataUpload(ctx, logger, du, "VirtualMachineBackup not found"); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -792,7 +792,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 		if vmb.Spec.PvcName == nil || *vmb.Spec.PvcName == "" {
 			err := fmt.Errorf("VirtualMachineBackup %s has no PVC name in spec", vmb.Name)
 			logger.Error(err, "Cannot determine source PVC for rebinding")
-			if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, err.Error()); updateErr != nil {
+			if updateErr := r.failDataUpload(ctx, logger, du, err.Error()); updateErr != nil {
 				return ctrl.Result{}, updateErr
 			}
 			return ctrl.Result{}, nil
@@ -810,7 +810,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 			// If it fails partway through, automatic retries could leave resources in an inconsistent state.
 			// Failing allows the user to investigate and take corrective action.
 			logger.Error(err, "Failed to rebind PV to OADP namespace")
-			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Failed to rebind PV: %v", err)); err != nil {
+			if err := r.failDataUpload(ctx, logger, du, fmt.Sprintf("Failed to rebind PV: %v", err)); err != nil {
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{}, nil
@@ -855,7 +855,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	if vmbtName == "" {
 		err := fmt.Errorf("VMBT name annotation %s not found on DataUpload", AnnotationVMBTName)
 		logger.Error(err, "Failed to get VMBT name")
-		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, err.Error()); err != nil {
+		if err := r.failDataUpload(ctx, logger, du, err.Error()); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -865,7 +865,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	podConfig, err := r.buildDatamoverPodConfig(du, bsl, vmb, vmRef, backupType, checkpointName, vmbtName)
 	if err != nil {
 		logger.Error(err, "Failed to build datamover pod config")
-		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Failed to build pod config: %v", err)); err != nil {
+		if err := r.failDataUpload(ctx, logger, du, fmt.Sprintf("Failed to build pod config: %v", err)); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -923,7 +923,7 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 	if pod == nil {
 		// Pod not found - this is unexpected in InProgress phase
 		logger.Error(nil, "Datamover pod not found", "dataUpload", du.Name, "namespace", podNamespace)
-		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, "Datamover pod not found"); err != nil {
+		if err := r.failDataUpload(ctx, logger, du, "Datamover pod not found"); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -953,7 +953,7 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 		// Skip cleanup on failure to preserve resources for debugging.
 		// Resources (pod, rebound PVC/PV) can be manually cleaned up after investigation.
 
-		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Datamover pod failed: %s", failureMessage)); err != nil {
+		if err := r.failDataUpload(ctx, logger, du, fmt.Sprintf("Datamover pod failed: %s", failureMessage)); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -1024,6 +1024,19 @@ func (r *KubeVirtDataUploadReconciler) cleanupVMBackupResources(ctx context.Cont
 			}
 		}
 	}
+}
+
+// failDataUpload transitions du to Failed and cleans up the VMB in the VM
+// namespace, mirroring the cleanup handleCanceling performs. The VMBT is
+// intentionally preserved (see cleanupVMBackupResources). If the VM
+// reference can't be resolved, no VMB could have been created yet, so
+// cleanup is skipped.
+// See https://github.com/migtools/kubevirt-datamover-controller/issues/168.
+func (r *KubeVirtDataUploadReconciler) failDataUpload(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, message string) error {
+	if vmRef, err := common.GetVMReference(du); err == nil {
+		r.cleanupVMBackupResources(ctx, logger, du, vmRef.Namespace)
+	}
+	return r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, message)
 }
 
 // handleCanceling processes DataUploads in Canceling phase
