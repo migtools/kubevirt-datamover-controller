@@ -2136,6 +2136,9 @@ func TestHandleCanceling_DefersCleanupWhileTerminating(t *testing.T) {
 	}, terminatingPod); err != nil {
 		t.Fatalf("failed to get terminating pod: %v", err)
 	}
+	if terminatingPod.DeletionTimestamp == nil {
+		t.Fatalf("expected handleCanceling to have requested datamover pod deletion in round 1")
+	}
 	terminatingPod.Finalizers = nil
 	if err := fakeClient.Update(context.Background(), terminatingPod); err != nil {
 		t.Fatalf("failed to clear pod finalizer: %v", err)
