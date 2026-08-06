@@ -38,6 +38,15 @@ const (
 	// once per DataUpload.
 	AnnotationBSLValidated = "kubevirt-datamover.io/bsl-validated"
 
+	// AnnotationDatamoverPodSucceeded indicates the datamover pod has already
+	// been observed in PodSucceeded phase and its deletion requested. Kubelet
+	// may take a reconcile or two to finish tearing the pod down (unmounting
+	// its volumes) before it disappears entirely; this annotation lets a
+	// later reconcile that finds no pod distinguish "cleanup still finishing"
+	// from a pod that never existed, so it doesn't mistakenly fail the
+	// DataUpload. See https://github.com/migtools/kubevirt-datamover-controller/issues/171.
+	AnnotationDatamoverPodSucceeded = "kubevirt-datamover.io/datamover-pod-succeeded"
+
 	// AnnotationForceFullBackup, when set to "true" on a DataUpload, forces
 	// a full backup even when a valid incremental checkpoint chain exists.
 	// The VMBT checkpoint is cleared and the VMB is created with

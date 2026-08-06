@@ -68,12 +68,17 @@ func findPodByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid
 	return &podList.Items[0], nil
 }
 
-// cleanupPodsByUID deletes all pods matching a UID label in the given namespace.
-func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid, namespace string, logger logr.Logger) {
+// cleanupPodsByUID deletes all pods matching a UID label in the given namespace
+// and reports whether any still exist afterward. Delete only requests removal —
+// kubelet must still terminate containers and unmount volumes before the pod
+// object actually disappears, so callers that need the pod fully gone (e.g.
+// before deleting a PVC it mounts) should treat a true return as "not yet safe
+// to proceed" and retry on a later reconcile.
+func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid, namespace string, logger logr.Logger) bool {
 	podList := &corev1.PodList{}
 	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
 		logger.Error(err, "Failed to list datamover pods for cleanup")
-		return
+		return true
 	}
 	for i := range podList.Items {
 		pod := &podList.Items[i]
@@ -83,6 +88,12 @@ func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, uidLabelKey,
 			logger.Info("Deleted datamover pod", "pod", pod.Name)
 		}
 	}
+
+	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
+		logger.Error(err, "Failed to re-check datamover pods after delete")
+		return true
+	}
+	return len(podList.Items) > 0
 }
 
 // extractPodFailureMessage extracts the failure message from a failed pod.
