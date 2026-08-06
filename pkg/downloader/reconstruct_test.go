@@ -308,6 +308,33 @@ func TestFlattenToRaw(t *testing.T) {
 		}
 	})
 
+	t.Run("outputIsBlockDevice passes -S 0 to disable sparse detection", func(t *testing.T) {
+		// A skipped (sparse) write is safe against a regular file -- an
+		// unwritten range in a fresh/truncated file already reads as zero --
+		// but not against a block device, which can carry leftover data from
+		// whatever previously occupied it. -S 0 forces every byte range to
+		// actually be written.
+		outputPath := filepath.Join(t.TempDir(), "disk.raw")
+		if err := os.WriteFile(outputPath, nil, 0o600); err != nil {
+			t.Fatalf("failed to seed output file: %v", err)
+		}
+		withFakeBlockDevice(t, outputPath)
+
+		var gotArgs []string
+		withFakeQemuImg(t, func(_ context.Context, args ...string) (string, string, error) {
+			gotArgs = args
+			return "", "", nil
+		})
+		if err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, true); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		want := []string{"convert", "-p", "-f", "qcow2", "-O", "raw", "-S", "0", "tip.qcow2", outputPath}
+		if !reflect.DeepEqual(gotArgs, want) {
+			t.Errorf("qemu-img args = %v, want %v", gotArgs, want)
+		}
+	})
+
 	t.Run("outputIsBlockDevice leaves the output path alone on failure", func(t *testing.T) {
 		// Models a raw block device target: unlinking it would destroy the
 		// pod's only path to that volume, unlike a disposable regular file.

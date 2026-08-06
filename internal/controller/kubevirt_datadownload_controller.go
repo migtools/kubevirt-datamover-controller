@@ -597,7 +597,11 @@ func (r *KubeVirtDataDownloadReconciler) handleAccepted(ctx context.Context, log
 // incrementals), the newest (chain-tip) checkpoint's mapping is authoritative,
 // not whichever checkpoint happens to be found first. Iterate the chain in its
 // given order and keep the last (most recent) match rather than returning on
-// the first one found.
+// the first one found -- including when the most recent match is itself
+// malformed (missing file entry or empty disk name): that supersedes an
+// earlier, valid match rather than being silently shadowed by it, and a
+// malformed entry earlier in the chain doesn't block a later, valid one from
+// being found.
 func resolveTargetDiskName(vmIndex uploader.VMIndex, chain []string, targetPVCName string) (string, error) {
 	entriesByID := make(map[string]*uploader.CheckpointEntry, len(vmIndex.Checkpoints))
 	for i := range vmIndex.Checkpoints {
@@ -617,13 +621,16 @@ func resolveTargetDiskName(vmIndex uploader.VMIndex, chain []string, targetPVCNa
 			}
 			if i >= len(entry.Files) {
 				lastErr = fmt.Errorf("checkpoint %q has PVC %q at index %d but no matching file entry", entry.ID, targetPVCName, i)
+				diskName = ""
 				break
 			}
 			if entry.Files[i].DiskName == "" {
 				lastErr = fmt.Errorf("checkpoint %q has PVC %q at index %d with an empty disk name", entry.ID, targetPVCName, i)
+				diskName = ""
 				break
 			}
 			diskName = entry.Files[i].DiskName
+			lastErr = nil
 			break
 		}
 	}

@@ -205,7 +205,10 @@ func TestLoadConfigFromEnv(t *testing.T) {
 	t.Run("block device target: TargetPath required, no default, filesystem-root check skipped", func(t *testing.T) {
 		setRequiredEnv(t)
 		t.Setenv(EnvTargetIsBlockDevice, "true")
-		t.Setenv(EnvTargetPath, "/dev/restore-output")
+		// A path whose directory is "/" -- would fail the non-block target's
+		// filesystem-root check above, but that check only applies in the
+		// non-block branch, so it must not reject this for a block device.
+		t.Setenv(EnvTargetPath, "/restore-output")
 
 		cfg, err := LoadConfigFromEnv()
 		if err != nil {
@@ -214,8 +217,8 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		if !cfg.TargetIsBlockDevice {
 			t.Error("expected TargetIsBlockDevice = true")
 		}
-		if cfg.TargetPath != "/dev/restore-output" {
-			t.Errorf("TargetPath = %q, want %q", cfg.TargetPath, "/dev/restore-output")
+		if cfg.TargetPath != "/restore-output" {
+			t.Errorf("TargetPath = %q, want %q", cfg.TargetPath, "/restore-output")
 		}
 	})
 

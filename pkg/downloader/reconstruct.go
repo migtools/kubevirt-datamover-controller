@@ -195,7 +195,19 @@ func flattenToRaw(ctx context.Context, chainTipPath, outputPath string, outputIs
 		return fmt.Errorf("failed to pre-create raw image %q: %w", outputPath, err)
 	}
 
-	_, stderr, err := runQemuImg(ctx, "convert", "-p", "-f", "qcow2", "-O", "raw", chainTipPath, outputPath)
+	convertArgs := []string{"convert", "-p", "-f", "qcow2", "-O", "raw"}
+	if outputIsBlockDevice {
+		// -S 0 disables qemu-img's sparse-detection: without it, a zero-filled
+		// region of the source image is skipped rather than written, which is
+		// safe for a regular file (an unwritten range in a fresh/truncated file
+		// already reads as zero) but not for a block device -- a reused PV's
+		// device node can carry leftover data from whatever previously occupied
+		// it, and a skipped write there would leave that stale data in place
+		// instead of the source image's actual (zero) content.
+		convertArgs = append(convertArgs, "-S", "0")
+	}
+	convertArgs = append(convertArgs, chainTipPath, outputPath)
+	_, stderr, err := runQemuImg(ctx, convertArgs...)
 	if err != nil {
 		removeOnError()
 		return fmt.Errorf("failed to flatten %q to raw %q: %w (%s)", chainTipPath, outputPath, err, stderr)

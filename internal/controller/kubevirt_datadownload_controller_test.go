@@ -1185,6 +1185,43 @@ func TestResolveTargetDiskName_SkipsMalformedOlderEntry(t *testing.T) {
 	}
 }
 
+// TestResolveTargetDiskName_NewestDefectSupersedesOlderValidEntry covers the
+// opposite ordering from the malformed-older-entry case above: the
+// chain-tip (newest, most authoritative) entry for the target PVC is itself
+// malformed, after an earlier entry had a valid mapping. The chain-tip's
+// defect must be surfaced, not silently shadowed by the earlier, now-stale
+// valid value.
+func TestResolveTargetDiskName_NewestDefectSupersedesOlderValidEntry(t *testing.T) {
+	vmIndex := uploader.VMIndex{
+		VMName:    "vm-1",
+		Namespace: "vm-ns",
+		Checkpoints: []uploader.CheckpointEntry{
+			{
+				ID:   "cp-full",
+				PVCs: []string{"restored-disk"},
+				Files: []uploader.CheckpointFile{
+					{DiskName: "old-disk-name"},
+				},
+			},
+			{
+				ID:   "cp-incremental",
+				PVCs: []string{"restored-disk"},
+				Files: []uploader.CheckpointFile{
+					{DiskName: ""}, // malformed: empty disk name
+				},
+			},
+		},
+	}
+
+	_, err := resolveTargetDiskName(vmIndex, []string{"cp-full", "cp-incremental"}, "restored-disk")
+	if err == nil {
+		t.Fatal("expected the chain-tip's defect to be surfaced, not shadowed by the earlier valid entry")
+	}
+	if !strings.Contains(err.Error(), "cp-incremental") {
+		t.Errorf("error = %q, want it to reference the chain-tip checkpoint %q", err, "cp-incremental")
+	}
+}
+
 func TestResolveTargetDiskName_Errors(t *testing.T) {
 	tests := []struct {
 		name          string
