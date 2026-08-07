@@ -18,6 +18,7 @@ package controller
 
 import (
 	"maps"
+	"os"
 
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
@@ -161,6 +162,13 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 		{Name: uploader.EnvDataUploadUID, Value: config.ResourceUID},
 		{Name: uploader.EnvVMBName, Value: config.VMBName},
 		{Name: uploader.EnvVMBTName, Value: config.VMBTName},
+	}
+
+	// Inject Azure Workload Identity env vars if present in the controller pod
+	for _, envName := range []string{"AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_FEDERATED_TOKEN_FILE"} {
+		if val := os.Getenv(envName); val != "" {
+			envVars = append(envVars, corev1.EnvVar{Name: envName, Value: val})
+		}
 	}
 
 	// Security context - follows Velero's pattern for CSI snapshot pods:
