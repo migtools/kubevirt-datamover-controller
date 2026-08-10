@@ -119,8 +119,9 @@ func main() {
 		"Namespace where OADP/Velero resources are located")
 	flag.IntVar(&maxIncrementalBackups, "max-incremental-backups", 0,
 		"Maximum number of incremental backups per VM before forcing a full backup (0 = unlimited)")
-	flag.DurationVar(&staleDataUploadThreshold, "stale-dataupload-threshold", common.DefaultStaleDataUploadThreshold,
-		"Duration after which a DataUpload in an active phase is considered stale and will no longer block younger DataUploads for the same VM")
+	flag.DurationVar(&staleDataUploadThreshold, "stale-dataupload-threshold",
+		common.DefaultStaleDataUploadThreshold,
+		"Duration after which a stale DataUpload stops blocking younger ones for the same VM")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -246,9 +247,9 @@ func main() {
 		DatamoverImage:           datamoverImage,
 		DatamoverImagePullPolicy: corev1.PullPolicy(datamoverImagePullPolicy),
 		MaxIncrementalBackups:    maxIncrementalBackups,
-		OADPNamespace:              oadpNamespace,
-		StaleDataUploadThreshold:   staleDataUploadThreshold,
-		PodLogCollector:            controller.NewPodLogCollector(kubeClient, 100),
+		OADPNamespace:            oadpNamespace,
+		StaleDataUploadThreshold: staleDataUploadThreshold,
+		PodLogCollector:          controller.NewPodLogCollector(kubeClient, 100),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "KubeVirtDataUpload")
 		os.Exit(1)
