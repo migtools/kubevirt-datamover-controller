@@ -20,6 +20,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -333,8 +334,11 @@ func (r *KubeVirtDataUploadReconciler) checkOperationTimeout(ctx context.Context
 			// persisting it before cleanup actually succeeds would leave the pod
 			// running forever with no chance to retry -- returning the error here
 			// instead lets the reconcile retry until cleanup succeeds.
-			if cleanupNotReady, _ := cleanupPodsByUID(ctx, r.Client, r.APIReader, common.LabelDataUploadUID, string(du.UID), r.getPodNamespace(du), logger); cleanupNotReady {
-				return fmt.Errorf("datamover pod still terminating (or its status couldn't be confirmed) before failing DataUpload on timeout")
+			if cleanupNotReady, terminating := cleanupPodsByUID(ctx, r.Client, r.APIReader, common.LabelDataUploadUID, string(du.UID), r.getPodNamespace(du), logger); cleanupNotReady {
+				if terminating {
+					return fmt.Errorf("datamover pod still terminating before failing DataUpload on timeout: %w", ErrPodsStillTerminating)
+				}
+				return fmt.Errorf("datamover pod cleanup could not be confirmed before failing DataUpload on timeout")
 			}
 			return r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, message)
 		},

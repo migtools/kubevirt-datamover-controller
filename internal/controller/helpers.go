@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"time"
@@ -212,6 +213,17 @@ func listPodByUID(ctx context.Context, reader client.Reader, uidLabelKey, uid, n
 	}
 	return &podList.Items[0], nil
 }
+
+// ErrPodsStillTerminating marks the expected, self-resolving case where
+// cleanupPodsByUID reports notReady with terminating=true. Not returned by
+// cleanupPodsByUID itself (which reports the distinction directly via its two
+// bool return values) -- callers that must communicate this state through an
+// error-returning interface they don't control (e.g. operationTimeoutTarget's
+// fail callback) wrap it explicitly so a caller further up the stack (e.g. a
+// Reconcile method) can still check stderrors.Is and requeue quietly instead
+// of logging a reconcile error/triggering exponential backoff for something
+// that isn't wrong.
+var ErrPodsStillTerminating = stderrors.New("pods still terminating")
 
 // cleanupPodsByUID deletes all pods matching a UID label in the given namespace
 // and reports whether it's NOT yet safe to proceed as though they're gone, plus

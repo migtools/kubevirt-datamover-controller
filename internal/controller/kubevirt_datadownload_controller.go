@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -383,8 +384,11 @@ func (r *KubeVirtDataDownloadReconciler) checkOperationTimeout(ctx context.Conte
 			// persisting it before cleanup actually succeeds would leave the pod
 			// running forever with no chance to retry -- returning the error here
 			// instead lets the reconcile retry until cleanup succeeds.
-			if cleanupNotReady, _ := cleanupPodsByUID(ctx, r.Client, r.APIReader, common.LabelDataDownloadUID, string(dd.UID), r.getPodNamespace(dd), logger); cleanupNotReady {
-				return fmt.Errorf("downloader pod still terminating (or its status couldn't be confirmed) before failing DataDownload on timeout")
+			if cleanupNotReady, terminating := cleanupPodsByUID(ctx, r.Client, r.APIReader, common.LabelDataDownloadUID, string(dd.UID), r.getPodNamespace(dd), logger); cleanupNotReady {
+				if terminating {
+					return fmt.Errorf("downloader pod still terminating before failing DataDownload on timeout: %w", ErrPodsStillTerminating)
+				}
+				return fmt.Errorf("downloader pod cleanup could not be confirmed before failing DataDownload on timeout")
 			}
 			return r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed, message)
 		},
