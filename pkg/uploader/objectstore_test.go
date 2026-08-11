@@ -201,6 +201,35 @@ func TestInitWithSDKCredentials(t *testing.T) {
 	}
 }
 
+func TestInitWithNamedProfile(t *testing.T) {
+	// Reproduces issue #179: a BSL credentials secret using a non-default
+	// profile name was parsed but ignored, so the SDK silently fell back
+	// to the default credential chain (e.g. EC2 IMDS) instead of the
+	// configured profile's static credentials.
+	credData := "[minio]\n" +
+		"aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n" +
+		"aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
+
+	store := &S3ObjectStore{}
+	err := store.Init(map[string]string{
+		"bucket":          "test-bucket",
+		"region":          "us-east-1",
+		"credentialsData": credData,
+		"profile":         "minio",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	creds, err := store.client.Options().Credentials.Retrieve(t.Context())
+	if err != nil {
+		t.Fatalf("failed to retrieve credentials from named profile: %v", err)
+	}
+	if creds.AccessKeyID != "AKIAIOSFODNN7EXAMPLE" {
+		t.Errorf("AccessKeyID = %q, want %q", creds.AccessKeyID, "AKIAIOSFODNN7EXAMPLE")
+	}
+}
+
 func TestInitWithCredentialsData(t *testing.T) {
 	// Test the in-memory credentials path (controller uses this)
 	store := &S3ObjectStore{}

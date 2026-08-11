@@ -2622,7 +2622,8 @@ func TestBuildDatamoverPodConfig(t *testing.T) {
 						},
 					},
 					Config: map[string]string{
-						"region": "us-east-1",
+						"region":  "us-east-1",
+						"profile": "minio",
 					},
 					Credential: &corev1.SecretKeySelector{
 						LocalObjectReference: corev1.LocalObjectReference{
@@ -2659,6 +2660,9 @@ func TestBuildDatamoverPodConfig(t *testing.T) {
 				}
 				if config.BSLRegion != "us-east-1" {
 					t.Errorf("BSLRegion = %q, want %q", config.BSLRegion, "us-east-1")
+				}
+				if config.BSLProfile != "minio" {
+					t.Errorf("BSLProfile = %q, want %q", config.BSLProfile, "minio")
 				}
 				if config.CredentialSecretName != "cloud-credentials" {
 					t.Errorf("CredentialSecretName = %q, want %q", config.CredentialSecretName, "cloud-credentials")
@@ -4871,6 +4875,31 @@ func TestExtractBSLConfig(t *testing.T) {
 			validate: func(t *testing.T, cfg *uploader.BSLConfig) {
 				if cfg.CredentialKey != "cloud" {
 					t.Errorf("CredentialKey = %q, want %q", cfg.CredentialKey, "cloud")
+				}
+			},
+		},
+		{
+			name: "profile config key is extracted",
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{Name: "minio-bsl"},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "my-bucket",
+						},
+					},
+					Config: map[string]string{
+						"profile": "minio",
+					},
+					Credential: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "creds"},
+					},
+				},
+			},
+			validate: func(t *testing.T, cfg *uploader.BSLConfig) {
+				if cfg.Profile != "minio" {
+					t.Errorf("Profile = %q, want %q", cfg.Profile, "minio")
 				}
 			},
 		},

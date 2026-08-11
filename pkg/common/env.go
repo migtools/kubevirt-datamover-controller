@@ -34,6 +34,7 @@ const (
 	EnvBSLKMSKeyID                  = "KUBEVIRT_DM_BSL_KMS_KEY_ID"
 	EnvBSLChecksumAlgorithm         = "KUBEVIRT_DM_BSL_CHECKSUM_ALGORITHM"
 	EnvBSLCustomerKeyEncryptionFile = "KUBEVIRT_DM_BSL_CUSTOMER_KEY_ENCRYPTION_FILE"
+	EnvBSLProfile                   = "KUBEVIRT_DM_BSL_PROFILE"
 
 	// GCP-specific storage provider settings
 	EnvBSLServiceAccount = "KUBEVIRT_DM_BSL_SERVICE_ACCOUNT"

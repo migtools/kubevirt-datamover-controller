@@ -65,6 +65,7 @@ type DatamoverPodConfig struct {
 	BSLServerSideEncryption  string
 	BSLKMSKeyID              string
 	BSLChecksumAlgorithm     string
+	BSLProfile               string
 	// SSE-C secret reference (parsed from BSL customerKeyEncryptionSecret "secretName/key")
 	SSECSecretName string
 	SSECSecretKey  string
@@ -152,6 +153,7 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 		{Name: common.EnvBSLServerSideEncryption, Value: config.BSLServerSideEncryption},
 		{Name: common.EnvBSLKMSKeyID, Value: config.BSLKMSKeyID},
 		{Name: common.EnvBSLChecksumAlgorithm, Value: config.BSLChecksumAlgorithm},
+		{Name: common.EnvBSLProfile, Value: config.BSLProfile},
 		{Name: common.EnvBSLCustomerKeyEncryptionFile, Value: sseCustomerKeyPath(config)},
 		{Name: common.EnvBSLServiceAccount, Value: config.BSLServiceAccount},
 		{Name: common.EnvBSLKMSKeyName, Value: config.BSLKMSKeyName},

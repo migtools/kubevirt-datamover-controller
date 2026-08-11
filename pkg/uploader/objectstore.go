@@ -382,6 +382,9 @@ func InitObjectStore(cfg *common.ObjectStoreConfig) (velero.ObjectStore, error) 
 	if cfg.BSLCustomerKeyEncryptionFile != "" {
 		configMap["customerKeyEncryptionFile"] = cfg.BSLCustomerKeyEncryptionFile
 	}
+	if cfg.BSLProfile != "" {
+		configMap["profile"] = cfg.BSLProfile
+	}
 	if cfg.BSLServiceAccount != "" {
 		configMap["serviceAccount"] = cfg.BSLServiceAccount
 	}
@@ -445,6 +448,7 @@ type BSLConfig struct {
 	KMSKeyID                    string
 	ChecksumAlgorithm           string
 	CustomerKeyEncryptionSecret string
+	Profile                     string
 
 	// GCP-specific storage provider settings
 	ServiceAccount string
@@ -489,6 +493,7 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 	kmsKeyID := ""
 	checksumAlgorithm := ""
 	customerKeyEncryptionSecret := ""
+	profile := ""
 	serviceAccount := ""
 	kmsKeyName := ""
 	resourceGroup := ""
@@ -508,6 +513,7 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 		kmsKeyID = bsl.Spec.Config["kmsKeyId"]
 		checksumAlgorithm = bsl.Spec.Config["checksumAlgorithm"]
 		customerKeyEncryptionSecret = bsl.Spec.Config["customerKeyEncryptionSecret"]
+		profile = bsl.Spec.Config["profile"]
 		serviceAccount = bsl.Spec.Config["serviceAccount"]
 		kmsKeyName = bsl.Spec.Config["kmsKeyName"]
 		resourceGroup = bsl.Spec.Config["resourceGroup"]
@@ -543,6 +549,7 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 		KMSKeyID:                    kmsKeyID,
 		ChecksumAlgorithm:           checksumAlgorithm,
 		CustomerKeyEncryptionSecret: customerKeyEncryptionSecret,
+		Profile:                     profile,
 		ServiceAccount:              serviceAccount,
 		KMSKeyName:                  kmsKeyName,
 		ResourceGroup:               resourceGroup,
@@ -594,6 +601,7 @@ func InitObjectStoreFromBSL(
 		BSLServerSideEncryption:  cfg.ServerSideEncryption,
 		BSLKMSKeyID:              cfg.KMSKeyID,
 		BSLChecksumAlgorithm:     cfg.ChecksumAlgorithm,
+		BSLProfile:               cfg.Profile,
 		// BSLCustomerKeyEncryptionFile is not set here — the controller path
 		// (InitObjectStoreFromBSL) doesn't have the SSE-C key file mounted.
 		// SSE-C is only applied in the datamover pod where the secret is volume-mounted.
