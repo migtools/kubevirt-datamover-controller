@@ -202,14 +202,17 @@ func TestInitWithSDKCredentials(t *testing.T) {
 }
 
 func TestInitWithNamedProfile(t *testing.T) {
-	// Isolate from ambient AWS credentials so this test verifies the named
-	// profile is actually selected, not whatever the environment happens
-	// to provide (env credentials outrank shared-config profile in the
-	// SDK's default chain). Also disable IMDS so a misconfiguration falls
-	// back to a fast local error instead of a slow network timeout.
+	// Set ambient AWS env credentials to a different value than the BSL
+	// profile's, and assert the profile wins. This verifies precedence
+	// (not just that the test is insulated from whatever the environment
+	// happens to provide): per the AWS SDK v2 credential chain
+	// (aws-sdk-go-v2/config resolve_credentials.go resolveCredentialChain),
+	// an explicitly-set SharedConfigProfile (via config.WithSharedConfigProfile)
+	// is checked before ambient env credentials, so the configured BSL
+	// profile must take priority even when AWS_ACCESS_KEY_ID is present.
+	t.Setenv("AWS_ACCESS_KEY_ID", "AMBIENTKEYID00000000")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "ambientSecretKeyThatMustNotBeUsed0000000")
 	for _, name := range []string{
-		"AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY",
-		"AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY",
 		"AWS_SESSION_TOKEN", "AWS_WEB_IDENTITY_TOKEN_FILE",
 		"AWS_PROFILE", "AWS_DEFAULT_PROFILE",
 		"AWS_CONTAINER_CREDENTIALS_FULL_URI",
@@ -243,7 +246,8 @@ func TestInitWithNamedProfile(t *testing.T) {
 		t.Fatalf("failed to retrieve credentials from named profile: %v", err)
 	}
 	if creds.AccessKeyID != "AKIAIOSFODNN7EXAMPLE" {
-		t.Errorf("AccessKeyID = %q, want %q", creds.AccessKeyID, "AKIAIOSFODNN7EXAMPLE")
+		t.Errorf("AccessKeyID = %q, want %q (BSL profile should win over ambient env credentials)",
+			creds.AccessKeyID, "AKIAIOSFODNN7EXAMPLE")
 	}
 }
 
