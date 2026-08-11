@@ -64,7 +64,7 @@ type S3ObjectStore struct {
 
 // NewS3ObjectStore creates a new S3ObjectStore from a config map.
 // Supported keys: bucket, prefix, region, credentialsFile, credentialsData,
-// s3Url, s3ForcePathStyle, insecureSkipTLSVerify, caCert,
+// profile, s3Url, s3ForcePathStyle, insecureSkipTLSVerify, caCert,
 // serverSideEncryption, kmsKeyId, checksumAlgorithm, customerKeyEncryptionFile.
 func NewS3ObjectStore(configMap map[string]string) (*S3ObjectStore, error) {
 	store := &S3ObjectStore{
@@ -82,7 +82,7 @@ func NewS3ObjectStore(configMap map[string]string) (*S3ObjectStore, error) {
 // Init initializes the ObjectStore with the provided config.
 // This implements velero.ObjectStore.Init().
 // Expected config keys: bucket, prefix, region, credentialsFile, credentialsData,
-// s3Url, s3ForcePathStyle, insecureSkipTLSVerify, caCert,
+// profile, s3Url, s3ForcePathStyle, insecureSkipTLSVerify, caCert,
 // serverSideEncryption, kmsKeyId, checksumAlgorithm, customerKeyEncryptionFile.
 // Credential parsing is delegated to the AWS SDK via
 // config.WithSharedCredentialsFiles, matching Velero's approach.
@@ -126,6 +126,15 @@ func (s *S3ObjectStore) Init(configMap map[string]string) error {
 			config.WithSharedCredentialsFiles([]string{tmpFile}),
 			config.WithSharedConfigFiles([]string{tmpFile}),
 		)
+	}
+
+	// Select a named profile from the credentials/config file, matching
+	// Velero's "profile" BSL config key. Without this, a credentials file
+	// containing a non-default profile section is parsed but ignored, and
+	// the SDK silently falls back to the default credential chain (e.g.
+	// EC2 IMDS), which fails outside of EC2.
+	if profile := configMap["profile"]; profile != "" {
+		opts = append(opts, config.WithSharedConfigProfile(profile))
 	}
 
 	// Add retry configuration for transient errors

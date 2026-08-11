@@ -1719,6 +1719,7 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		BSLServerSideEncryption:        cfg.ServerSideEncryption,
 		BSLKMSKeyID:                    cfg.KMSKeyID,
 		BSLChecksumAlgorithm:           cfg.ChecksumAlgorithm,
+		BSLProfile:                     cfg.Profile,
 		SSECSecretName:                 ssecName,
 		SSECSecretKey:                  ssecKey,
 		BSLServiceAccount:              cfg.ServiceAccount,

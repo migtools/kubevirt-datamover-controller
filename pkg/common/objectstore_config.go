@@ -37,6 +37,7 @@ type ObjectStoreConfig struct {
 	BSLKMSKeyID                  string // KMS key ARN for SSE-KMS
 	BSLChecksumAlgorithm         string // e.g. "CRC32", "CRC32C", "SHA1", "SHA256"
 	BSLCustomerKeyEncryptionFile string // Mounted SSE-C key file path
+	BSLProfile                   string // Named profile in the shared credentials/config file
 
 	// GCP-specific storage provider settings
 	BSLServiceAccount string // GCP service account email for compute engine signing

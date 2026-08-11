@@ -129,6 +129,7 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 			BSLKMSKeyID:                    os.Getenv(common.EnvBSLKMSKeyID),
 			BSLChecksumAlgorithm:           os.Getenv(common.EnvBSLChecksumAlgorithm),
 			BSLCustomerKeyEncryptionFile:   os.Getenv(common.EnvBSLCustomerKeyEncryptionFile),
+			BSLProfile:                     os.Getenv(common.EnvBSLProfile),
 			BSLServiceAccount:              os.Getenv(common.EnvBSLServiceAccount),
 			BSLKMSKeyName:                  os.Getenv(common.EnvBSLKMSKeyName),
 			BSLResourceGroup:               os.Getenv(common.EnvBSLResourceGroup),

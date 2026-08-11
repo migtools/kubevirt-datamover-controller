@@ -201,6 +201,56 @@ func TestInitWithSDKCredentials(t *testing.T) {
 	}
 }
 
+func TestInitWithNamedProfile(t *testing.T) {
+	// Set ambient AWS env credentials to a different value than the BSL
+	// profile's, and assert the profile wins. This verifies precedence
+	// (not just that the test is insulated from whatever the environment
+	// happens to provide): per the AWS SDK v2 credential chain
+	// (aws-sdk-go-v2/config resolve_credentials.go resolveCredentialChain),
+	// an explicitly-set SharedConfigProfile (via config.WithSharedConfigProfile)
+	// is checked before ambient env credentials, so the configured BSL
+	// profile must take priority even when AWS_ACCESS_KEY_ID is present.
+	t.Setenv("AWS_ACCESS_KEY_ID", "AMBIENTKEYID00000000")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "ambientSecretKeyThatMustNotBeUsed0000000")
+	for _, name := range []string{
+		"AWS_SESSION_TOKEN", "AWS_WEB_IDENTITY_TOKEN_FILE",
+		"AWS_PROFILE", "AWS_DEFAULT_PROFILE",
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI",
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+	} {
+		t.Setenv(name, "")
+	}
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	// Reproduces issue #179: a BSL credentials secret using a non-default
+	// profile name was parsed but ignored, so the SDK silently fell back
+	// to the default credential chain (e.g. EC2 IMDS) instead of the
+	// configured profile's static credentials.
+	credData := "[minio]\n" +
+		"aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n" +
+		"aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
+
+	store := &S3ObjectStore{}
+	err := store.Init(map[string]string{
+		"bucket":          "test-bucket",
+		"region":          "us-east-1",
+		"credentialsData": credData,
+		"profile":         "minio",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	creds, err := store.client.Options().Credentials.Retrieve(t.Context())
+	if err != nil {
+		t.Fatalf("failed to retrieve credentials from named profile: %v", err)
+	}
+	if creds.AccessKeyID != "AKIAIOSFODNN7EXAMPLE" {
+		t.Errorf("AccessKeyID = %q, want %q (BSL profile should win over ambient env credentials)",
+			creds.AccessKeyID, "AKIAIOSFODNN7EXAMPLE")
+	}
+}
+
 func TestInitWithCredentialsData(t *testing.T) {
 	// Test the in-memory credentials path (controller uses this)
 	store := &S3ObjectStore{}
