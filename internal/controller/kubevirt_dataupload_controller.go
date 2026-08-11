@@ -921,6 +921,18 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 		return ctrl.Result{}, fmt.Errorf("failed to get datamover pod: %w", err)
 	}
 	if pod == nil {
+		if du.Annotations[common.AnnotationDatamoverPodSucceeded] == bslValidatedValue {
+			// The pod succeeded on an earlier reconcile and has now fully
+			// terminated (kubelet finished unmounting its volumes). Finish
+			// the PVC/PV cleanup that was deferred and complete.
+			if !r.cleanupDatamoverResources(ctx, logger, du, podNamespace) {
+				return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+			}
+			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseCompleted, "Data upload completed"); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
 		// Pod not found - this is unexpected in InProgress phase
 		logger.Error(nil, "Datamover pod not found", "dataUpload", du.Name, "namespace", podNamespace)
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, "Datamover pod not found"); err != nil {
@@ -934,10 +946,19 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 	case corev1.PodSucceeded:
 		logger.Info("Datamover pod completed successfully", "pod", pod.Name)
 
-		r.emitPodLogs(ctx, logger, pod)
+		if du.Annotations[common.AnnotationDatamoverPodSucceeded] != bslValidatedValue {
+			r.emitPodLogs(ctx, logger, pod)
+			if err := r.markDatamoverPodSucceeded(ctx, du); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 
-		// Cleanup resources
-		r.cleanupDatamoverResources(ctx, logger, du, podNamespace)
+		// Cleanup resources. If the pod is still terminating, defer PVC/PV
+		// cleanup and the Completed transition to a later reconcile rather
+		// than blocking this one on waitForPVCDeletion.
+		if !r.cleanupDatamoverResources(ctx, logger, du, podNamespace) {
+			return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+		}
 
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseCompleted, "Data upload completed"); err != nil {
 			return ctrl.Result{}, err
@@ -968,6 +989,17 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 	}
 }
 
+// markDatamoverPodSucceeded persists AnnotationDatamoverPodSucceeded so a
+// later reconcile that finds no datamover pod (because it has since fully
+// terminated) knows this is expected rather than a genuine failure.
+func (r *KubeVirtDataUploadReconciler) markDatamoverPodSucceeded(ctx context.Context, du *velerov2alpha1.DataUpload) error {
+	if du.Annotations == nil {
+		du.Annotations = make(map[string]string)
+	}
+	du.Annotations[common.AnnotationDatamoverPodSucceeded] = bslValidatedValue
+	return r.Update(ctx, du)
+}
+
 // emitPodLogs collects logs from a completed datamover pod and emits them
 // through the controller's logger. Failures are logged as warnings and
 // never block the reconcile loop.
@@ -993,9 +1025,17 @@ func (r *KubeVirtDataUploadReconciler) emitPodLogs(ctx context.Context, logger l
 	}
 }
 
-// cleanupDatamoverResources cleans up resources created during the datamover process
-func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, podNamespace string) {
-	cleanupPodsByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), podNamespace, logger)
+// cleanupDatamoverResources cleans up resources created during the datamover process.
+// Returns false if the datamover pod is still terminating — deleting the rebound
+// PVC while the pod still mounts it would block synchronously in
+// waitForPVCDeletion for up to PVRebindTimeout, so callers should defer and let
+// a later reconcile retry once the pod is confirmed gone.
+// See https://github.com/migtools/kubevirt-datamover-controller/issues/171.
+func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, podNamespace string) bool {
+	if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), podNamespace, logger); cleanupNotReady {
+		logger.Info("Datamover pod still terminating (or its status couldn't be confirmed), deferring PVC/PV cleanup to next reconcile")
+		return false
+	}
 
 	reboundPVCName := common.SafeResourceName(common.ReboundPVCNamePrefix, du.Name)
 	if err := cleanupReboundPVCAndPV(ctx, r.Client, logger, reboundPVCName, podNamespace, string(du.UID), common.LabelDataUploadUID); err != nil {
@@ -1003,6 +1043,7 @@ func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Con
 		// Continue - don't block completion on cleanup failures
 	}
 
+	return true
 }
 
 // cleanupVMBackupResources deletes VMB CRs in the VM namespace.
@@ -1010,6 +1051,12 @@ func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Con
 // The VMBT is intentionally preserved so KubeVirt can use it during VM lifecycle
 // events (restarts, migrations) to redefine libvirt checkpoints.
 // See https://github.com/migtools/kubevirt-datamover-controller/issues/32.
+//
+// Not called on a Failed transition: the team decided to preserve the VMB
+// (like the datamover pod/PVC/PV, see the PodFailed case in handleInProgress)
+// for debugging failed backups rather than deleting it automatically.
+// TODO: consider a configurable cleanup-on-failure option in the future.
+// See https://github.com/migtools/kubevirt-datamover-controller/issues/168.
 func (r *KubeVirtDataUploadReconciler) cleanupVMBackupResources(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmNamespace string) {
 	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
 	if err := r.List(ctx, vmbList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
@@ -1034,8 +1081,12 @@ func (r *KubeVirtDataUploadReconciler) handleCanceling(ctx context.Context, logg
 	// Datamover pod runs in OADP namespace
 	podNamespace := r.getPodNamespace(du)
 
-	// Clean up datamover resources in OADP namespace
-	r.cleanupDatamoverResources(ctx, logger, du, podNamespace)
+	// Clean up datamover resources in OADP namespace. If the pod is still
+	// terminating, defer VMB cleanup and the Canceled transition to a later
+	// reconcile rather than blocking this one on waitForPVCDeletion.
+	if !r.cleanupDatamoverResources(ctx, logger, du, podNamespace) {
+		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+	}
 
 	// Clean up VMB and VMBT in the VM namespace.
 	// When canceling, the datamover pod won't run its cleanup, so we handle it here.

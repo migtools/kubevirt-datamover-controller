@@ -34,6 +34,7 @@ import (
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -49,6 +50,7 @@ func TestReconcile(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
 	_ = kubevirtcorev1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
 
 	// Helper function to create a valid VM with CBT enabled and running
 	validVM := func(name, namespace string) *kubevirtcorev1.VirtualMachine {
@@ -1879,6 +1881,319 @@ func TestHandleInProgress_PodSucceeded(t *testing.T) {
 	}
 }
 
+// TestHandleInProgress_PodSucceeded_DefersCleanupWhileTerminating verifies the
+// fix for https://github.com/migtools/kubevirt-datamover-controller/issues/171:
+// PVC/PV cleanup (and the Completed transition) must be deferred to a later
+// reconcile while the datamover pod is still terminating, instead of blocking
+// the reconcile on waitForPVCDeletion. It must also not mistake the pod's
+// eventual disappearance for a genuine "pod not found" failure.
+func TestHandleInProgress_PodSucceeded_DefersCleanupWhileTerminating(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du",
+			Namespace: "openshift-adp",
+			UID:       types.UID("test-uid-terminating"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      "test-vm",
+				common.AnnotationVMNamespace: "test-ns",
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseInProgress,
+		},
+	}
+
+	// A finalizer keeps the fake client from actually removing the pod on
+	// Delete, simulating kubelet still tearing it down (unmounting volumes).
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.DatamoverPodNamePrefix + du.Name,
+			Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataUploadUID: string(du.UID),
+			},
+			Finalizers: []string{"test.io/still-terminating"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodSucceeded,
+		},
+	}
+
+	reboundPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.SafeResourceName(common.ReboundPVCNamePrefix, du.Name),
+			Namespace: "openshift-adp",
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+			VolumeName: "pv-test-du",
+		},
+	}
+
+	// The bound PV: cleanupReboundPVCAndPV also patches its reclaim policy to
+	// Delete and deletes it after the PVC, so round 2 must clean this up too.
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pv-test-du",
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pod, reboundPVC, pv).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: "openshift-adp",
+	}
+
+	// Round 1: pod is present but still terminating (finalizer blocks
+	// removal). Cleanup must defer rather than block on PVC/PV deletion.
+	result, err := r.handleInProgress(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter != RequeueAfterShort {
+		t.Errorf("expected requeue=%v while pod terminating, got %v", RequeueAfterShort, result.RequeueAfter)
+	}
+
+	updatedDU := &velerov2alpha1.DataUpload{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      du.Name,
+		Namespace: du.Namespace,
+	}, updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseInProgress {
+		t.Errorf("expected phase to remain InProgress while pod terminates, got phase=%s", updatedDU.Status.Phase)
+	}
+	if updatedDU.Annotations[common.AnnotationDatamoverPodSucceeded] != "true" {
+		t.Errorf("expected %s annotation to be set to record the pod's success", common.AnnotationDatamoverPodSucceeded)
+	}
+
+	// The rebound PVC must survive round 1: cleanup deferred while the pod
+	// is still terminating.
+	survivingPVC := &corev1.PersistentVolumeClaim{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      reboundPVC.Name,
+		Namespace: reboundPVC.Namespace,
+	}, survivingPVC); err != nil {
+		t.Errorf("expected rebound PVC to survive while pod cleanup is deferred, got err=%v", err)
+	}
+
+	// Simulate kubelet finishing termination: clear the finalizer, which lets
+	// the fake client actually remove the pod.
+	terminatingPod := &corev1.Pod{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      pod.Name,
+		Namespace: pod.Namespace,
+	}, terminatingPod); err != nil {
+		t.Fatalf("failed to get terminating pod: %v", err)
+	}
+	if terminatingPod.DeletionTimestamp == nil {
+		t.Fatalf("expected handleInProgress to have requested datamover pod deletion in round 1")
+	}
+	terminatingPod.Finalizers = nil
+	if err := fakeClient.Update(context.Background(), terminatingPod); err != nil {
+		t.Fatalf("failed to clear pod finalizer: %v", err)
+	}
+
+	// Round 2: the pod is now fully gone. Because AnnotationDatamoverPodSucceeded
+	// is set, this must be treated as "cleanup finishing", not "pod not found".
+	result, err = r.handleInProgress(context.Background(), logr.Discard(), updatedDU)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue once pod is gone, got RequeueAfter=%v", result.RequeueAfter)
+	}
+
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      du.Name,
+		Namespace: du.Namespace,
+	}, updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseCompleted {
+		t.Errorf("expected phase=%s once cleanup finishes, got phase=%s", velerov2alpha1.DataUploadPhaseCompleted, updatedDU.Status.Phase)
+	}
+
+	// The rebound PVC must be cleaned up once the pod cleanup completes.
+	deletedPVC := &corev1.PersistentVolumeClaim{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      reboundPVC.Name,
+		Namespace: reboundPVC.Namespace,
+	}, deletedPVC)
+	if !errors.IsNotFound(err) {
+		t.Errorf("expected rebound PVC to be deleted once cleanup completes, got err=%v", err)
+	}
+
+	// Its bound PV must be cleaned up too.
+	deletedPV := &corev1.PersistentVolume{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: pv.Name,
+	}, deletedPV)
+	if !errors.IsNotFound(err) {
+		t.Errorf("expected bound PV to be deleted once cleanup completes, got err=%v", err)
+	}
+}
+
+// TestHandleCanceling_DefersCleanupWhileTerminating verifies handleCanceling
+// also defers (rather than blocks on waitForPVCDeletion) when the datamover
+// pod is still terminating, per issue #171.
+func TestHandleCanceling_DefersCleanupWhileTerminating(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+
+	vmNamespace := "test-ns"
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du",
+			Namespace: "openshift-adp",
+			UID:       types.UID("test-uid-canceling"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      "test-vm",
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseCanceling,
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.DatamoverPodNamePrefix + du.Name,
+			Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataUploadUID: string(du.UID),
+			},
+			Finalizers: []string{"test.io/still-terminating"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmb-test-du",
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadUID: string(du.UID),
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pod, vmb).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: "openshift-adp",
+	}
+
+	// Round 1: pod still terminating - VMB cleanup and Canceled transition
+	// must be deferred.
+	result, err := r.handleCanceling(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter != RequeueAfterShort {
+		t.Errorf("expected requeue=%v while pod terminating, got %v", RequeueAfterShort, result.RequeueAfter)
+	}
+
+	updatedDU := &velerov2alpha1.DataUpload{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      du.Name,
+		Namespace: du.Namespace,
+	}, updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseCanceling {
+		t.Errorf("expected phase to remain Canceling while pod terminates, got phase=%s", updatedDU.Status.Phase)
+	}
+
+	survivingVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      vmb.Name,
+		Namespace: vmNamespace,
+	}, survivingVMB); err != nil {
+		t.Errorf("expected VMB to survive while pod cleanup is deferred, got err=%v", err)
+	}
+
+	// Simulate kubelet finishing termination.
+	terminatingPod := &corev1.Pod{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      pod.Name,
+		Namespace: pod.Namespace,
+	}, terminatingPod); err != nil {
+		t.Fatalf("failed to get terminating pod: %v", err)
+	}
+	if terminatingPod.DeletionTimestamp == nil {
+		t.Fatalf("expected handleCanceling to have requested datamover pod deletion in round 1")
+	}
+	terminatingPod.Finalizers = nil
+	if err := fakeClient.Update(context.Background(), terminatingPod); err != nil {
+		t.Fatalf("failed to clear pod finalizer: %v", err)
+	}
+
+	// Round 2: pod is gone - VMB cleanup and Canceled transition proceed.
+	result, err = r.handleCanceling(context.Background(), logr.Discard(), updatedDU)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue once pod is gone, got RequeueAfter=%v", result.RequeueAfter)
+	}
+
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      du.Name,
+		Namespace: du.Namespace,
+	}, updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseCanceled {
+		t.Errorf("expected phase=%s once cleanup finishes, got phase=%s", velerov2alpha1.DataUploadPhaseCanceled, updatedDU.Status.Phase)
+	}
+
+	deletedVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      vmb.Name,
+		Namespace: vmNamespace,
+	}, deletedVMB)
+	if !errors.IsNotFound(err) {
+		t.Errorf("expected VMB to be deleted once cleanup completes, got err=%v", err)
+	}
+}
+
 func TestHandleInProgress_PodFailed(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
@@ -1958,6 +2273,123 @@ func TestHandleInProgress_PodFailed(t *testing.T) {
 
 	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseFailed {
 		t.Errorf("expected phase=%s, got phase=%s", velerov2alpha1.DataUploadPhaseFailed, updatedDU.Status.Phase)
+	}
+}
+
+// TestHandleInProgress_PodFailed_PreservesVMB locks in the team's decision
+// (see PR #170 review discussion) to preserve the VMB (and VMBT) on a
+// genuine DataUpload Failed transition for debugging, matching the existing
+// "Skip cleanup on failure to preserve resources for debugging" handling of
+// the datamover pod/PVC/PV in handleInProgress's PodFailed case.
+func TestHandleInProgress_PodFailed_PreservesVMB(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+
+	vmNamespace := "test-ns"
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du",
+			Namespace: "openshift-adp",
+			UID:       types.UID("test-uid-failed"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      "test-vm",
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseInProgress,
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.DatamoverPodNamePrefix + du.Name,
+			Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataUploadUID: string(du.UID),
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+		},
+	}
+
+	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmb-test-du",
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadUID: string(du.UID),
+			},
+		},
+	}
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-test-vm",
+			Namespace: vmNamespace,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pod, vmb, vmbt).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: "openshift-adp",
+	}
+
+	result, err := r.handleInProgress(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue when pod failed, got RequeueAfter=%v", result.RequeueAfter)
+	}
+
+	updatedDU := &velerov2alpha1.DataUpload{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      du.Name,
+		Namespace: du.Namespace,
+	}, updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseFailed {
+		t.Errorf("expected phase=%s, got phase=%s", velerov2alpha1.DataUploadPhaseFailed, updatedDU.Status.Phase)
+	}
+
+	survivingVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      vmb.Name,
+		Namespace: vmNamespace,
+	}, survivingVMB); err != nil {
+		t.Errorf("expected VMB to be preserved on Failed transition, got err=%v", err)
+	}
+
+	survivingVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      vmbt.Name,
+		Namespace: vmNamespace,
+	}, survivingVMBT); err != nil {
+		t.Errorf("expected VMBT to be preserved, but it was deleted or errored: %v", err)
+	}
+
+	// The failed datamover pod itself must also survive (per the existing
+	// "skip cleanup on failure to preserve resources for debugging" handling).
+	survivingPod := &corev1.Pod{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      pod.Name,
+		Namespace: pod.Namespace,
+	}, survivingPod); err != nil {
+		t.Errorf("expected datamover pod to be preserved on Failed transition, got err=%v", err)
 	}
 }
 
