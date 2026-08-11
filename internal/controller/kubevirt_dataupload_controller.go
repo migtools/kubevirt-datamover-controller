@@ -1646,6 +1646,11 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		pullPolicy = corev1.PullAlways
 	}
 
+	ssecName, ssecKey, err := parseSSECSecretRef(cfg.CustomerKeyEncryptionSecret)
+	if err != nil {
+		return nil, err
+	}
+
 	return &DatamoverPodConfig{
 		OperationMode:                  OperationModeUpload,
 		Name:                           du.Name, // Used as a prefix for GenerateName
@@ -1660,6 +1665,11 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		BSLS3ForcePathStyle:            strconv.FormatBool(cfg.S3ForcePathStyle),
 		BSLInsecureSkipTLSVerify:       strconv.FormatBool(cfg.InsecureSkipTLSVerify),
 		BSLCACert:                      cfg.CACert,
+		BSLServerSideEncryption:        cfg.ServerSideEncryption,
+		BSLKMSKeyID:                    cfg.KMSKeyID,
+		BSLChecksumAlgorithm:           cfg.ChecksumAlgorithm,
+		SSECSecretName:                 ssecName,
+		SSECSecretKey:                  ssecKey,
 		BSLServiceAccount:              cfg.ServiceAccount,
 		BSLKMSKeyName:                  cfg.KMSKeyName,
 		BSLResourceGroup:               cfg.ResourceGroup,
@@ -1685,6 +1695,20 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		SourcePVCName:                  "", // overridden by handlePrepared with the rebound PVC name
 		Labels:                         make(map[string]string),
 	}, nil
+}
+
+// parseSSECSecretRef parses a "secretName/key" reference into its components.
+// Returns ("", "", nil) when ref is empty (SSE-C not configured).
+// Returns an error for malformed references.
+func parseSSECSecretRef(ref string) (secretName, key string, err error) {
+	if ref == "" {
+		return "", "", nil
+	}
+	parts := strings.SplitN(ref, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("invalid customerKeyEncryptionSecret %q: must be in secretName/key format", ref)
+	}
+	return parts[0], parts[1], nil
 }
 
 // lookupCheckpointFromBSL reads the VM's checkpoint index from the BSL and returns

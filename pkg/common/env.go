@@ -21,15 +21,19 @@ package common
 // upload and download pods never run in the same process, so there's no
 // collision reusing the same names.
 const (
-	EnvBSLProvider              = "KUBEVIRT_DM_BSL_PROVIDER"
-	EnvBSLBucket                = "KUBEVIRT_DM_BSL_BUCKET"
-	EnvBSLPrefix                = "KUBEVIRT_DM_BSL_PREFIX"
-	EnvBSLRegion                = "KUBEVIRT_DM_BSL_REGION"
-	EnvCredentialsFile          = "KUBEVIRT_DM_CREDENTIALS_FILE"
-	EnvBSLS3URL                 = "KUBEVIRT_DM_BSL_S3_URL"
-	EnvBSLS3ForcePathStyle      = "KUBEVIRT_DM_BSL_S3_FORCE_PATH_STYLE"
-	EnvBSLInsecureSkipTLSVerify = "KUBEVIRT_DM_BSL_INSECURE_SKIP_TLS_VERIFY"
-	EnvBSLCACert                = "KUBEVIRT_DM_BSL_CA_CERT"
+	EnvBSLProvider                  = "KUBEVIRT_DM_BSL_PROVIDER"
+	EnvBSLBucket                    = "KUBEVIRT_DM_BSL_BUCKET"
+	EnvBSLPrefix                    = "KUBEVIRT_DM_BSL_PREFIX"
+	EnvBSLRegion                    = "KUBEVIRT_DM_BSL_REGION"
+	EnvCredentialsFile              = "KUBEVIRT_DM_CREDENTIALS_FILE"
+	EnvBSLS3URL                     = "KUBEVIRT_DM_BSL_S3_URL"
+	EnvBSLS3ForcePathStyle          = "KUBEVIRT_DM_BSL_S3_FORCE_PATH_STYLE"
+	EnvBSLInsecureSkipTLSVerify     = "KUBEVIRT_DM_BSL_INSECURE_SKIP_TLS_VERIFY"
+	EnvBSLCACert                    = "KUBEVIRT_DM_BSL_CA_CERT"
+	EnvBSLServerSideEncryption      = "KUBEVIRT_DM_BSL_SERVER_SIDE_ENCRYPTION"
+	EnvBSLKMSKeyID                  = "KUBEVIRT_DM_BSL_KMS_KEY_ID"
+	EnvBSLChecksumAlgorithm         = "KUBEVIRT_DM_BSL_CHECKSUM_ALGORITHM"
+	EnvBSLCustomerKeyEncryptionFile = "KUBEVIRT_DM_BSL_CUSTOMER_KEY_ENCRYPTION_FILE"
 
 	// GCP-specific storage provider settings
 	EnvBSLServiceAccount = "KUBEVIRT_DM_BSL_SERVICE_ACCOUNT"

@@ -19,6 +19,7 @@ package controller
 import (
 	"maps"
 	"os"
+	"path/filepath"
 
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
@@ -61,6 +62,12 @@ type DatamoverPodConfig struct {
 	BSLS3ForcePathStyle      string
 	BSLInsecureSkipTLSVerify string
 	BSLCACert                string
+	BSLServerSideEncryption  string
+	BSLKMSKeyID              string
+	BSLChecksumAlgorithm     string
+	// SSE-C secret reference (parsed from BSL customerKeyEncryptionSecret "secretName/key")
+	SSECSecretName string
+	SSECSecretKey  string
 
 	// GCP-specific storage provider settings
 	BSLServiceAccount string
@@ -142,6 +149,10 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 		{Name: common.EnvBSLS3ForcePathStyle, Value: config.BSLS3ForcePathStyle},
 		{Name: common.EnvBSLInsecureSkipTLSVerify, Value: config.BSLInsecureSkipTLSVerify},
 		{Name: common.EnvBSLCACert, Value: config.BSLCACert},
+		{Name: common.EnvBSLServerSideEncryption, Value: config.BSLServerSideEncryption},
+		{Name: common.EnvBSLKMSKeyID, Value: config.BSLKMSKeyID},
+		{Name: common.EnvBSLChecksumAlgorithm, Value: config.BSLChecksumAlgorithm},
+		{Name: common.EnvBSLCustomerKeyEncryptionFile, Value: sseCustomerKeyPath(config)},
 		{Name: common.EnvBSLServiceAccount, Value: config.BSLServiceAccount},
 		{Name: common.EnvBSLKMSKeyName, Value: config.BSLKMSKeyName},
 		{Name: common.EnvBSLResourceGroup, Value: config.BSLResourceGroup},
@@ -239,9 +250,6 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 					},
 				},
 				{
-					// Mount BSL credentials secret. The secret key (from BSL config) is mounted
-					// to a fixed path "/credentials/cloud" that matches common.DefaultCredentialsPath.
-					// This is simpler than Velero's dynamic path approach since we control both ends.
 					Name: "cloud-credentials",
 					VolumeSource: corev1.VolumeSource{
 						Secret: &corev1.SecretVolumeSource{
@@ -249,7 +257,7 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 							Items: []corev1.KeyToPath{
 								{
 									Key:  config.CredentialSecretKey,
-									Path: "cloud", // Fixed filename, matches common.DefaultCredentialsPath
+									Path: "cloud",
 								},
 							},
 						},
@@ -275,5 +283,44 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 		},
 	}
 
+	if config.SSECSecretName != "" {
+		pod.Spec.Volumes = append(pod.Spec.Volumes, sseCustomerKeyVolume(config))
+		pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts,
+			corev1.VolumeMount{
+				Name:      "sse-c-key",
+				MountPath: "/etc/sse-c",
+				ReadOnly:  true,
+			})
+	}
+
 	return pod
+}
+
+const sseCustomerKeyMountPath = "/etc/sse-c/key"
+
+// sseCustomerKeyPath returns the mounted file path for the SSE-C key,
+// or empty string if SSE-C is not configured.
+func sseCustomerKeyPath(config *DatamoverPodConfig) string {
+	if config.SSECSecretName == "" {
+		return ""
+	}
+	return sseCustomerKeyMountPath
+}
+
+// sseCustomerKeyVolume returns the volume for the SSE-C key secret.
+func sseCustomerKeyVolume(config *DatamoverPodConfig) corev1.Volume {
+	return corev1.Volume{
+		Name: "sse-c-key",
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: config.SSECSecretName,
+				Items: []corev1.KeyToPath{
+					{
+						Key:  config.SSECSecretKey,
+						Path: filepath.Base(sseCustomerKeyMountPath),
+					},
+				},
+			},
+		},
+	}
 }

@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/go-logr/logr"
 
@@ -167,15 +166,19 @@ func prepareDir(dir string) error {
 func LoadConfigFromEnv() (*DownloaderConfig, error) {
 	config := &DownloaderConfig{
 		ObjectStoreConfig: common.ObjectStoreConfig{
-			BSLProvider:              os.Getenv(common.EnvBSLProvider),
-			BSLBucket:                os.Getenv(common.EnvBSLBucket),
-			BSLPrefix:                os.Getenv(common.EnvBSLPrefix),
-			BSLRegion:                os.Getenv(common.EnvBSLRegion),
-			BSLS3URL:                 os.Getenv(common.EnvBSLS3URL),
-			BSLS3ForcePathStyle:      strings.EqualFold(os.Getenv(common.EnvBSLS3ForcePathStyle), "true"),
-			BSLInsecureSkipTLSVerify: strings.EqualFold(os.Getenv(common.EnvBSLInsecureSkipTLSVerify), "true"),
-			BSLCACert:                os.Getenv(common.EnvBSLCACert),
-			CredentialsFile:          os.Getenv(common.EnvCredentialsFile),
+			BSLProvider:                  os.Getenv(common.EnvBSLProvider),
+			BSLBucket:                    os.Getenv(common.EnvBSLBucket),
+			BSLPrefix:                    os.Getenv(common.EnvBSLPrefix),
+			BSLRegion:                    os.Getenv(common.EnvBSLRegion),
+			BSLS3URL:                     os.Getenv(common.EnvBSLS3URL),
+			BSLS3ForcePathStyle:          common.ParseBool(os.Getenv(common.EnvBSLS3ForcePathStyle)),
+			BSLInsecureSkipTLSVerify:     common.ParseBool(os.Getenv(common.EnvBSLInsecureSkipTLSVerify)),
+			BSLCACert:                    os.Getenv(common.EnvBSLCACert),
+			BSLServerSideEncryption:      os.Getenv(common.EnvBSLServerSideEncryption),
+			BSLKMSKeyID:                  os.Getenv(common.EnvBSLKMSKeyID),
+			BSLChecksumAlgorithm:         os.Getenv(common.EnvBSLChecksumAlgorithm),
+			BSLCustomerKeyEncryptionFile: os.Getenv(common.EnvBSLCustomerKeyEncryptionFile),
+			CredentialsFile:              os.Getenv(common.EnvCredentialsFile),
 		},
 		VMName:           os.Getenv(EnvVMName),
 		VMNamespace:      os.Getenv(EnvVMNamespace),

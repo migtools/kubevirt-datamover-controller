@@ -370,6 +370,18 @@ func InitObjectStore(cfg *common.ObjectStoreConfig) (velero.ObjectStore, error) 
 	if cfg.BSLCACert != "" {
 		configMap["caCert"] = cfg.BSLCACert
 	}
+	if cfg.BSLServerSideEncryption != "" {
+		configMap["serverSideEncryption"] = cfg.BSLServerSideEncryption
+	}
+	if cfg.BSLKMSKeyID != "" {
+		configMap["kmsKeyId"] = cfg.BSLKMSKeyID
+	}
+	if cfg.BSLChecksumAlgorithm != "" {
+		configMap["checksumAlgorithm"] = cfg.BSLChecksumAlgorithm
+	}
+	if cfg.BSLCustomerKeyEncryptionFile != "" {
+		configMap["customerKeyEncryptionFile"] = cfg.BSLCustomerKeyEncryptionFile
+	}
 	if cfg.BSLServiceAccount != "" {
 		configMap["serviceAccount"] = cfg.BSLServiceAccount
 	}
@@ -425,10 +437,14 @@ type BSLConfig struct {
 	CredentialKey  string
 
 	// S3-compatible storage provider settings
-	S3URL                 string
-	S3ForcePathStyle      bool
-	InsecureSkipTLSVerify bool
-	CACert                string
+	S3URL                       string
+	S3ForcePathStyle            bool
+	InsecureSkipTLSVerify       bool
+	CACert                      string
+	ServerSideEncryption        string
+	KMSKeyID                    string
+	ChecksumAlgorithm           string
+	CustomerKeyEncryptionSecret string
 
 	// GCP-specific storage provider settings
 	ServiceAccount string
@@ -469,6 +485,10 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 	s3ForcePathStyle := false
 	insecureSkipTLSVerify := false
 	caCert := ""
+	serverSideEncryption := ""
+	kmsKeyID := ""
+	checksumAlgorithm := ""
+	customerKeyEncryptionSecret := ""
 	serviceAccount := ""
 	kmsKeyName := ""
 	resourceGroup := ""
@@ -481,9 +501,13 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 	if bsl.Spec.Config != nil {
 		region = bsl.Spec.Config["region"]
 		s3URL = bsl.Spec.Config["s3Url"]
-		s3ForcePathStyle = strings.EqualFold(bsl.Spec.Config["s3ForcePathStyle"], "true")
-		insecureSkipTLSVerify = strings.EqualFold(bsl.Spec.Config["insecureSkipTLSVerify"], "true")
+		s3ForcePathStyle = common.ParseBool(bsl.Spec.Config["s3ForcePathStyle"])
+		insecureSkipTLSVerify = common.ParseBool(bsl.Spec.Config["insecureSkipTLSVerify"])
 		caCert = bsl.Spec.Config["caCert"]
+		serverSideEncryption = bsl.Spec.Config["serverSideEncryption"]
+		kmsKeyID = bsl.Spec.Config["kmsKeyId"]
+		checksumAlgorithm = bsl.Spec.Config["checksumAlgorithm"]
+		customerKeyEncryptionSecret = bsl.Spec.Config["customerKeyEncryptionSecret"]
 		serviceAccount = bsl.Spec.Config["serviceAccount"]
 		kmsKeyName = bsl.Spec.Config["kmsKeyName"]
 		resourceGroup = bsl.Spec.Config["resourceGroup"]
@@ -491,7 +515,7 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 		storageAccountKeyEnvVar = bsl.Spec.Config["storageAccountKeyEnvVar"]
 		storageAccountURI = bsl.Spec.Config["storageAccountURI"]
 		subscriptionID = bsl.Spec.Config["subscriptionId"]
-		useAAD = strings.EqualFold(bsl.Spec.Config["useAAD"], "true")
+		useAAD = common.ParseBool(bsl.Spec.Config["useAAD"])
 		activeDirectoryAuthorityURI = bsl.Spec.Config["activeDirectoryAuthorityURI"]
 	}
 
@@ -515,6 +539,10 @@ func ExtractBSLConfig(bsl *velerov1.BackupStorageLocation) (*BSLConfig, error) {
 		S3ForcePathStyle:            s3ForcePathStyle,
 		InsecureSkipTLSVerify:       insecureSkipTLSVerify,
 		CACert:                      caCert,
+		ServerSideEncryption:        serverSideEncryption,
+		KMSKeyID:                    kmsKeyID,
+		ChecksumAlgorithm:           checksumAlgorithm,
+		CustomerKeyEncryptionSecret: customerKeyEncryptionSecret,
 		ServiceAccount:              serviceAccount,
 		KMSKeyName:                  kmsKeyName,
 		ResourceGroup:               resourceGroup,
@@ -555,14 +583,20 @@ func InitObjectStoreFromBSL(
 	}
 
 	store, err := factory(&common.ObjectStoreConfig{
-		BSLProvider:                    cfg.Provider,
-		BSLBucket:                      cfg.Bucket,
-		BSLPrefix:                      cfg.Prefix,
-		BSLRegion:                      cfg.Region,
-		BSLS3URL:                       cfg.S3URL,
-		BSLS3ForcePathStyle:            cfg.S3ForcePathStyle,
-		BSLInsecureSkipTLSVerify:       cfg.InsecureSkipTLSVerify,
-		BSLCACert:                      cfg.CACert,
+		BSLProvider:              cfg.Provider,
+		BSLBucket:                cfg.Bucket,
+		BSLPrefix:                cfg.Prefix,
+		BSLRegion:                cfg.Region,
+		BSLS3URL:                 cfg.S3URL,
+		BSLS3ForcePathStyle:      cfg.S3ForcePathStyle,
+		BSLInsecureSkipTLSVerify: cfg.InsecureSkipTLSVerify,
+		BSLCACert:                cfg.CACert,
+		BSLServerSideEncryption:  cfg.ServerSideEncryption,
+		BSLKMSKeyID:              cfg.KMSKeyID,
+		BSLChecksumAlgorithm:     cfg.ChecksumAlgorithm,
+		// BSLCustomerKeyEncryptionFile is not set here — the controller path
+		// (InitObjectStoreFromBSL) doesn't have the SSE-C key file mounted.
+		// SSE-C is only applied in the datamover pod where the secret is volume-mounted.
 		BSLServiceAccount:              cfg.ServiceAccount,
 		BSLKMSKeyName:                  cfg.KMSKeyName,
 		BSLResourceGroup:               cfg.ResourceGroup,

@@ -29,10 +29,14 @@ type ObjectStoreConfig struct {
 	BSLRegion   string
 
 	// S3-compatible storage provider settings
-	BSLS3URL                 string // Custom S3 endpoint URL (e.g., "https://minio.example.com")
-	BSLS3ForcePathStyle      bool   // Use path-style URLs (required by most S3-compatible stores)
-	BSLInsecureSkipTLSVerify bool   // Skip TLS certificate verification
-	BSLCACert                string // PEM-encoded custom CA certificate
+	BSLS3URL                     string // Custom S3 endpoint URL (e.g., "https://minio.example.com")
+	BSLS3ForcePathStyle          bool   // Use path-style URLs (required by most S3-compatible stores)
+	BSLInsecureSkipTLSVerify     bool   // Skip TLS certificate verification
+	BSLCACert                    string // PEM-encoded custom CA certificate
+	BSLServerSideEncryption      string // e.g. "AES256", "aws:kms", "aws:kms:dsse"
+	BSLKMSKeyID                  string // KMS key ARN for SSE-KMS
+	BSLChecksumAlgorithm         string // e.g. "CRC32", "CRC32C", "SHA1", "SHA256"
+	BSLCustomerKeyEncryptionFile string // Mounted SSE-C key file path
 
 	// GCP-specific storage provider settings
 	BSLServiceAccount string // GCP service account email for compute engine signing
