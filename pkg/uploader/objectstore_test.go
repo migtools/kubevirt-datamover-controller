@@ -202,6 +202,23 @@ func TestInitWithSDKCredentials(t *testing.T) {
 }
 
 func TestInitWithNamedProfile(t *testing.T) {
+	// Isolate from ambient AWS credentials so this test verifies the named
+	// profile is actually selected, not whatever the environment happens
+	// to provide (env credentials outrank shared-config profile in the
+	// SDK's default chain). Also disable IMDS so a misconfiguration falls
+	// back to a fast local error instead of a slow network timeout.
+	for _, name := range []string{
+		"AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY",
+		"AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY",
+		"AWS_SESSION_TOKEN", "AWS_WEB_IDENTITY_TOKEN_FILE",
+		"AWS_PROFILE", "AWS_DEFAULT_PROFILE",
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI",
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+	} {
+		t.Setenv(name, "")
+	}
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
 	// Reproduces issue #179: a BSL credentials secret using a non-default
 	// profile name was parsed but ignored, so the SDK silently fell back
 	// to the default credential chain (e.g. EC2 IMDS) instead of the
