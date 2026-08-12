@@ -264,14 +264,9 @@ func main() {
 	}
 
 	// Setup KubeVirt DataUpload controller
-	// GetEventRecorderFor is deprecated in favor of GetEventRecorder, which returns
-	// the newer events.EventRecorder interface -- our reconcilers are built on
-	// record.EventRecorder throughout, so migrating is a real interface change,
-	// not a rename. Deferred to its own PR.
 	if err = (&controller.KubeVirtDataUploadReconciler{
 		Client:                   mgr.GetClient(),
 		APIReader:                mgr.GetAPIReader(),
-		EventRecorder:            mgr.GetEventRecorderFor("kubevirt-dataupload-controller"), //nolint:staticcheck
 		Scheme:                   mgr.GetScheme(),
 		Log:                      ctrl.Log.WithName("controllers").WithName("KubeVirtDataUpload"),
 		MaxConcurrentReconciles:  maxConcurrentReconciles,
@@ -287,6 +282,10 @@ func main() {
 	}
 
 	// Setup KubeVirt DataDownload controller
+	// GetEventRecorderFor is deprecated in favor of GetEventRecorder, which returns
+	// the newer events.EventRecorder interface -- this reconciler is built on
+	// record.EventRecorder, so migrating is a real interface change, not a
+	// rename. Deferred to its own PR.
 	if err = (&controller.KubeVirtDataDownloadReconciler{
 		Client:                   mgr.GetClient(),
 		APIReader:                mgr.GetAPIReader(),

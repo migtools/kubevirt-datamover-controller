@@ -1222,6 +1222,48 @@ func TestResolveTargetDiskName_NewestDefectSupersedesOlderValidEntry(t *testing.
 	}
 }
 
+// TestResolveTargetDiskName_ValidDuplicateWinsWithinEntry covers a single
+// checkpoint whose PVCs list names targetPVCName more than once (e.g. the
+// same PVC attached as two VM volumes): a well-formed duplicate must resolve
+// even when another duplicate in the very same entry is malformed, and this
+// holds regardless of which duplicate comes first.
+func TestResolveTargetDiskName_ValidDuplicateWinsWithinEntry(t *testing.T) {
+	tests := []struct {
+		name  string
+		pvcs  []string
+		files []uploader.CheckpointFile
+	}{
+		{
+			name:  "malformed duplicate first",
+			pvcs:  []string{"restored-disk", "restored-disk"},
+			files: []uploader.CheckpointFile{{DiskName: ""}, {DiskName: "new-disk-name"}},
+		},
+		{
+			name:  "malformed duplicate last",
+			pvcs:  []string{"restored-disk", "restored-disk"},
+			files: []uploader.CheckpointFile{{DiskName: "new-disk-name"}, {DiskName: ""}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vmIndex := uploader.VMIndex{
+				VMName:    "vm-1",
+				Namespace: "vm-ns",
+				Checkpoints: []uploader.CheckpointEntry{
+					{ID: "cp-full", PVCs: tt.pvcs, Files: tt.files},
+				},
+			}
+			got, err := resolveTargetDiskName(vmIndex, []string{"cp-full"}, "restored-disk")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != "new-disk-name" {
+				t.Errorf("resolveTargetDiskName() = %q, want %q (the well-formed duplicate)", got, "new-disk-name")
+			}
+		})
+	}
+}
+
 func TestResolveTargetDiskName_Errors(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -1544,17 +1586,20 @@ func TestListScratchPVC_EmptyRoleExcludesRoleLabeled(t *testing.T) {
 // scratch PVC missed here (cached client hasn't caught up yet) would never
 // get cleaned up at all, since Canceled never reconciles again.
 func TestListAllScratchPVCs_APIReaderFallback(t *testing.T) {
-	f := newDDTestFixture(t)
 	scheme := ddScheme()
 
-	scratchPVC := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "scratch-pvc-1", Namespace: "openshift-adp",
-			Labels: map[string]string{common.LabelDataDownloadUID: string(f.dd.UID)},
-		},
+	newScratchPVC := func(f *ddTestFixture) *corev1.PersistentVolumeClaim {
+		return &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "scratch-pvc-1", Namespace: "openshift-adp",
+				Labels: map[string]string{common.LabelDataDownloadUID: string(f.dd.UID)},
+			},
+		}
 	}
 
 	t.Run("cached client is empty (cache lag), APIReader fallback finds it", func(t *testing.T) {
+		f := newDDTestFixture(t)
+		scratchPVC := newScratchPVC(f)
 		cached := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd).Build()
 		apiReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, scratchPVC.DeepCopy()).Build()
 		r := &KubeVirtDataDownloadReconciler{Client: cached, APIReader: apiReader, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
@@ -1569,6 +1614,7 @@ func TestListAllScratchPVCs_APIReaderFallback(t *testing.T) {
 	})
 
 	t.Run("nil APIReader falls back to cached-only behavior", func(t *testing.T) {
+		f := newDDTestFixture(t)
 		cached := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd).Build()
 		r := &KubeVirtDataDownloadReconciler{Client: cached, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
 
@@ -1586,6 +1632,7 @@ func TestListAllScratchPVCs_APIReaderFallback(t *testing.T) {
 		// created moments apart -- the cached client can have one visible and
 		// not the other. "Found one" must not be mistaken for "list complete"
 		// the way it correctly is for a Filesystem-mode target's single PVC.
+		f := newDDTestFixture(t)
 		f.dd.Annotations[AnnotationRestoreBlockMode] = "true"
 		workPVC := &corev1.PersistentVolumeClaim{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1623,10 +1670,8 @@ func TestListAllScratchPVCs_APIReaderFallback(t *testing.T) {
 		// race in after handleAccepted created the first scratch PVC but before
 		// it persisted the annotation. The cached, role-labeled work PVC alone
 		// must still be enough to know a second (output) PVC might exist and is
-		// worth an APIReader retry for -- not just the annotation. Explicitly
-		// cleared rather than assumed unset: the previous subtest set it on this
-		// same shared fixture.
-		delete(f.dd.Annotations, AnnotationRestoreBlockMode)
+		// worth an APIReader retry for -- not just the annotation.
+		f := newDDTestFixture(t)
 		workPVC := &corev1.PersistentVolumeClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "work-pvc-2", Namespace: "openshift-adp",

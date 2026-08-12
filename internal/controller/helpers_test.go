@@ -400,6 +400,9 @@ func TestCleanupPodsByUID(t *testing.T) {
 		if cleanupNotReady, _ := cleanupPodsByUID(context.Background(), cached, apiReader, "uid-label", "abc", "ns", logr.Discard()); cleanupNotReady {
 			t.Error("expected APIReader fallback to override the stale cached confirmation, got not-ready")
 		}
+		if listCallCount != 1 {
+			t.Errorf("cached client List called %d times, want 1 (confirmation must go through apiReader, not consult the stale cached client again)", listCallCount)
+		}
 	})
 
 	t.Run("APIReader fallback finds a pod missed by the initial cached list", func(t *testing.T) {

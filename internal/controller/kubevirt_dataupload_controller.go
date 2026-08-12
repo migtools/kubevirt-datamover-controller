@@ -39,7 +39,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -91,10 +90,6 @@ type KubeVirtDataUploadReconciler struct {
 	// May be nil (falls back to cached-only lookups), so tests that don't wire
 	// one keep working.
 	APIReader client.Reader
-
-	// EventRecorder emits Kubernetes Events on DataUpload objects. May be nil,
-	// in which case event emission is skipped.
-	EventRecorder record.EventRecorder
 
 	// OADPNamespace is the namespace where OADP and Velero resources are located
 	OADPNamespace string

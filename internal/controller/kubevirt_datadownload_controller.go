@@ -619,23 +619,40 @@ func resolveTargetDiskName(vmIndex uploader.VMIndex, chain []string, targetPVCNa
 		if !ok {
 			continue
 		}
+		// A single checkpoint's PVCs list isn't expected to name targetPVCName
+		// more than once, but if it ever does (e.g. the same PVC attached as two
+		// VM volumes), prefer whichever duplicate is well-formed over one that
+		// isn't -- unlike the cross-checkpoint case above, there's no chronological
+		// reason to let a malformed duplicate shadow a valid one within the same
+		// checkpoint, so scan all of them before deciding this entry's result.
+		var entryDiskName string
+		var entryErr error
 		for i, pvcName := range entry.PVCs {
 			if pvcName != targetPVCName {
 				continue
 			}
 			if i >= len(entry.Files) {
-				lastErr = fmt.Errorf("checkpoint %q has PVC %q at index %d but no matching file entry", entry.ID, targetPVCName, i)
-				diskName = ""
-				break
+				if entryDiskName == "" && entryErr == nil {
+					entryErr = fmt.Errorf("checkpoint %q has PVC %q at index %d but no matching file entry", entry.ID, targetPVCName, i)
+				}
+				continue
 			}
 			if entry.Files[i].DiskName == "" {
-				lastErr = fmt.Errorf("checkpoint %q has PVC %q at index %d with an empty disk name", entry.ID, targetPVCName, i)
-				diskName = ""
-				break
+				if entryDiskName == "" && entryErr == nil {
+					entryErr = fmt.Errorf("checkpoint %q has PVC %q at index %d with an empty disk name", entry.ID, targetPVCName, i)
+				}
+				continue
 			}
-			diskName = entry.Files[i].DiskName
+			entryDiskName = entry.Files[i].DiskName
+			entryErr = nil
+		}
+		switch {
+		case entryDiskName != "":
+			diskName = entryDiskName
 			lastErr = nil
-			break
+		case entryErr != nil:
+			diskName = ""
+			lastErr = entryErr
 		}
 	}
 
@@ -975,18 +992,19 @@ func (r *KubeVirtDataDownloadReconciler) deleteAllScratchPVCs(ctx context.Contex
 // after the claimRef is set -- using the PVC's fields would miss the narrow
 // window where the rebind is already committed but not yet reflected as Bound.
 func (r *KubeVirtDataDownloadReconciler) isRestoreAlreadyProvisioned(ctx context.Context, dd *velerov2alpha1.DataDownload) (bool, error) {
-	pvList := &corev1.PersistentVolumeList{}
-	if err := r.List(ctx, pvList, client.MatchingLabels{common.LabelDataDownloadUID: string(dd.UID)}); err != nil {
-		return false, fmt.Errorf("failed to list PVs by UID label: %w", err)
+	matched, err := findProvisionedPV(ctx, r.Client, dd)
+	if err != nil {
+		return false, err
 	}
-
-	var matched *corev1.PersistentVolume
-	for i, pv := range pvList.Items {
-		if pv.Spec.ClaimRef != nil &&
-			pv.Spec.ClaimRef.Name == dd.Spec.TargetVolume.PVC &&
-			pv.Spec.ClaimRef.Namespace == dd.Spec.TargetVolume.Namespace {
-			matched = &pvList.Items[i]
-			break
+	// The informer cache is only eventually consistent, so a PV whose claimRef
+	// was just set by patchPVBinding in an earlier reconcile (crashed/requeued
+	// before this check ran again) may not yet be visible to a cached List --
+	// retry via APIReader (an uncached read) before concluding it's unprovisioned,
+	// matching the fallback convention used elsewhere for cached child-resource
+	// lookups (e.g. findScratchPVC, listAllScratchPVCs).
+	if matched == nil && r.APIReader != nil {
+		if matched, err = findProvisionedPV(ctx, r.APIReader, dd); err != nil {
+			return false, err
 		}
 	}
 	if matched == nil {
@@ -1011,6 +1029,25 @@ func (r *KubeVirtDataDownloadReconciler) isRestoreAlreadyProvisioned(ctx context
 		return false, fmt.Errorf("failed to get target PVC to verify claimRef UID: %w", err)
 	}
 	return targetPVC.UID == matched.Spec.ClaimRef.UID, nil
+}
+
+// findProvisionedPV lists PVs carrying dd's UID label via reader (either the
+// cached client or an uncached APIReader -- see isRestoreAlreadyProvisioned)
+// and returns the one whose claimRef names dd's target PVC, or nil if none
+// match.
+func findProvisionedPV(ctx context.Context, reader client.Reader, dd *velerov2alpha1.DataDownload) (*corev1.PersistentVolume, error) {
+	pvList := &corev1.PersistentVolumeList{}
+	if err := reader.List(ctx, pvList, client.MatchingLabels{common.LabelDataDownloadUID: string(dd.UID)}); err != nil {
+		return nil, fmt.Errorf("failed to list PVs by UID label: %w", err)
+	}
+	for i, pv := range pvList.Items {
+		if pv.Spec.ClaimRef != nil &&
+			pv.Spec.ClaimRef.Name == dd.Spec.TargetVolume.PVC &&
+			pv.Spec.ClaimRef.Namespace == dd.Spec.TargetVolume.Namespace {
+			return &pvList.Items[i], nil
+		}
+	}
+	return nil, nil
 }
 
 // isBlockModeRestore reports whether dd's restore target PVC was Block
