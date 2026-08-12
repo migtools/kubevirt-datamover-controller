@@ -84,16 +84,23 @@ import (
 // for the canonical definitions and their values, referenced directly at
 // call sites instead of re-exported here.
 const (
-	EnvVMName           = "KUBEVIRT_DM_VM_NAME"
-	EnvVMNamespace      = "KUBEVIRT_DM_VM_NAMESPACE"
-	EnvCheckpointName   = "KUBEVIRT_DM_CHECKPOINT_NAME"
-	EnvBackupType       = "KUBEVIRT_DM_BACKUP_TYPE"
-	EnvVeleroBackupName = "KUBEVIRT_DM_VELERO_BACKUP_NAME"
-	EnvSourcePVCPath    = "KUBEVIRT_DM_SOURCE_PVC_PATH"
-	EnvDataUploadName   = "KUBEVIRT_DM_DATAUPLOAD_NAME"
-	EnvDataUploadUID    = "KUBEVIRT_DM_DATAUPLOAD_UID"
-	EnvVMBName          = "KUBEVIRT_DM_VMB_NAME"
-	EnvVMBTName         = "KUBEVIRT_DM_VMBT_NAME"
+	EnvVMName         = "KUBEVIRT_DM_VM_NAME"
+	EnvVMNamespace    = "KUBEVIRT_DM_VM_NAMESPACE"
+	EnvCheckpointName = "KUBEVIRT_DM_CHECKPOINT_NAME"
+	EnvBackupType     = "KUBEVIRT_DM_BACKUP_TYPE"
+	// EnvExpectedBackupType carries the backup type the controller intended
+	// based on BSL chain validation. It is compared against the actual backup
+	// type (EnvBackupType, derived from VMB.Status.Type) so the uploader can
+	// correct the S3 index when virt-controller performs a full backup despite
+	// the controller expecting an incremental one (e.g. the VM lost its
+	// libvirt checkpoint).
+	EnvExpectedBackupType = "KUBEVIRT_DM_EXPECTED_BACKUP_TYPE"
+	EnvVeleroBackupName   = "KUBEVIRT_DM_VELERO_BACKUP_NAME"
+	EnvSourcePVCPath      = "KUBEVIRT_DM_SOURCE_PVC_PATH"
+	EnvDataUploadName     = "KUBEVIRT_DM_DATAUPLOAD_NAME"
+	EnvDataUploadUID      = "KUBEVIRT_DM_DATAUPLOAD_UID"
+	EnvVMBName            = "KUBEVIRT_DM_VMB_NAME"
+	EnvVMBTName           = "KUBEVIRT_DM_VMBT_NAME"
 )
 
 // Default paths and values
@@ -118,13 +125,18 @@ type UploaderConfig struct {
 	VMNamespace string
 
 	// Backup context
-	CheckpointName   string
-	BackupType       string // "full" or "incremental"
-	VeleroBackupName string
-	DataUploadName   string
-	DataUploadUID    string
-	VMBName          string
-	VMBTName         string
+	CheckpointName string
+	BackupType     string // actual backup type performed: "full" or "incremental"
+	// ExpectedBackupType is the backup type the controller intended based on
+	// BSL chain validation. When it is "incremental" but BackupType is "full",
+	// virt-controller performed a full backup unexpectedly and the S3 index
+	// entry is recorded as full with no parent pointer.
+	ExpectedBackupType string
+	VeleroBackupName   string
+	DataUploadName     string
+	DataUploadUID      string
+	VMBName            string
+	VMBTName           string
 
 	// Source PVC mount path
 	SourcePVCPath string

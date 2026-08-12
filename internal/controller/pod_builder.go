@@ -131,13 +131,14 @@ type DatamoverPodConfig struct {
 	VMNamespace string
 
 	// Backup context
-	CheckpointName   string
-	BackupType       string
-	VeleroBackupName string
-	ResourceName     string
-	ResourceUID      string
-	VMBName          string
-	VMBTName         string
+	CheckpointName     string
+	BackupType         string
+	ExpectedBackupType string
+	VeleroBackupName   string
+	ResourceName       string
+	ResourceUID        string
+	VMBName            string
+	VMBTName           string
 
 	// Identity label/annotation keys for the owning resource (DataUpload or DataDownload).
 	// These determine which label key carries the UID and which annotation carries the name.
@@ -474,6 +475,7 @@ func buildUploadPodResources(config *DatamoverPodConfig) ([]corev1.EnvVar, []cor
 		corev1.EnvVar{Name: uploader.EnvVMNamespace, Value: config.VMNamespace},
 		corev1.EnvVar{Name: uploader.EnvCheckpointName, Value: config.CheckpointName},
 		corev1.EnvVar{Name: uploader.EnvBackupType, Value: config.BackupType},
+		corev1.EnvVar{Name: uploader.EnvExpectedBackupType, Value: config.ExpectedBackupType},
 		corev1.EnvVar{Name: uploader.EnvVeleroBackupName, Value: config.VeleroBackupName},
 		corev1.EnvVar{Name: uploader.EnvSourcePVCPath, Value: uploader.DefaultSourcePVCPath},
 		corev1.EnvVar{Name: uploader.EnvDataUploadName, Value: config.ResourceName},
