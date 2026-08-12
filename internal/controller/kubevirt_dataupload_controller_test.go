@@ -1290,6 +1290,115 @@ func TestHasOlderActiveDUForVM(t *testing.T) {
 	}
 }
 
+func TestHasOlderActiveDUForVM_Staleness(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "vm-ns"
+	oadpNs := "openshift-adp"
+
+	now := time.Now()
+	recentTime := metav1.NewTime(now.Add(-10 * time.Minute))
+	staleTime := metav1.NewTime(now.Add(-3 * time.Hour))
+
+	makeDU := func(name string, uid types.UID, phase velerov2alpha1.DataUploadPhase, creationTime metav1.Time) *velerov2alpha1.DataUpload {
+		return &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				Namespace:         oadpNs,
+				UID:               uid,
+				CreationTimestamp: creationTime,
+				Annotations: map[string]string{
+					common.AnnotationVMName:      vmName,
+					common.AnnotationVMNamespace: vmNamespace,
+				},
+			},
+			Spec: velerov2alpha1.DataUploadSpec{
+				DataMover:       common.DataMoverKubeVirt,
+				SourceNamespace: vmNamespace,
+			},
+			Status: velerov2alpha1.DataUploadStatus{
+				Phase: phase,
+			},
+		}
+	}
+
+	currentDU := makeDU("du-current", "current-uid", velerov2alpha1.DataUploadPhaseAccepted, metav1.NewTime(now))
+
+	tests := []struct {
+		name                     string
+		staleDataUploadThreshold time.Duration
+		otherDUs                 []client.Object
+		wantWait                 bool
+		wantBlocked              string
+	}{
+		{
+			name:                     "stale older DU is skipped",
+			staleDataUploadThreshold: 2 * time.Hour,
+			otherDUs: []client.Object{
+				makeDU("du-stale", "stale-uid", velerov2alpha1.DataUploadPhaseAccepted, staleTime),
+			},
+			wantWait: false,
+		},
+		{
+			name:                     "non-stale older DU still blocks",
+			staleDataUploadThreshold: 2 * time.Hour,
+			otherDUs: []client.Object{
+				makeDU("du-recent", "recent-uid", velerov2alpha1.DataUploadPhaseAccepted, recentTime),
+			},
+			wantWait:    true,
+			wantBlocked: "du-recent",
+		},
+		{
+			name:                     "threshold 0 disables staleness check",
+			staleDataUploadThreshold: 0,
+			otherDUs: []client.Object{
+				makeDU("du-stale", "stale-uid", velerov2alpha1.DataUploadPhaseAccepted, staleTime),
+			},
+			wantWait:    true,
+			wantBlocked: "du-stale",
+		},
+		{
+			name:                     "stale DU in InProgress is also skipped",
+			staleDataUploadThreshold: 2 * time.Hour,
+			otherDUs: []client.Object{
+				makeDU("du-stale", "stale-uid", velerov2alpha1.DataUploadPhaseInProgress, staleTime),
+			},
+			wantWait: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objs := append([]client.Object{currentDU.DeepCopy()}, tt.otherDUs...)
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objs...).
+				Build()
+
+			r := &KubeVirtDataUploadReconciler{
+				Client:                   fakeClient,
+				Scheme:                   scheme,
+				Log:                      logr.Discard(),
+				OADPNamespace:            oadpNs,
+				StaleDataUploadThreshold: tt.staleDataUploadThreshold,
+			}
+
+			shouldWait, blockingDU, err := r.hasOlderActiveDUForVM(context.Background(), currentDU.DeepCopy())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if shouldWait != tt.wantWait {
+				t.Errorf("hasOlderActiveDUForVM() shouldWait = %v, want %v", shouldWait, tt.wantWait)
+			}
+			if tt.wantWait && blockingDU != tt.wantBlocked {
+				t.Errorf("hasOlderActiveDUForVM() blockingDU = %q, want %q", blockingDU, tt.wantBlocked)
+			}
+		})
+	}
+}
+
 func TestHandleAccepted_RequeuesWhenOlderDUActive(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)

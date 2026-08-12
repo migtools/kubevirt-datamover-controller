@@ -178,6 +178,8 @@ func (s *S3ObjectStore) Init(configMap map[string]string) error {
 		if forcePathStyle {
 			o.UsePathStyle = true
 		}
+		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
 	s.uploader = transfermanager.New(s.client, func(o *transfermanager.Options) {
 		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired

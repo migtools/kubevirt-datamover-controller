@@ -18,6 +18,8 @@ limitations under the License.
 // the kubevirt-datamover-controller and kubevirt-datamover-plugin.
 package common
 
+import "time"
+
 // Annotation keys for DataUpload and DataDownload resources
 const (
 	// AnnotationVMName is the annotation key for the source VirtualMachine name.
@@ -165,6 +167,14 @@ const (
 const (
 	// DefaultDatamoverImage is the default image for datamover pods.
 	DefaultDatamoverImage = "quay.io/konveyor/kubevirt-datamover-controller:latest"
+)
+
+// Default thresholds
+const (
+	// DefaultStaleDataUploadThreshold is the default duration after which a
+	// DataUpload in an active phase is considered stale and will no longer
+	// block younger DataUploads for the same VM.
+	DefaultStaleDataUploadThreshold = 2 * time.Hour
 )
 
 // SnapshotType constants for DataUpload

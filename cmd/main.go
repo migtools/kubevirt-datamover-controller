@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -89,6 +90,7 @@ func main() {
 	var datamoverImagePullPolicy string
 	var oadpNamespace string
 	var maxIncrementalBackups int
+	var staleDataUploadThreshold time.Duration
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -117,6 +119,9 @@ func main() {
 		"Namespace where OADP/Velero resources are located")
 	flag.IntVar(&maxIncrementalBackups, "max-incremental-backups", 0,
 		"Maximum number of incremental backups per VM before forcing a full backup (0 = unlimited)")
+	flag.DurationVar(&staleDataUploadThreshold, "stale-dataupload-threshold",
+		common.DefaultStaleDataUploadThreshold,
+		"Duration after which a stale DataUpload stops blocking younger ones for the same VM")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -243,6 +248,7 @@ func main() {
 		DatamoverImagePullPolicy: corev1.PullPolicy(datamoverImagePullPolicy),
 		MaxIncrementalBackups:    maxIncrementalBackups,
 		OADPNamespace:            oadpNamespace,
+		StaleDataUploadThreshold: staleDataUploadThreshold,
 		PodLogCollector:          controller.NewPodLogCollector(kubeClient, 100),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "KubeVirtDataUpload")
