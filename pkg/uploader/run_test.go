@@ -94,45 +94,143 @@ func TestExtractDiskName(t *testing.T) {
 	tests := []struct {
 		name     string
 		filename string
+		vmbName  string
 		expected string
 	}{
 		{
-			name:     "standard vmb filename",
+			name:     "standard vmb filename with vmb name",
 			filename: "vmb-test-du-volume0.qcow2",
+			vmbName:  "vmb-test-du",
 			expected: "volume0",
 		},
 		{
-			name:     "filename with timestamp",
+			name:     "hyphenated disk name with vmb name",
+			filename: "vmb-du-bkp-dm-win-baselinqt2dj-datadisk-1.qcow2",
+			vmbName:  "vmb-du-bkp-dm-win-baselinqt2dj",
+			expected: "datadisk-1",
+		},
+		{
+			name:     "multiple hyphenated disks with vmb name",
+			filename: "vmb-du-bkp-dm-win-baselinqt2dj-datadisk-2.qcow2",
+			vmbName:  "vmb-du-bkp-dm-win-baselinqt2dj",
+			expected: "datadisk-2",
+		},
+		{
+			name:     "rootdisk with vmb name",
+			filename: "vmb-du-bkp-dm-win-baselinqt2dj-rootdisk.qcow2",
+			vmbName:  "vmb-du-bkp-dm-win-baselinqt2dj",
+			expected: "rootdisk",
+		},
+		{
+			name:     "fallback without vmb name - simple disk",
+			filename: "vmb-test-du-volume0.qcow2",
+			vmbName:  "",
+			expected: "volume0",
+		},
+		{
+			name:     "fallback without vmb name - last segment",
 			filename: "vmb-test-2026-02-05_19-12-01-disk1.qcow2",
+			vmbName:  "",
 			expected: "disk1",
 		},
 		{
 			name:     "simple filename",
 			filename: "backup-rootdisk.qcow2",
+			vmbName:  "",
 			expected: "rootdisk",
 		},
 		{
-			name:     "uppercase extension",
+			name:     "uppercase extension with vmb name",
 			filename: "vmb-test-volume0.QCOW2",
+			vmbName:  "vmb-test",
 			expected: "volume0",
 		},
 		{
 			name:     "no dash in filename",
 			filename: "backup.qcow2",
+			vmbName:  "",
 			expected: "backup",
 		},
 		{
 			name:     "single part",
 			filename: "disk.qcow2",
+			vmbName:  "",
 			expected: "disk",
+		},
+		{
+			name:     "vmb name does not match prefix - falls back to last segment",
+			filename: "vmb-other-prefix-disk1.qcow2",
+			vmbName:  "vmb-different",
+			expected: "disk1",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := extractDiskName(tt.filename)
+			result := extractDiskName(tt.filename, tt.vmbName)
 			if result != tt.expected {
-				t.Errorf("extractDiskName(%q) = %q, want %q", tt.filename, result, tt.expected)
+				t.Errorf("extractDiskName(%q, %q) = %q, want %q", tt.filename, tt.vmbName, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestResolveDiskNameFromVolumes(t *testing.T) {
+	tests := []struct {
+		name      string
+		filename  string
+		volumeMap map[string]string
+		expected  string
+	}{
+		{
+			name:     "matches hyphenated disk name",
+			filename: "vmb-du-bkp-baselinqt2dj-datadisk-1.qcow2",
+			volumeMap: map[string]string{
+				"datadisk-1": "pvc-data-1",
+				"datadisk-2": "pvc-data-2",
+				"rootdisk":   "pvc-root",
+			},
+			expected: "datadisk-1",
+		},
+		{
+			name:     "matches simple disk name",
+			filename: "vmb-test-rootdisk.qcow2",
+			volumeMap: map[string]string{
+				"rootdisk": "pvc-root",
+			},
+			expected: "rootdisk",
+		},
+		{
+			name:     "longest match wins",
+			filename: "vmb-test-my-data-disk.qcow2",
+			volumeMap: map[string]string{
+				"disk":         "pvc-1",
+				"data-disk":    "pvc-2",
+				"my-data-disk": "pvc-3",
+			},
+			expected: "my-data-disk",
+		},
+		{
+			name:     "no match returns empty",
+			filename: "vmb-test-unknown.qcow2",
+			volumeMap: map[string]string{
+				"rootdisk": "pvc-root",
+			},
+			expected: "",
+		},
+		{
+			name:      "empty volume map returns empty",
+			filename:  "vmb-test-disk1.qcow2",
+			volumeMap: map[string]string{},
+			expected:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := resolveDiskNameFromVolumes(tt.filename, tt.volumeMap)
+			if result != tt.expected {
+				t.Errorf("resolveDiskNameFromVolumes(%q) = %q, want %q", tt.filename, result, tt.expected)
 			}
 		})
 	}
@@ -722,6 +820,183 @@ func TestUpdateVMIndex(t *testing.T) {
 				tt.validateResult(t, store)
 			}
 		})
+	}
+}
+
+func TestUpdateVMIndex_HyphenatedDiskNames(t *testing.T) {
+	scheme := getTestScheme()
+
+	config := &UploaderConfig{
+		ObjectStoreConfig: common.ObjectStoreConfig{
+			BSLBucket: "test-bucket",
+		},
+		VMName:           "test-vm",
+		VMNamespace:      "test-ns",
+		CheckpointName:   "cp-001",
+		BackupType:       "full",
+		VMBName:          "vmb-du-bkp-baselinqt2dj",
+		VeleroBackupName: "backup-001",
+	}
+
+	files := []CheckpointFile{
+		{
+			Filename:   "vmb-du-bkp-baselinqt2dj-datadisk-1.qcow2",
+			DiskName:   "datadisk-1",
+			Size:       1024,
+			ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-du-bkp-baselinqt2dj-datadisk-1.qcow2",
+		},
+		{
+			Filename:   "vmb-du-bkp-baselinqt2dj-rootdisk.qcow2",
+			DiskName:   "rootdisk",
+			Size:       512,
+			ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-du-bkp-baselinqt2dj-rootdisk.qcow2",
+		},
+	}
+
+	archived := &archivedPaths{
+		VMBObjectPath:  "checkpoints/test-ns/test-vm/cp-001/vmb.json",
+		VMBTObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmbt.json",
+	}
+
+	store := NewMockObjectStore("test-bucket", "")
+	objects := getTestClientObjects(config, files)
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objects...).Build()
+
+	err := updateVMIndex(context.Background(), store, fakeClient, config, files, archived, logr.Discard())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	data, err := store.GetObjectBytes("checkpoints/test-ns/test-vm/index.json")
+	if err != nil {
+		t.Fatalf("failed to get index: %v", err)
+	}
+	if !containsBytes(data, "datadisk-1") {
+		t.Error("index should contain hyphenated disk name datadisk-1")
+	}
+	if !containsBytes(data, "rootdisk") {
+		t.Error("index should contain rootdisk")
+	}
+}
+
+func TestUpdateVMIndex_ResolveDiskNameFallback(t *testing.T) {
+	scheme := getTestScheme()
+
+	config := &UploaderConfig{
+		ObjectStoreConfig: common.ObjectStoreConfig{
+			BSLBucket: "test-bucket",
+		},
+		VMName:           "test-vm",
+		VMNamespace:      "test-ns",
+		CheckpointName:   "cp-001",
+		BackupType:       "full",
+		VMBName:          "vmb-du-bkp-baselinqt2dj",
+		VeleroBackupName: "backup-001",
+	}
+
+	// Simulate the bug: extractDiskName returned "1" instead of "datadisk-1"
+	// because the old last-segment logic split on the final dash.
+	files := []CheckpointFile{
+		{
+			Filename:   "vmb-du-bkp-baselinqt2dj-datadisk-1.qcow2",
+			DiskName:   "1",
+			Size:       1024,
+			ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-du-bkp-baselinqt2dj-datadisk-1.qcow2",
+		},
+		{
+			Filename:   "vmb-du-bkp-baselinqt2dj-datadisk-2.qcow2",
+			DiskName:   "2",
+			Size:       512,
+			ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-du-bkp-baselinqt2dj-datadisk-2.qcow2",
+		},
+	}
+
+	archived := &archivedPaths{
+		VMBObjectPath:  "checkpoints/test-ns/test-vm/cp-001/vmb.json",
+		VMBTObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmbt.json",
+	}
+
+	// Build VM with hyphenated volume names and matching PVCs manually,
+	// since getTestClientObjects ties volume names to the (wrong) DiskName.
+	objects := []client.Object{
+		&kubevirtcorev1.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-vm",
+				Namespace: "test-ns",
+			},
+			Spec: kubevirtcorev1.VirtualMachineSpec{
+				Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+					Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+						Volumes: []kubevirtcorev1.Volume{
+							{
+								Name: "datadisk-1",
+								VolumeSource: kubevirtcorev1.VolumeSource{
+									DataVolume: &kubevirtcorev1.DataVolumeSource{Name: "datadisk-1"},
+								},
+							},
+							{
+								Name: "datadisk-2",
+								VolumeSource: kubevirtcorev1.VolumeSource{
+									DataVolume: &kubevirtcorev1.DataVolumeSource{Name: "datadisk-2"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		&corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: "datadisk-1", Namespace: "test-ns"},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse("10Gi"),
+					},
+				},
+			},
+		},
+		&corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: "datadisk-2", Namespace: "test-ns"},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse("10Gi"),
+					},
+				},
+			},
+		},
+	}
+
+	store := NewMockObjectStore("test-bucket", "")
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objects...).Build()
+
+	err := updateVMIndex(context.Background(), store, fakeClient, config, files, archived, logr.Discard())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify the fallback corrected the DiskName
+	if files[0].DiskName != "datadisk-1" {
+		t.Errorf("files[0].DiskName = %q, want %q", files[0].DiskName, "datadisk-1")
+	}
+	if files[1].DiskName != "datadisk-2" {
+		t.Errorf("files[1].DiskName = %q, want %q", files[1].DiskName, "datadisk-2")
+	}
+
+	// Verify the index was written with correct PVC names
+	data, err := store.GetObjectBytes("checkpoints/test-ns/test-vm/index.json")
+	if err != nil {
+		t.Fatalf("failed to get index: %v", err)
+	}
+	if !containsBytes(data, "datadisk-1") {
+		t.Error("index should contain resolved PVC name datadisk-1")
+	}
+	if !containsBytes(data, "datadisk-2") {
+		t.Error("index should contain resolved PVC name datadisk-2")
 	}
 }
 
