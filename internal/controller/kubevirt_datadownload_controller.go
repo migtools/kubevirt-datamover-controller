@@ -1754,19 +1754,29 @@ func (r *KubeVirtDataDownloadReconciler) restoreVMRunStateIfAllSiblingsCompleted
 // allSiblingDataDownloadsCompleted reports whether every kubevirt-datamover
 // DataDownload in dd's namespace correlated to the same VM (via
 // AnnotationVMName/AnnotationVMNamespace -- the same correlation key the
-// plugin stamps on every DataDownload it creates, see pvc/restore.go) has
-// reached Completed. A single sibling that hasn't (including one that failed
-// or was canceled) means the VM's disks aren't all restored yet, so it must
-// stay halted.
+// plugin stamps on every DataDownload it creates, see pvc/restore.go) AND the
+// same Velero restore (via the velero.io/restore-name label Velero itself
+// stamps on every DataDownload it creates during a restore) has reached
+// Completed. Scoping to the current restore matters because Velero doesn't
+// immediately GC a prior restore's Failed/Canceled DataDownloads for the same
+// VM -- without this, a leftover sibling from an earlier, unrelated restore
+// attempt would make this return false forever, permanently leaving the VM
+// halted on every later restore of that VM. A single same-restore sibling
+// that hasn't completed (including one that failed or was canceled) means
+// the VM's disks aren't all restored yet, so it must stay halted.
 func (r *KubeVirtDataDownloadReconciler) allSiblingDataDownloadsCompleted(ctx context.Context, dd *velerov2alpha1.DataDownload, vmRef *common.VMReference) (bool, error) {
 	ddList := &velerov2alpha1.DataDownloadList{}
 	if err := r.List(ctx, ddList, client.InNamespace(dd.Namespace)); err != nil {
 		return false, fmt.Errorf("failed to list DataDownloads: %w", err)
 	}
 
+	restoreName := dd.Labels[common.LabelVeleroRestoreName]
 	for i := range ddList.Items {
 		other := &ddList.Items[i]
 		if other.Spec.DataMover != common.DataMoverKubeVirt {
+			continue
+		}
+		if other.Labels[common.LabelVeleroRestoreName] != restoreName {
 			continue
 		}
 		otherRef, err := common.GetVMReferenceFromDataDownload(other)

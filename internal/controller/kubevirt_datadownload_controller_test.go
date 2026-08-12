@@ -3170,6 +3170,43 @@ func TestRestoreVMRunStateIfAllSiblingsCompleted(t *testing.T) {
 		}
 	})
 
+	t.Run("flips despite a stale Failed sibling from a different restore", func(t *testing.T) {
+		scheme := ddSchemeWithKubeVirt()
+		dd := newDD("dd-1", velerov2alpha1.DataDownloadPhaseCompleted)
+		dd.Labels = map[string]string{common.LabelVeleroRestoreName: "restore-current"}
+		staleSibling := newDD("dd-stale", velerov2alpha1.DataDownloadPhaseFailed)
+		staleSibling.Labels = map[string]string{common.LabelVeleroRestoreName: "restore-previous"}
+		vm := &kubevirtcorev1.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      vmName,
+				Namespace: vmNamespace,
+				Annotations: map[string]string{
+					common.AnnotationOriginalRunStrategy:       string(kubevirtcorev1.RunStrategyAlways),
+					common.AnnotationOriginalRunStrategySource: common.RunStrategySourceRunStrategy,
+				},
+			},
+			Spec: kubevirtcorev1.VirtualMachineSpec{RunStrategy: new(kubevirtcorev1.RunStrategyHalted)},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, staleSibling, vm).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+		if err := r.restoreVMRunStateIfAllSiblingsCompleted(context.Background(), logr.Discard(), dd); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated kubevirtcorev1.VirtualMachine
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: vmName, Namespace: vmNamespace}, &updated); err != nil {
+			t.Fatalf("failed to get VM: %v", err)
+		}
+		if updated.Spec.RunStrategy == nil || *updated.Spec.RunStrategy != kubevirtcorev1.RunStrategyAlways {
+			t.Errorf("RunStrategy = %v, want %q (stale sibling from a different restore must not block)",
+				updated.Spec.RunStrategy, kubevirtcorev1.RunStrategyAlways)
+		}
+		if _, ok := updated.Annotations[common.AnnotationOriginalRunStrategy]; ok {
+			t.Error("AnnotationOriginalRunStrategy should have been deleted")
+		}
+	})
+
 	t.Run("tolerates VM already gone", func(t *testing.T) {
 		scheme := ddSchemeWithKubeVirt()
 		dd := newDD("dd-1", velerov2alpha1.DataDownloadPhaseCompleted)
