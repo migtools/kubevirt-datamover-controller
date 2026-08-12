@@ -197,6 +197,11 @@ func flattenToRaw(ctx context.Context, chainTipPath, outputPath string, outputIs
 
 	convertArgs := []string{"convert", "-p", "-f", "qcow2", "-O", "raw"}
 	if outputIsBlockDevice {
+		// -n skips qemu-img's own target-volume creation step: the block device
+		// is already provisioned (by Kubernetes, at its full size) rather than
+		// something qemu-img should be creating/truncating itself the way it
+		// would for a fresh regular-file target.
+		//
 		// -S 0 disables qemu-img's sparse-detection: without it, a zero-filled
 		// region of the source image is skipped rather than written, which is
 		// safe for a regular file (an unwritten range in a fresh/truncated file
@@ -204,7 +209,7 @@ func flattenToRaw(ctx context.Context, chainTipPath, outputPath string, outputIs
 		// device node can carry leftover data from whatever previously occupied
 		// it, and a skipped write there would leave that stale data in place
 		// instead of the source image's actual (zero) content.
-		convertArgs = append(convertArgs, "-S", "0")
+		convertArgs = append(convertArgs, "-n", "-S", "0")
 	}
 	convertArgs = append(convertArgs, chainTipPath, outputPath)
 	_, stderr, err := runQemuImg(ctx, convertArgs...)

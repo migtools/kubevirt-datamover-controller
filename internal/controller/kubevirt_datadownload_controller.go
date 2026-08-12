@@ -992,6 +992,15 @@ func (r *KubeVirtDataDownloadReconciler) deleteAllScratchPVCs(ctx context.Contex
 // after the claimRef is set -- using the PVC's fields would miss the narrow
 // window where the rebind is already committed but not yet reflected as Bound.
 func (r *KubeVirtDataDownloadReconciler) isRestoreAlreadyProvisioned(ctx context.Context, dd *velerov2alpha1.DataDownload) (bool, error) {
+	// The PV's claimRef is only ever set by rebindPVToNamespace, which only ever
+	// runs after AnnotationDownloaderPodSucceeded is persisted (see its own doc
+	// comment) -- so this can only be true once that annotation is set. Skip the
+	// PV list/lookup entirely otherwise, rather than issuing it on every InProgress
+	// reconcile while the downloader pod is still running.
+	if dd.Annotations[AnnotationDownloaderPodSucceeded] != downloaderPodSucceededValue {
+		return false, nil
+	}
+
 	matched, err := findProvisionedPV(ctx, r.Client, dd)
 	if err != nil {
 		return false, err

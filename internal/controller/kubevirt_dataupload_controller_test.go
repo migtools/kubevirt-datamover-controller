@@ -645,6 +645,52 @@ func TestReconcile_OperationTimeout(t *testing.T) {
 	})
 }
 
+// TestReconcile_OperationTimeout_PodAlreadySucceededDoesNotFail covers the
+// datamover pod having already reported success (AnnotationDatamoverPodSucceeded
+// persisted) with only trailing PVC/PV cleanup left -- the operation timeout
+// elapsing during that cleanup window must not report an already-successful
+// upload as Failed. Split out from TestReconcile_OperationTimeout for the same
+// gocyclo reason as TestReconcile_OperationTimeout_PodStillTerminatingRequeuesWithoutError
+// above.
+func TestReconcile_OperationTimeout_PodAlreadySucceededDoesNotFail(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	get := func(t *testing.T, c client.Client, name, namespace string) *velerov2alpha1.DataUpload {
+		t.Helper()
+		var out velerov2alpha1.DataUpload
+		if err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: namespace}, &out); err != nil {
+			t.Fatalf("failed to get DataUpload: %v", err)
+		}
+		return &out
+	}
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "du-succeeded-pending-cleanup", Namespace: "openshift-adp",
+			Annotations: map[string]string{
+				common.AnnotationDatamoverPodSucceeded: bslValidatedValue,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase:             velerov2alpha1.DataUploadPhaseInProgress,
+			AcceptedTimestamp: ptrTime(time.Now().Add(-(DefaultOperationTimeout + time.Minute))),
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).Build()
+	r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: du.Name, Namespace: du.Namespace}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	updated := get(t, fakeClient, du.Name, du.Namespace)
+	if updated.Status.Phase == velerov2alpha1.DataUploadPhaseFailed {
+		t.Errorf("phase = %q, want not Failed (datamover pod already succeeded, trailing cleanup shouldn't be timed out)", updated.Status.Phase)
+	}
+}
+
 // TestReconcile_OperationTimeout_PodStillTerminatingRequeuesWithoutError
 // covers the same expected, self-resolving ErrPodsStillTerminating the
 // timeout fail callback's pod cleanup can hit as handleCanceling's own

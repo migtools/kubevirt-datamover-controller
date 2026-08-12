@@ -308,8 +308,10 @@ func TestFlattenToRaw(t *testing.T) {
 		}
 	})
 
-	t.Run("outputIsBlockDevice passes -S 0 to disable sparse detection", func(t *testing.T) {
-		// A skipped (sparse) write is safe against a regular file -- an
+	t.Run("outputIsBlockDevice passes -n and -S 0 (skip creation, disable sparse)", func(t *testing.T) {
+		// -n: the block device is already provisioned, so qemu-img shouldn't try
+		// to create/truncate it itself the way it would a fresh regular file.
+		// -S 0: a skipped (sparse) write is safe against a regular file -- an
 		// unwritten range in a fresh/truncated file already reads as zero --
 		// but not against a block device, which can carry leftover data from
 		// whatever previously occupied it. -S 0 forces every byte range to
@@ -329,7 +331,7 @@ func TestFlattenToRaw(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		want := []string{"convert", "-p", "-f", "qcow2", "-O", "raw", "-S", "0", "tip.qcow2", outputPath}
+		want := []string{"convert", "-p", "-f", "qcow2", "-O", "raw", "-n", "-S", "0", "tip.qcow2", outputPath}
 		if !reflect.DeepEqual(gotArgs, want) {
 			t.Errorf("qemu-img args = %v, want %v", gotArgs, want)
 		}

@@ -162,7 +162,16 @@ func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// Accepted: without this, any of the several unbounded-requeue branches below
 	// (waiting on VMB status, waiting on the datamover pod, etc.) would retry
 	// forever instead of eventually failing per Spec.OperationTimeout.
-	timeoutBound := isDataUploadTimeoutBound(dataUpload.Status.Phase)
+	//
+	// A datamover pod that already reported success (AnnotationDatamoverPodSucceeded)
+	// has already committed the uploaded data and the S3 index -- only local
+	// PVC/PV cleanup remains, handled by handleInProgress's own requeue loop.
+	// Failing on the deadline here would report an already-successful backup as
+	// Failed purely because that trailing cleanup took longer than
+	// Spec.OperationTimeout, so skip the timeout check entirely once the pod has
+	// succeeded.
+	timeoutBound := isDataUploadTimeoutBound(dataUpload.Status.Phase) &&
+		dataUpload.Annotations[common.AnnotationDatamoverPodSucceeded] != bslValidatedValue
 	if timeoutBound {
 		if failed, err := r.checkOperationTimeout(ctx, logger, dataUpload); err != nil {
 			if stderrors.Is(err, ErrPodsStillTerminating) {

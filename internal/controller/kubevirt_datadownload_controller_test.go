@@ -157,7 +157,10 @@ func TestDataDownloadReconcile(t *testing.T) {
 
 	t.Run("Cancel requested but restore already provisioned completes instead of canceling", func(t *testing.T) {
 		dd := &velerov2alpha1.DataDownload{
-			ObjectMeta: metav1.ObjectMeta{Name: "test-dd", Namespace: "openshift-adp", UID: types.UID("dd-uid-provisioned")},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-dd", Namespace: "openshift-adp", UID: types.UID("dd-uid-provisioned"),
+				Annotations: map[string]string{AnnotationDownloaderPodSucceeded: downloaderPodSucceededValue},
+			},
 			Spec: velerov2alpha1.DataDownloadSpec{
 				DataMover: common.DataMoverKubeVirt,
 				Cancel:    true,
@@ -511,7 +514,10 @@ func TestDataDownloadReconcile_OperationTimeout(t *testing.T) {
 		// API error right after a successful rebind) must not be misreported as
 		// Failed just because Spec.OperationTimeout has since expired.
 		dd := &velerov2alpha1.DataDownload{
-			ObjectMeta: metav1.ObjectMeta{Name: "dd-timeout-provisioned", Namespace: "openshift-adp", UID: types.UID("dd-timeout-provisioned-uid")},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "dd-timeout-provisioned", Namespace: "openshift-adp", UID: types.UID("dd-timeout-provisioned-uid"),
+				Annotations: map[string]string{AnnotationDownloaderPodSucceeded: downloaderPodSucceededValue},
+			},
 			Spec: velerov2alpha1.DataDownloadSpec{
 				DataMover: common.DataMoverKubeVirt,
 				TargetVolume: velerov2alpha1.TargetVolumeSpec{
@@ -2184,6 +2190,7 @@ func TestHandleInProgressDataDownload(t *testing.T) {
 		// actual claimRef-UID-vs-live-PVC-UID comparison, not the empty-UID
 		// legacy fallback (see the mismatch test below for that branch).
 		f.targetPVC.UID = types.UID("target-pvc-uid")
+		f.dd.Annotations[AnnotationDownloaderPodSucceeded] = downloaderPodSucceededValue
 		reboundPV := &corev1.PersistentVolume{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:   "pv-already-rebound",
@@ -2218,6 +2225,7 @@ func TestHandleInProgressDataDownload(t *testing.T) {
 	t.Run("claimRef UID mismatch does not count as already provisioned", func(t *testing.T) {
 		f := newDDTestFixture(t)
 		scheme := ddScheme()
+		f.dd.Annotations[AnnotationDownloaderPodSucceeded] = downloaderPodSucceededValue
 
 		// The claimRef names the right PVC/namespace, but a different UID -- as if
 		// the target PVC had been deleted and recreated after this PV's claimRef was
@@ -2247,6 +2255,43 @@ func TestHandleInProgressDataDownload(t *testing.T) {
 		}
 		if done {
 			t.Error("expected isRestoreAlreadyProvisioned = false for a claimRef UID mismatch")
+		}
+	})
+
+	t.Run("skips the PV lookup entirely when the downloader pod hasn't succeeded yet", func(t *testing.T) {
+		f := newDDTestFixture(t)
+		scheme := ddScheme()
+
+		// A matching, already-provisioned PV is present, but AnnotationDownloaderPodSucceeded
+		// is deliberately left unset: the PV's claimRef can only ever have been set by
+		// rebindPVToNamespace, which never runs before that annotation is persisted (see
+		// its own doc comment), so this scenario cannot occur for a real DataDownload --
+		// but it proves the guard short-circuits on the annotation rather than reaching
+		// the PV list at all.
+		reboundPV := &corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "pv-already-rebound",
+				Labels: map[string]string{common.LabelDataDownloadUID: string(f.dd.UID)},
+			},
+			Spec: corev1.PersistentVolumeSpec{
+				ClaimRef: &corev1.ObjectReference{
+					Kind:      "PersistentVolumeClaim",
+					Name:      f.targetPVC.Name,
+					Namespace: f.targetPVC.Namespace,
+					UID:       f.targetPVC.UID,
+				},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, f.targetPVC, reboundPV).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		done, err := r.isRestoreAlreadyProvisioned(context.Background(), f.dd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if done {
+			t.Error("expected isRestoreAlreadyProvisioned = false when AnnotationDownloaderPodSucceeded isn't set, regardless of a matching PV existing")
 		}
 	})
 
