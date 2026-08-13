@@ -138,7 +138,8 @@ func main() {
 	flag.IntVar(&maxIncrementalBackups, "max-incremental-backups", 0,
 		"Maximum number of incremental backups per VM before forcing a full backup (0 = unlimited)")
 	flag.IntVar(&maxConcurrentDataMovers, "max-concurrent-data-movers", common.DefaultMaxConcurrentDataMovers,
-		"Maximum number of active DataDownloads (Accepted/Prepared/InProgress) allowed concurrently (0 = unlimited)")
+		"Maximum number of active DataUploads or DataDownloads (per-controller; "+
+			"Accepted/Prepared/InProgress) allowed concurrently (0 = unlimited)")
 	flag.DurationVar(&staleDataUploadThreshold, "stale-dataupload-threshold",
 		common.DefaultStaleDataUploadThreshold,
 		"Duration after which a stale DataUpload stops blocking younger ones for the same VM")
@@ -278,6 +279,7 @@ func main() {
 		Scheme:                   mgr.GetScheme(),
 		Log:                      ctrl.Log.WithName("controllers").WithName("KubeVirtDataUpload"),
 		MaxConcurrentReconciles:  maxConcurrentReconciles,
+		MaxConcurrentDataMovers:  maxConcurrentDataMovers,
 		DatamoverImage:           datamoverImage,
 		DatamoverImagePullPolicy: corev1.PullPolicy(datamoverImagePullPolicy),
 		MaxIncrementalBackups:    maxIncrementalBackups,

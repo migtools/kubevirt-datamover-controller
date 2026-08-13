@@ -4008,6 +4008,177 @@ func TestHandlePrepared(t *testing.T) {
 	}
 }
 
+// TestHandlePreparedDataUpload_ConcurrencyLimit covers issue #174: gating
+// datamover pod creation in handlePrepared against MaxConcurrentDataMovers.
+func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	newFixtureWithOthers := func(otherActiveCount int) (*velerov2alpha1.DataUpload, []runtime.Object) {
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-du",
+				Namespace: "openshift-adp",
+				UID:       types.UID("du-uid-123"),
+				Annotations: map[string]string{
+					common.AnnotationVMName:      "test-vm",
+					common.AnnotationVMNamespace: "vm-ns",
+					AnnotationVMBTName:           "vmbt-test-vm-abc",
+				},
+				Labels: map[string]string{
+					common.LabelVeleroBackupName: "velero-backup",
+				},
+			},
+			Spec: velerov2alpha1.DataUploadSpec{
+				DataMover:             common.DataMoverKubeVirt,
+				BackupStorageLocation: "default",
+				SourceNamespace:       "vm-ns",
+			},
+			Status: velerov2alpha1.DataUploadStatus{
+				Phase: velerov2alpha1.DataUploadPhasePrepared,
+			},
+		}
+
+		bsl := &velerov1.BackupStorageLocation{
+			ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "openshift-adp"},
+			Spec: velerov1.BackupStorageLocationSpec{
+				Provider: "aws",
+				StorageType: velerov1.StorageType{
+					ObjectStorage: &velerov1.ObjectStorageLocation{Bucket: "test-bucket", Prefix: "velero"},
+				},
+				Config: map[string]string{"region": "us-east-1"},
+				Credential: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+					Key:                  "cloud",
+				},
+			},
+		}
+
+		checkpointName := "checkpoint-001"
+		tempPVCName := "kubevirt-backup-test-du-abc12"
+		vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "vmb-test-du",
+				Namespace: "vm-ns",
+				Labels:    map[string]string{common.LabelDataUploadUID: "du-uid-123"},
+			},
+			Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{PvcName: &tempPVCName},
+			Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+				Type:           kubevirtbackupv1alpha1.Full,
+				CheckpointName: &checkpointName,
+			},
+		}
+
+		reboundPVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: common.ReboundPVCNamePrefix + "test-du", Namespace: "openshift-adp"},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				VolumeName:  "pv-123",
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+				},
+			},
+			Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+		}
+
+		objs := make([]runtime.Object, 0, 3+otherActiveCount)
+		objs = append(objs, bsl, vmb, reboundPVC)
+		for i := range otherActiveCount {
+			other := &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("other-du-%d", i), Namespace: "openshift-adp", UID: types.UID(fmt.Sprintf("other-uid-%d", i))},
+				Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+				Status:     velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseInProgress},
+			}
+			objs = append(objs, other)
+		}
+		return du, objs
+	}
+
+	t.Run("proceeds when under the limit", func(t *testing.T) {
+		du, objs := newFixtureWithOthers(2)
+		builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du)
+		for _, obj := range objs {
+			builder = builder.WithRuntimeObjects(obj)
+		}
+		fakeClient := builder.Build()
+		r := &KubeVirtDataUploadReconciler{
+			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 3,
+		}
+
+		if _, err := r.handlePrepared(context.Background(), logr.Discard(), du); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated velerov2alpha1.DataUpload
+		_ = fakeClient.Get(context.Background(), types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, &updated)
+		if updated.Status.Phase != velerov2alpha1.DataUploadPhaseInProgress {
+			t.Errorf("phase = %q, want %q (should proceed: 2 others < limit 3)", updated.Status.Phase, velerov2alpha1.DataUploadPhaseInProgress)
+		}
+	})
+
+	t.Run("requeues without creating a pod when at the limit", func(t *testing.T) {
+		du, objs := newFixtureWithOthers(3)
+		builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du)
+		for _, obj := range objs {
+			builder = builder.WithRuntimeObjects(obj)
+		}
+		fakeClient := builder.Build()
+		r := &KubeVirtDataUploadReconciler{
+			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 3,
+		}
+
+		result, err := r.handlePrepared(context.Background(), logr.Discard(), du)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.RequeueAfter != RequeueAfterLong {
+			t.Errorf("RequeueAfter = %v, want %v", result.RequeueAfter, RequeueAfterLong)
+		}
+
+		var updated velerov2alpha1.DataUpload
+		_ = fakeClient.Get(context.Background(), types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, &updated)
+		if updated.Status.Phase != velerov2alpha1.DataUploadPhasePrepared {
+			t.Errorf("phase = %q, want still %q (at limit 3, must not proceed)", updated.Status.Phase, velerov2alpha1.DataUploadPhasePrepared)
+		}
+
+		pod, err := r.findPodForDataUpload(context.Background(), du, "openshift-adp")
+		if err != nil {
+			t.Fatalf("failed to find pod: %v", err)
+		}
+		if pod != nil {
+			t.Error("expected no datamover pod to be created while gated")
+		}
+	})
+
+	t.Run("unlimited (MaxConcurrentDataMovers=0) always proceeds", func(t *testing.T) {
+		du, objs := newFixtureWithOthers(50)
+		builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du)
+		for _, obj := range objs {
+			builder = builder.WithRuntimeObjects(obj)
+		}
+		fakeClient := builder.Build()
+		r := &KubeVirtDataUploadReconciler{
+			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 0,
+		}
+
+		if _, err := r.handlePrepared(context.Background(), logr.Discard(), du); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated velerov2alpha1.DataUpload
+		_ = fakeClient.Get(context.Background(), types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, &updated)
+		if updated.Status.Phase != velerov2alpha1.DataUploadPhaseInProgress {
+			t.Errorf("phase = %q, want %q (limit disabled, must proceed regardless of active count)", updated.Status.Phase, velerov2alpha1.DataUploadPhaseInProgress)
+		}
+	})
+}
+
 func TestGetCredentialsFromBSL(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov1.AddToScheme(scheme)

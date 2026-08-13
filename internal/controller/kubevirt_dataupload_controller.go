@@ -97,6 +97,12 @@ type KubeVirtDataUploadReconciler struct {
 	// MaxConcurrentReconciles is the maximum number of concurrent Reconciles which can be run
 	MaxConcurrentReconciles int
 
+	// MaxConcurrentDataMovers caps how many DataUploads may be in an active
+	// phase (Accepted/Prepared/InProgress) at once, gating pod creation in
+	// handlePrepared -- covers the full resource window (backup PVC + pod),
+	// not just running pods. 0 (default) disables the limit.
+	MaxConcurrentDataMovers int
+
 	// DatamoverImage is the image to use for datamover pods
 	DatamoverImage string
 
@@ -1008,6 +1014,18 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	podConfig.Namespace = podNamespace
 	podConfig.SourcePVCName = reboundPVCName
 
+	if r.MaxConcurrentDataMovers > 0 {
+		activeCount, err := r.countOtherActiveDataUploads(ctx, du)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if activeCount >= r.MaxConcurrentDataMovers {
+			logger.Info("Deferring datamover pod creation, at concurrent data mover limit",
+				"activeCount", activeCount, "limit", r.MaxConcurrentDataMovers)
+			return ctrl.Result{RequeueAfter: RequeueAfterLong}, nil
+		}
+	}
+
 	// Create the datamover pod
 	podToCreate := buildDatamoverPod(podConfig)
 
@@ -1879,6 +1897,37 @@ func (r *KubeVirtDataUploadReconciler) hasOlderActiveDUForVM(ctx context.Context
 		}
 	}
 	return false, "", nil
+}
+
+// countOtherActiveDataUploads counts kubevirt-datamover DataUploads in du's
+// namespace, excluding du itself, that are in an active phase (Accepted,
+// Prepared, InProgress). Used by handlePrepared to gate pod creation against
+// MaxConcurrentDataMovers -- an active DU already holds its share of the full
+// resource window (backup PVC, mover pod), not just a running pod, so New
+// (pre-provisioning) is deliberately excluded from the count.
+func (r *KubeVirtDataUploadReconciler) countOtherActiveDataUploads(ctx context.Context, du *velerov2alpha1.DataUpload) (int, error) {
+	duList := &velerov2alpha1.DataUploadList{}
+	if err := r.List(ctx, duList, client.InNamespace(du.Namespace)); err != nil {
+		return 0, fmt.Errorf("failed to list DataUploads: %w", err)
+	}
+
+	count := 0
+	for i := range duList.Items {
+		other := &duList.Items[i]
+		if other.UID == du.UID {
+			continue
+		}
+		if other.Spec.DataMover != common.DataMoverKubeVirt {
+			continue
+		}
+		switch other.Status.Phase {
+		case velerov2alpha1.DataUploadPhaseAccepted,
+			velerov2alpha1.DataUploadPhasePrepared,
+			velerov2alpha1.DataUploadPhaseInProgress:
+			count++
+		}
+	}
+	return count, nil
 }
 
 // buildDatamoverPodConfig assembles the configuration for the datamover pod
