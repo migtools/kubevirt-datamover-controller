@@ -56,7 +56,7 @@ func TestResolveCheckpointFiles(t *testing.T) {
 	}
 
 	t.Run("resolves full chain in order", func(t *testing.T) {
-		files, err := resolveCheckpointFiles(
+		files, err := ResolveCheckpointFiles(
 			"default", "fedora-test", []string{"checkpoint-1", "checkpoint-2"}, vmIndex, "disk1")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -73,7 +73,7 @@ func TestResolveCheckpointFiles(t *testing.T) {
 	})
 
 	t.Run("filters by target volume", func(t *testing.T) {
-		files, err := resolveCheckpointFiles("default", "fedora-test", []string{"checkpoint-1"}, vmIndex, "disk2")
+		files, err := ResolveCheckpointFiles("default", "fedora-test", []string{"checkpoint-1"}, vmIndex, "disk2")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -83,14 +83,14 @@ func TestResolveCheckpointFiles(t *testing.T) {
 	})
 
 	t.Run("errors on empty chain", func(t *testing.T) {
-		_, err := resolveCheckpointFiles("default", "fedora-test", nil, vmIndex, "disk1")
+		_, err := ResolveCheckpointFiles("default", "fedora-test", nil, vmIndex, "disk1")
 		if err == nil {
 			t.Fatal("expected error for an empty checkpoint chain")
 		}
 	})
 
 	t.Run("errors on missing checkpoint ID", func(t *testing.T) {
-		_, err := resolveCheckpointFiles(
+		_, err := ResolveCheckpointFiles(
 			"default", "fedora-test", []string{"checkpoint-1", "does-not-exist"}, vmIndex, "disk1")
 		if err == nil {
 			t.Fatal("expected error for missing checkpoint ID")
@@ -98,14 +98,14 @@ func TestResolveCheckpointFiles(t *testing.T) {
 	})
 
 	t.Run("errors on missing disk match", func(t *testing.T) {
-		_, err := resolveCheckpointFiles("default", "fedora-test", []string{"checkpoint-1", "checkpoint-2"}, vmIndex, "disk2")
+		_, err := ResolveCheckpointFiles("default", "fedora-test", []string{"checkpoint-1", "checkpoint-2"}, vmIndex, "disk2")
 		if err == nil {
 			t.Fatal("expected error when checkpoint has no file for target volume")
 		}
 	})
 
 	t.Run("errors on duplicate checkpoint ID in chain", func(t *testing.T) {
-		_, err := resolveCheckpointFiles("default", "fedora-test", []string{"checkpoint-1", "checkpoint-1"}, vmIndex, "disk1")
+		_, err := ResolveCheckpointFiles("default", "fedora-test", []string{"checkpoint-1", "checkpoint-1"}, vmIndex, "disk1")
 		if err == nil {
 			t.Fatal("expected error when a checkpoint ID appears more than once in the chain")
 		}
@@ -120,7 +120,7 @@ func TestResolveCheckpointFiles(t *testing.T) {
 				{ID: "checkpoint-1", Files: []uploader.CheckpointFile{{Filename: "b.qcow2", DiskName: "disk1"}}},
 			},
 		}
-		_, err := resolveCheckpointFiles("default", "fedora-test", []string{"checkpoint-1"}, dupIndex, "disk1")
+		_, err := ResolveCheckpointFiles("default", "fedora-test", []string{"checkpoint-1"}, dupIndex, "disk1")
 		if err == nil {
 			t.Fatal("expected error when the VM index has a duplicate checkpoint ID")
 		}
@@ -141,14 +141,14 @@ func TestResolveCheckpointFiles(t *testing.T) {
 				},
 			},
 		}
-		_, err := resolveCheckpointFiles("default", "fedora-test", []string{"checkpoint-1"}, dupDiskIndex, "disk1")
+		_, err := ResolveCheckpointFiles("default", "fedora-test", []string{"checkpoint-1"}, dupDiskIndex, "disk1")
 		if err == nil {
 			t.Fatal("expected error when a checkpoint has multiple files for the same target volume")
 		}
 	})
 
 	t.Run("errors on reversed chain", func(t *testing.T) {
-		_, err := resolveCheckpointFiles("default", "fedora-test", []string{"checkpoint-2", "checkpoint-1"}, vmIndex, "disk1")
+		_, err := ResolveCheckpointFiles("default", "fedora-test", []string{"checkpoint-2", "checkpoint-1"}, vmIndex, "disk1")
 		if err == nil {
 			t.Fatal("expected error when the chain starts with an incremental instead of a full backup")
 		}
@@ -179,7 +179,7 @@ func TestResolveCheckpointFiles(t *testing.T) {
 				},
 			},
 		}
-		_, err := resolveCheckpointFiles(
+		_, err := ResolveCheckpointFiles(
 			"default", "fedora-test", []string{"checkpoint-1", "checkpoint-3"}, disconnectedIndex, "disk1")
 		if err == nil {
 			t.Fatal("expected error when an incremental's parent does not match the preceding chain entry")
@@ -211,7 +211,7 @@ func TestResolveCheckpointFiles(t *testing.T) {
 				},
 			},
 		}
-		_, err := resolveCheckpointFiles(
+		_, err := ResolveCheckpointFiles(
 			"default", "fedora-test", []string{"checkpoint-1", "checkpoint-2"}, wrongTypeIndex, "disk1")
 		if err == nil {
 			t.Fatal("expected error when a non-first chain entry has a correct parent but is not marked incremental")
@@ -237,7 +237,7 @@ func TestResolveCheckpointFiles(t *testing.T) {
 				},
 			},
 		}
-		_, err := resolveCheckpointFiles("default", "fedora-test", []string{"checkpoint-1"}, tamperedIndex, "disk1")
+		_, err := ResolveCheckpointFiles("default", "fedora-test", []string{"checkpoint-1"}, tamperedIndex, "disk1")
 		if err == nil {
 			t.Fatal("expected error when a file's object path does not match this VM's own checkpoint prefix")
 		}

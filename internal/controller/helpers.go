@@ -18,20 +18,138 @@ package controller
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/go-logr/logr"
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 )
+
+// DefaultOperationTimeout bounds how long a DataUpload/DataDownload may remain
+// in a non-terminal phase after being Accepted when Spec.OperationTimeout is
+// unset or zero. Matches Velero server's own default item-operation-timeout.
+const DefaultOperationTimeout = 4 * time.Hour
+
+// immediateRequeueDelay is used by capRequeueToOperationDeadline in place of a
+// zero RequeueAfter: returning ctrl.Result{RequeueAfter: 0} with a nil error
+// is treated by controller-runtime as "don't requeue," not "requeue now."
+const immediateRequeueDelay = time.Second
+
+// maxEmittedPodLogLines caps how many lines of a datamover/downloader pod's
+// log emitPodLogs re-emits through the controller's own logger. A pod that
+// produced a very large log (e.g. a crash loop with verbose output) would
+// otherwise flood the controller's logs with no bound; keeping only the last
+// N lines still surfaces the most relevant (final) output.
+const maxEmittedPodLogLines = 200
+
+// operationTimeoutExceeded reports whether the time elapsed since acceptedAt
+// exceeds the effective operation timeout: specTimeout when positive, otherwise
+// DefaultOperationTimeout. Returns exceeded=false if acceptedAt is nil (nothing
+// to measure against yet).
+func operationTimeoutExceeded(acceptedAt *metav1.Time, specTimeout time.Duration) (exceeded bool, elapsed, effective time.Duration) {
+	if acceptedAt == nil {
+		return false, 0, 0
+	}
+	effective = specTimeout
+	if effective <= 0 {
+		effective = DefaultOperationTimeout
+	}
+	elapsed = time.Since(acceptedAt.Time)
+	return elapsed >= effective, elapsed, effective
+}
+
+// capRequeueToOperationDeadline caps result.RequeueAfter so a phase handler's
+// own requeue delay (e.g. RequeueAfterLong) can never push the next reconcile
+// past the operation's timeout deadline -- otherwise a short Spec.OperationTimeout
+// could be overshot by however long the handler's own poll interval is before
+// checkOperationTimeout gets a chance to re-evaluate it.
+func capRequeueToOperationDeadline(result ctrl.Result, acceptedAt *metav1.Time, specTimeout time.Duration) ctrl.Result {
+	if result.RequeueAfter <= 0 || acceptedAt == nil {
+		return result
+	}
+	_, elapsed, effective := operationTimeoutExceeded(acceptedAt, specTimeout)
+	remaining := effective - elapsed
+	switch {
+	case remaining <= 0:
+		// The deadline has already passed -- e.g. the phase handler itself took
+		// long enough to run that it crossed the deadline after checkOperationTimeout
+		// last evaluated it. Requeue almost immediately instead of preserving the
+		// handler's original (possibly long) delay, so the next reconcile can fail
+		// it right away rather than waiting out a stale poll interval.
+		result.RequeueAfter = immediateRequeueDelay
+	case remaining < result.RequeueAfter:
+		result.RequeueAfter = remaining
+	}
+	return result
+}
+
+// operationTimeoutTarget adapts a DataUpload/DataDownload to checkOperationTimeoutCore
+// via accessors, since the two are distinct vendored Velero types (different Phase
+// enums, different updatePhase methods) with no shared interface to dispatch on directly.
+// This keeps the backfill / exceeded-check / failure-message logic in exactly one
+// place instead of duplicated per controller.
+type operationTimeoutTarget struct {
+	// acceptedTimestamp returns the resource's current Status.AcceptedTimestamp.
+	acceptedTimestamp func() *metav1.Time
+	// setAcceptedTimestamp backfills Status.AcceptedTimestamp on the in-memory object.
+	setAcceptedTimestamp func(*metav1.Time)
+	// operationTimeout is the resource's Spec.OperationTimeout.Duration.
+	operationTimeout time.Duration
+	// phase returns the resource's current Status.Phase as a string, for logging
+	// and the failure message.
+	phase func() string
+	// persist writes back an in-place mutation (the AcceptedTimestamp backfill)
+	// without also changing phase.
+	persist func(ctx context.Context) error
+	// fail transitions the resource to its Failed phase with the given message.
+	fail func(ctx context.Context, message string) error
+}
+
+// checkOperationTimeoutCore fails the target if too much time has elapsed since
+// it was accepted, per its effective OperationTimeout (falling back to
+// DefaultOperationTimeout when unset -- see operationTimeoutExceeded). Self-heals
+// a missing AcceptedTimestamp -- e.g. a resource already past New when this check
+// was introduced -- by backfilling it to now rather than leaving the operation
+// unbounded forever.
+func checkOperationTimeoutCore(ctx context.Context, logger logr.Logger, resourceKind string, t operationTimeoutTarget) (failed bool, err error) {
+	if t.acceptedTimestamp() == nil {
+		now := metav1.Now()
+		t.setAcceptedTimestamp(&now)
+		logger.Info("Backfilling missing AcceptedTimestamp", "kind", resourceKind, "phase", t.phase())
+		if err := t.persist(ctx); err != nil {
+			return false, fmt.Errorf("failed to backfill AcceptedTimestamp: %w", err)
+		}
+		return false, nil
+	}
+
+	exceeded, elapsed, effective := operationTimeoutExceeded(t.acceptedTimestamp(), t.operationTimeout)
+	if !exceeded {
+		return false, nil
+	}
+
+	logger.Error(nil, resourceKind+" exceeded operation timeout",
+		"phase", t.phase(), "elapsed", elapsed.Round(time.Second), "timeout", effective)
+	// t.fail may fail here either because it couldn't stop a still-running pod or
+	// because persisting the Failed phase itself failed -- either way, propagate
+	// so the reconcile retries rather than silently leaving a pod running behind
+	// a resource that was never actually marked Failed.
+	if err := t.fail(ctx, fmt.Sprintf("operation timed out after %s in phase %s (limit %s)", elapsed.Round(time.Second), t.phase(), effective)); err != nil {
+		return false, fmt.Errorf("failed to fail %s on operation timeout: %w", resourceKind, err)
+	}
+	return true, nil
+}
 
 // getBackupStorageLocation fetches the BSL by name from the OADP namespace,
 // falling back to fallbackNamespace if oadpNamespace is empty.
@@ -53,10 +171,38 @@ func getBackupStorageLocation(ctx context.Context, k8sClient client.Client, bslN
 	return bsl, nil
 }
 
+// isTransientBSLLookupError reports whether an error from getBackupStorageLocation
+// (or its ...ForDU/...ForDD wrappers) is worth retrying (a transient API
+// hiccup or cache-not-yet-synced 404) rather than a definitive "BSL doesn't
+// exist" failure. An empty bslName is always definitive -- a spec-configuration
+// error retrying can never fix -- regardless of what the error itself says.
+// A genuine apierrors.NotFound (the BSL object doesn't exist) is also
+// definitive. Anything else (timeouts, throttling, other API errors) is
+// treated as transient so the caller returns the error for controller-runtime
+// to retry with backoff, instead of terminally failing on something that might
+// resolve on its own.
+func isTransientBSLLookupError(err error, bslName string) bool {
+	return bslName != "" && !errors.IsNotFound(err)
+}
+
 // findPodByUID finds the unique datamover pod associated with a resource UID.
-func findPodByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid, namespace string) (*corev1.Pod, error) {
+// Tries the cached client first; if it finds nothing, retries via apiReader
+// (an uncached read) before the caller concludes the pod is genuinely absent --
+// controller-runtime's informer cache is only eventually consistent, so a pod
+// this same controller created moments ago in an earlier reconcile may not yet
+// be visible to a cached List. apiReader may be nil (falls back to cached-only
+// behavior), so existing callers/tests that don't wire one still work.
+func findPodByUID(ctx context.Context, k8sClient client.Client, apiReader client.Reader, uidLabelKey, uid, namespace string) (*corev1.Pod, error) {
+	pod, err := listPodByUID(ctx, k8sClient, uidLabelKey, uid, namespace)
+	if err != nil || pod != nil || apiReader == nil {
+		return pod, err
+	}
+	return listPodByUID(ctx, apiReader, uidLabelKey, uid, namespace)
+}
+
+func listPodByUID(ctx context.Context, reader client.Reader, uidLabelKey, uid, namespace string) (*corev1.Pod, error) {
 	podList := &corev1.PodList{}
-	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
+	if err := reader.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
 		return nil, err
 	}
 	if len(podList.Items) == 0 {
@@ -68,33 +214,96 @@ func findPodByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid
 	return &podList.Items[0], nil
 }
 
+// ErrPodsStillTerminating marks the expected, self-resolving case where
+// cleanupPodsByUID reports notReady with terminating=true. Not returned by
+// cleanupPodsByUID itself (which reports the distinction directly via its two
+// bool return values) -- callers that must communicate this state through an
+// error-returning interface they don't control (e.g. operationTimeoutTarget's
+// fail callback) wrap it explicitly so a caller further up the stack (e.g. a
+// Reconcile method) can still check stderrors.Is and requeue quietly instead
+// of logging a reconcile error/triggering exponential backoff for something
+// that isn't wrong.
+var ErrPodsStillTerminating = stderrors.New("pods still terminating")
+
 // cleanupPodsByUID deletes all pods matching a UID label in the given namespace
-// and reports whether it's NOT yet safe to proceed as though they're gone.
-// A true return folds together two distinct cases callers should treat the
-// same way (retry on a later reconcile): pods still present (Delete only
-// requests removal — kubelet must still terminate containers and unmount
-// volumes before the pod object actually disappears) and a List failure
-// (unknown state, so conservatively assume cleanup isn't done yet).
-func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid, namespace string, logger logr.Logger) bool {
+// and reports whether it's NOT yet safe to proceed as though they're gone, plus
+// whether that not-ready state is the expected, self-resolving kind.
+//
+// notReady folds together several cases callers should treat the same way
+// (retry on a later reconcile): a List failure (unknown state, so
+// conservatively assume cleanup isn't done yet), a Delete call that failed for
+// a reason other than the pod already being gone, or a pod still present
+// after the delete calls (Delete only requests removal -- kubelet must still
+// terminate containers and unmount volumes before the pod object actually
+// disappears).
+//
+// terminating is true only when notReady is true and every remaining pod
+// already carries a DeletionTimestamp (Delete was accepted, kubelet just
+// hasn't finished tearing it down yet) -- callers on a fast requeue loop can
+// use this to retry quietly instead of treating it as a reconcile error, as
+// opposed to a pod remaining with no DeletionTimestamp at all (a genuine
+// anomaly -- Delete didn't even get accepted -- worth the normal
+// error-and-backoff path). Meaningless when notReady is false.
+//
+// apiReader is an uncached client used as a fallback for both the initial
+// list and the confirmation re-list, if non-nil: a cached client's informer
+// can be stale in either direction here -- it can miss a pod this controller
+// created moments ago (initial list, same staleness findPodByUID guards
+// against), or it can still show a pod that Delete just removed moments ago
+// (confirmation re-list, the opposite direction), which would otherwise
+// report a false "still present" and needlessly retry a cleanup that already
+// succeeded. Missing the initial list entirely would be worse than that: the
+// delete loop would issue no Delete calls at all, so nothing would ever get
+// cleaned up until the cache happened to catch up on some later reconcile.
+func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, apiReader client.Reader, uidLabelKey, uid, namespace string, logger logr.Logger) (notReady, terminating bool) {
 	podList := &corev1.PodList{}
 	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
 		logger.Error(err, "Failed to list datamover pods for cleanup")
-		return true
+		return true, false
 	}
-	for i := range podList.Items {
-		pod := &podList.Items[i]
-		if err := k8sClient.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
-			logger.Error(err, "Failed to delete datamover pod", "pod", pod.Name)
-		} else {
-			logger.Info("Deleted datamover pod", "pod", pod.Name)
+	if len(podList.Items) == 0 && apiReader != nil {
+		if err := apiReader.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
+			logger.Error(err, "Failed to list datamover pods for cleanup via APIReader")
+			return true, false
 		}
 	}
-
-	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
-		logger.Error(err, "Failed to re-check datamover pods after delete")
-		return true
+	deleteFailed := false
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		switch err := k8sClient.Delete(ctx, pod); {
+		case err == nil:
+			logger.Info("Deleted datamover pod", "pod", pod.Name)
+		case errors.IsNotFound(err):
+			logger.V(1).Info("Datamover pod already gone", "pod", pod.Name)
+		default:
+			logger.Error(err, "Failed to delete datamover pod", "pod", pod.Name)
+			deleteFailed = true
+		}
 	}
-	return len(podList.Items) > 0
+	if deleteFailed {
+		return true, false
+	}
+
+	confirmReader := client.Reader(k8sClient)
+	if apiReader != nil {
+		confirmReader = apiReader
+	}
+	remaining := &corev1.PodList{}
+	if err := confirmReader.List(ctx, remaining, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
+		logger.Error(err, "Failed to re-list datamover pods after cleanup")
+		return true, false
+	}
+	if len(remaining.Items) == 0 {
+		return false, false
+	}
+	allTerminating := true
+	for i := range remaining.Items {
+		if remaining.Items[i].DeletionTimestamp == nil {
+			allTerminating = false
+			break
+		}
+	}
+	return true, allTerminating
 }
 
 // extractPodFailureMessage extracts the failure message from a failed pod.

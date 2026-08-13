@@ -345,11 +345,33 @@ func updateVMIndex(
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: config.VMNamespace}, pvc); err != nil {
 				return fmt.Errorf("failed to get PVC %s: %w", pvcName, err)
 			}
-			if storage, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; ok {
-				pvcSizes = append(pvcSizes, storage)
-			} else {
+			storage, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+			if !ok {
 				return fmt.Errorf("missing storage request value in PVC %s", pvcName)
 			}
+			// Prefer the bound PV's actual capacity over the PVC's requested size:
+			// storage backends that enforce a minimum volume size above the request
+			// (e.g. AWS EBS's 1GiB floor) still expose the full underlying block
+			// device to the guest, so a restore needs scratch space sized to the
+			// real capacity, not the smaller request (issue #160). A failure here
+			// must not silently fall back to the (potentially unsafe) requested
+			// size -- that would re-open #160 under a different trigger (a
+			// transient Get error) instead of the original one, so fail the
+			// upload and let it retry rather than publish an undersized index.
+			if pvc.Spec.VolumeName != "" {
+				pv := &corev1.PersistentVolume{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: pvc.Spec.VolumeName}, pv); err != nil {
+					return fmt.Errorf("failed to get bound PV %s for PVC %s: %w", pvc.Spec.VolumeName, pvcName, err)
+				}
+				capacity, ok := pv.Spec.Capacity[corev1.ResourceStorage]
+				if !ok {
+					return fmt.Errorf("bound PV %s for PVC %s has no storage capacity", pvc.Spec.VolumeName, pvcName)
+				}
+				if capacity.Cmp(storage) > 0 {
+					storage = capacity
+				}
+			}
+			pvcSizes = append(pvcSizes, storage)
 		}
 	}
 

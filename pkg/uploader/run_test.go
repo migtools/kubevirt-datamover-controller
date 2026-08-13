@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -1672,6 +1673,220 @@ func TestUpdateVMIndex_DedupIncrementalPreservesParent(t *testing.T) {
 	}
 	assertReferencedBy(t, "cp-001", cp001.ReferencedBy,
 		[]string{"backup-day1", "backup-day2", "backup-retry"})
+}
+
+// TestUpdateVMIndex_PVCSizeUsesBoundPVCapacity covers issue #160: storage
+// backends that enforce a minimum volume size above the request (e.g. AWS
+// EBS's 1GiB floor) still expose the full underlying block device to the
+// guest, so the recorded PVCSizes entry must reflect the bound PV's actual
+// capacity, not the smaller PVC request -- otherwise a later restore
+// undersizes its scratch volume against the real on-disk data.
+func TestUpdateVMIndex_PVCSizeUsesBoundPVCapacity(t *testing.T) {
+	scheme := getTestScheme()
+	store := NewMockObjectStore("test-bucket", "")
+
+	config := &UploaderConfig{
+		ObjectStoreConfig: common.ObjectStoreConfig{
+			BSLBucket: "test-bucket",
+		},
+		VMName:           "test-vm",
+		VMNamespace:      "test-ns",
+		CheckpointName:   "cp-001",
+		BackupType:       "full",
+		VMBName:          "vmb-1",
+		VeleroBackupName: "backup-001",
+	}
+	files := []CheckpointFile{
+		{Filename: "vmb-1-disk1.qcow2", DiskName: "disk1", Size: 512,
+			ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-1-disk1.qcow2"},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "disk1", Namespace: "test-ns"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName: "pv-disk1",
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("150Mi")},
+			},
+		},
+	}
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-disk1"},
+		Spec: corev1.PersistentVolumeSpec{
+			Capacity: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+		},
+	}
+	vm := &kubevirtcorev1.VirtualMachine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-vm", Namespace: "test-ns"},
+		Spec: kubevirtcorev1.VirtualMachineSpec{
+			Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+				Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+					Volumes: []kubevirtcorev1.Volume{
+						{Name: "disk1", VolumeSource: kubevirtcorev1.VolumeSource{
+							DataVolume: &kubevirtcorev1.DataVolumeSource{Name: "disk1"},
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pvc, pv, vm).Build()
+
+	err := updateVMIndex(context.Background(), store, fakeClient, config, files, &archivedPaths{}, logr.Discard())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	result, err := store.GetObjectBytes("checkpoints/test-ns/test-vm/index.json")
+	if err != nil {
+		t.Fatalf("failed to get index: %v", err)
+	}
+	var idx VMIndex
+	if err := json.Unmarshal(result, &idx); err != nil {
+		t.Fatalf("failed to parse index: %v", err)
+	}
+
+	cp := findCheckpoint(idx.Checkpoints, "cp-001")
+	if cp == nil {
+		t.Fatal("cp-001 not found")
+	}
+	if len(cp.PVCSizes) != 1 {
+		t.Fatalf("expected 1 PVCSizes entry, got %d", len(cp.PVCSizes))
+	}
+	want := resource.MustParse("1Gi")
+	if cp.PVCSizes[0].Cmp(want) != 0 {
+		t.Errorf("PVCSizes[0] = %s, want %s (bound PV's actual capacity, not the 150Mi PVC request)",
+			cp.PVCSizes[0].String(), want.String())
+	}
+}
+
+// TestUpdateVMIndex_BoundPVLookupFailureIsFatal covers the failure side of
+// the bound-PV capacity lookup above: if the PV can't be fetched, falling
+// back to the PVC's requested size would silently republish the exact
+// undersized-scratch-space bug (#160) this lookup exists to prevent, just
+// triggered by a different cause (a failed Get instead of a storage-class
+// size floor). The upload must fail instead, so it can be retried rather
+// than persist an unsafe index.
+func TestUpdateVMIndex_BoundPVLookupFailureIsFatal(t *testing.T) {
+	scheme := getTestScheme()
+	store := NewMockObjectStore("test-bucket", "")
+
+	config := &UploaderConfig{
+		ObjectStoreConfig: common.ObjectStoreConfig{
+			BSLBucket: "test-bucket",
+		},
+		VMName:           "test-vm",
+		VMNamespace:      "test-ns",
+		CheckpointName:   "cp-001",
+		BackupType:       "full",
+		VMBName:          "vmb-1",
+		VeleroBackupName: "backup-001",
+	}
+	files := []CheckpointFile{
+		{Filename: "vmb-1-disk1.qcow2", DiskName: "disk1", Size: 512,
+			ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-1-disk1.qcow2"},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "disk1", Namespace: "test-ns"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName: "pv-missing",
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("150Mi")},
+			},
+		},
+	}
+	// Deliberately no PersistentVolume object -- the PVC's VolumeName points at
+	// one that doesn't exist in the fake client.
+	vm := &kubevirtcorev1.VirtualMachine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-vm", Namespace: "test-ns"},
+		Spec: kubevirtcorev1.VirtualMachineSpec{
+			Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+				Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+					Volumes: []kubevirtcorev1.Volume{
+						{Name: "disk1", VolumeSource: kubevirtcorev1.VolumeSource{
+							DataVolume: &kubevirtcorev1.DataVolumeSource{Name: "disk1"},
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pvc, vm).Build()
+
+	err := updateVMIndex(context.Background(), store, fakeClient, config, files, &archivedPaths{}, logr.Discard())
+	if err == nil {
+		t.Fatal("expected an error when the bound PV cannot be fetched, got nil")
+	}
+	if !strings.Contains(err.Error(), "pv-missing") {
+		t.Errorf("error = %q, want it to mention the missing PV name", err.Error())
+	}
+}
+
+// TestUpdateVMIndex_BoundPVNoCapacityIsFatal covers the other half of the
+// bound-PV capacity lookup's failure contract: the PV exists but declares no
+// storage capacity at all (Spec.Capacity has no ResourceStorage entry). Must
+// fail the same way a failed Get does, not silently fall back to the PVC's
+// requested size.
+func TestUpdateVMIndex_BoundPVNoCapacityIsFatal(t *testing.T) {
+	scheme := getTestScheme()
+	store := NewMockObjectStore("test-bucket", "")
+
+	config := &UploaderConfig{
+		ObjectStoreConfig: common.ObjectStoreConfig{
+			BSLBucket: "test-bucket",
+		},
+		VMName:           "test-vm",
+		VMNamespace:      "test-ns",
+		CheckpointName:   "cp-001",
+		BackupType:       "full",
+		VMBName:          "vmb-1",
+		VeleroBackupName: "backup-001",
+	}
+	files := []CheckpointFile{
+		{Filename: "vmb-1-disk1.qcow2", DiskName: "disk1", Size: 512,
+			ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-1-disk1.qcow2"},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "disk1", Namespace: "test-ns"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName: "pv-no-capacity",
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("150Mi")},
+			},
+		},
+	}
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-no-capacity"},
+		// Deliberately no Spec.Capacity entry for ResourceStorage.
+	}
+	vm := &kubevirtcorev1.VirtualMachine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-vm", Namespace: "test-ns"},
+		Spec: kubevirtcorev1.VirtualMachineSpec{
+			Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+				Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+					Volumes: []kubevirtcorev1.Volume{
+						{Name: "disk1", VolumeSource: kubevirtcorev1.VolumeSource{
+							DataVolume: &kubevirtcorev1.DataVolumeSource{Name: "disk1"},
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pvc, pv, vm).Build()
+
+	err := updateVMIndex(context.Background(), store, fakeClient, config, files, &archivedPaths{}, logr.Discard())
+	if err == nil {
+		t.Fatal("expected an error when the bound PV has no storage capacity, got nil")
+	}
+	if !strings.Contains(err.Error(), "pv-no-capacity") || !strings.Contains(err.Error(), "no storage capacity") {
+		t.Errorf("error = %q, want it to mention the PV name and missing capacity", err.Error())
+	}
 }
 
 func TestUpdateBackupManifests(t *testing.T) {

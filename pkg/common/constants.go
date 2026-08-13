@@ -81,6 +81,35 @@ const (
 	// the global --max-incremental-backups setting for that VM.
 	// The value must be a non-negative integer string (e.g., "5"). "0" means unlimited.
 	AnnotationMaxIncrementalBackups = "kubevirt-datamover.io/max-incremental-backups"
+
+	// AnnotationOriginalRunStrategy stores a restored VM's pre-restore run
+	// state so the controller can restore it once every DataDownload
+	// targeting the VM reaches Completed. Always one of the
+	// VirtualMachineRunStrategy enum values (Always/RerunOnFailure/Manual/
+	// Once/Halted) -- if the original VM used the deprecated spec.Running
+	// bool instead of spec.RunStrategy, the plugin normalizes it to
+	// "Always"/"Halted" before stashing, so the controller never parses a
+	// bool here. See AnnotationOriginalRunStrategySource for which field to
+	// write the value back to.
+	AnnotationOriginalRunStrategy = "kubevirt-datamover.io/original-run-strategy"
+
+	// AnnotationOriginalRunStrategySource records which field the VM used
+	// pre-restore ("runStrategy" or "running", see the RunStrategySource*
+	// constants) so the controller writes AnnotationOriginalRunStrategy's
+	// value back to the same field the user had, instead of silently
+	// migrating them off the deprecated bool field as a side effect of
+	// restore.
+	AnnotationOriginalRunStrategySource = "kubevirt-datamover.io/original-run-strategy-source"
+)
+
+// Values for AnnotationOriginalRunStrategySource.
+const (
+	// RunStrategySourceRunStrategy indicates the VM used spec.RunStrategy pre-restore.
+	RunStrategySourceRunStrategy = "runStrategy"
+
+	// RunStrategySourceRunning indicates the VM used the deprecated
+	// spec.Running bool pre-restore.
+	RunStrategySourceRunning = "running"
 )
 
 // Label keys for resources created by the controller.
@@ -111,6 +140,28 @@ const (
 
 	// LabelVeleroRestoreName is the label key for the Velero restore name.
 	LabelVeleroRestoreName = "velero.io/restore-name"
+
+	// LabelScratchVolumeRole distinguishes a DataDownload's scratch PVCs when
+	// a Block-mode restore target needs two: a Filesystem "work" PVC staging
+	// the downloaded qcow2 chain, and a Block "output" PVC receiving the
+	// final flattened image (which gets rebound onto the restore target).
+	// Unset on the single scratch PVC used by a Filesystem-mode restore
+	// target, which needs only one and serves both roles.
+	LabelScratchVolumeRole = "kubevirt-datamover.io/scratch-volume-role"
+)
+
+// Scratch volume role values used with LabelScratchVolumeRole. Only present
+// on a Block-mode restore target's two scratch PVCs -- a Filesystem-mode
+// target's single scratch PVC carries no role label.
+const (
+	// ScratchVolumeRoleWork identifies the Filesystem-mode PVC that stages
+	// the downloaded qcow2 chain.
+	ScratchVolumeRoleWork = "work"
+
+	// ScratchVolumeRoleOutput identifies the Block-mode PVC that receives
+	// the final flattened raw disk image and gets rebound onto the restore
+	// target.
+	ScratchVolumeRoleOutput = "output"
 )
 
 // Naming conventions for resources

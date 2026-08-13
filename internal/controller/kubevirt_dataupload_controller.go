@@ -20,6 +20,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -81,6 +82,14 @@ type KubeVirtDataUploadReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	Log    logr.Logger
+
+	// APIReader is an uncached client, used as a fallback when the cached client's
+	// List returns no results for a child resource this controller expects to
+	// exist -- the informer cache is only eventually consistent, so a resource
+	// created moments ago in an earlier reconcile may not yet be visible to it.
+	// May be nil (falls back to cached-only lookups), so tests that don't wire
+	// one keep working.
+	APIReader client.Reader
 
 	// OADPNamespace is the namespace where OADP and Velero resources are located
 	OADPNamespace string
@@ -149,19 +158,54 @@ func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.R
 		"dataUpload", req.NamespacedName,
 		"phase", dataUpload.Status.Phase)
 
+	// Bound how long a DataUpload may sit in a non-terminal phase after being
+	// Accepted: without this, any of the several unbounded-requeue branches below
+	// (waiting on VMB status, waiting on the datamover pod, etc.) would retry
+	// forever instead of eventually failing per Spec.OperationTimeout.
+	//
+	// A datamover pod that already reported success (AnnotationDatamoverPodSucceeded)
+	// has already committed the uploaded data and the S3 index -- only local
+	// PVC/PV cleanup remains, handled by handleInProgress's own requeue loop.
+	// Failing on the deadline here would report an already-successful backup as
+	// Failed purely because that trailing cleanup took longer than
+	// Spec.OperationTimeout, so skip the timeout check entirely once the pod has
+	// succeeded.
+	timeoutBound := isDataUploadTimeoutBound(dataUpload.Status.Phase) &&
+		dataUpload.Annotations[common.AnnotationDatamoverPodSucceeded] != bslValidatedValue
+	if timeoutBound {
+		if failed, err := r.checkOperationTimeout(ctx, logger, dataUpload); err != nil {
+			if stderrors.Is(err, ErrPodsStillTerminating) {
+				// Expected, self-resolving: kubelet just hasn't finished tearing the
+				// stalled pod down yet. Requeue quickly without logging a reconcile
+				// error or triggering controller-runtime's exponential backoff for
+				// something that isn't wrong -- matches handleCanceling's treatment
+				// of the same error. The DataUpload isn't marked Failed yet; the next
+				// reconcile re-enters this same timeout check and retries the fail
+				// callback (including re-persisting Failed) once cleanup succeeds.
+				logger.V(1).Info("Datamover pod(s) still terminating during timeout cleanup, will retry", "error", err)
+				return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+			}
+			return ctrl.Result{}, err
+		} else if failed {
+			return ctrl.Result{}, nil
+		}
+	}
+
 	// Handle based on current phase
+	var result ctrl.Result
+	var err error
 	switch dataUpload.Status.Phase {
 	case "", velerov2alpha1.DataUploadPhaseNew:
-		return r.handleNew(ctx, logger, dataUpload)
+		result, err = r.handleNew(ctx, logger, dataUpload)
 
 	case velerov2alpha1.DataUploadPhaseAccepted:
-		return r.handleAccepted(ctx, logger, dataUpload)
+		result, err = r.handleAccepted(ctx, logger, dataUpload)
 
 	case velerov2alpha1.DataUploadPhasePrepared:
-		return r.handlePrepared(ctx, logger, dataUpload)
+		result, err = r.handlePrepared(ctx, logger, dataUpload)
 
 	case velerov2alpha1.DataUploadPhaseInProgress:
-		return r.handleInProgress(ctx, logger, dataUpload)
+		result, err = r.handleInProgress(ctx, logger, dataUpload)
 
 	case velerov2alpha1.DataUploadPhaseCanceling:
 		return r.handleCanceling(ctx, logger, dataUpload)
@@ -177,6 +221,16 @@ func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.R
 		logger.Info("Unknown DataUpload phase", "phase", dataUpload.Status.Phase)
 		return ctrl.Result{}, nil
 	}
+
+	// Cap the handler's RequeueAfter to the operation deadline. The condition keys off
+	// dataUpload.Status.AcceptedTimestamp (rather than the pre-dispatch timeoutBound)
+	// so a New DataUpload that handleNew just transitioned to Accepted in this same
+	// reconcile -- setting AcceptedTimestamp along the way -- gets its first
+	// RequeueAfter capped too, not just subsequent reconciles.
+	if err == nil && dataUpload.Status.AcceptedTimestamp != nil {
+		result = capRequeueToOperationDeadline(result, dataUpload.Status.AcceptedTimestamp, dataUpload.Spec.OperationTimeout.Duration)
+	}
+	return result, err
 }
 
 // handleNew processes DataUploads in New phase
@@ -221,12 +275,78 @@ func (r *KubeVirtDataUploadReconciler) handleNew(ctx context.Context, logger log
 
 	logger.Info("VM validation passed", "vmName", vmRef.Name, "vmNamespace", vmRef.Namespace)
 
+	// Record when this DataUpload was accepted so checkOperationTimeout can bound
+	// how long it's allowed to remain non-terminal against Spec.OperationTimeout.
+	now := metav1.Now()
+	du.Status.AcceptedTimestamp = &now
+
 	// Transition to Accepted phase
 	if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseAccepted, "DataUpload accepted by kubevirt datamover"); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+}
+
+// isDataUploadTimeoutBound reports whether phase is one of the non-terminal
+// phases (Accepted, Prepared, InProgress) subject to Spec.OperationTimeout
+// enforcement. Kept as the single source of truth for that phase set so a
+// future phase added to the dispatch switch below can't silently drift out of
+// sync with which phases get timeout-checked.
+func isDataUploadTimeoutBound(phase velerov2alpha1.DataUploadPhase) bool {
+	switch phase {
+	case velerov2alpha1.DataUploadPhaseAccepted,
+		velerov2alpha1.DataUploadPhasePrepared,
+		velerov2alpha1.DataUploadPhaseInProgress:
+		return true
+	default:
+		return false
+	}
+}
+
+// checkOperationTimeout fails du if too much time has elapsed since it was
+// accepted, per Spec.OperationTimeout (falling back to DefaultOperationTimeout
+// when unset). Self-heals a missing AcceptedTimestamp -- e.g. a DataUpload
+// already past New when this check was introduced -- by backfilling it to now
+// rather than leaving the operation unbounded forever. A thin adapter over
+// checkOperationTimeoutCore (in helpers.go), shared with DataDownload's own
+// checkOperationTimeout: DataUpload and DataDownload are distinct vendored
+// Velero types with no common interface to dispatch the backfill / exceeded-check
+// / failure-message logic on directly, so each controller adapts via accessors
+// instead of duplicating that logic.
+func (r *KubeVirtDataUploadReconciler) checkOperationTimeout(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload) (failed bool, err error) {
+	return checkOperationTimeoutCore(ctx, logger, "DataUpload", operationTimeoutTarget{
+		acceptedTimestamp:    func() *metav1.Time { return du.Status.AcceptedTimestamp },
+		setAcceptedTimestamp: func(t *metav1.Time) { du.Status.AcceptedTimestamp = t },
+		operationTimeout:     du.Spec.OperationTimeout.Duration,
+		phase:                func() string { return string(du.Status.Phase) },
+		persist:              func(ctx context.Context) error { return r.Update(ctx, du) },
+		fail: func(ctx context.Context, message string) error {
+			// Capture the stalled pod's logs before deleting it -- on a timeout the
+			// pod is usually still running, and its logs are the only evidence of
+			// why it stalled. Best-effort: a lookup failure here shouldn't block
+			// the actual cleanup/fail below.
+			if pod, findErr := r.findPodForDataUpload(ctx, du, r.getPodNamespace(du)); findErr == nil && pod != nil {
+				r.emitPodLogs(ctx, logger, pod)
+			}
+			// Stop the still-running datamover pod BEFORE persisting Failed, and
+			// propagate a cleanup failure rather than swallowing it: a timeout can
+			// fire while the pod is still Pending/Running (that's exactly the
+			// unbounded-wait branch this timeout guards against), unlike the other
+			// Failed paths where the pod has already terminated on its own. Failed
+			// is a dead-end terminal state with no further reconciliation, so
+			// persisting it before cleanup actually succeeds would leave the pod
+			// running forever with no chance to retry -- returning the error here
+			// instead lets the reconcile retry until cleanup succeeds.
+			if cleanupNotReady, terminating := cleanupPodsByUID(ctx, r.Client, r.APIReader, common.LabelDataUploadUID, string(du.UID), r.getPodNamespace(du), logger); cleanupNotReady {
+				if terminating {
+					return fmt.Errorf("datamover pod still terminating before failing DataUpload on timeout: %w", ErrPodsStillTerminating)
+				}
+				return fmt.Errorf("datamover pod cleanup could not be confirmed before failing DataUpload on timeout")
+			}
+			return r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, message)
+		},
+	})
 }
 
 // handleAccepted processes DataUploads in Accepted phase
@@ -266,6 +386,9 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	if du.Spec.BackupStorageLocation != "" {
 		bslObj, err := r.getBackupStorageLocationForDU(ctx, du)
 		if err != nil {
+			if isTransientBSLLookupError(err, du.Spec.BackupStorageLocation) {
+				return ctrl.Result{}, fmt.Errorf("failed to get BackupStorageLocation: %w", err)
+			}
 			logger.Error(err, "BackupStorageLocation not accessible")
 			if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
 				fmt.Sprintf("BackupStorageLocation not accessible: %v", err)); updateErr != nil {
@@ -762,6 +885,9 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	// Get BackupStorageLocation
 	bsl, err := r.getBackupStorageLocationForDU(ctx, du)
 	if err != nil {
+		if isTransientBSLLookupError(err, du.Spec.BackupStorageLocation) {
+			return ctrl.Result{}, fmt.Errorf("failed to get BackupStorageLocation: %w", err)
+		}
 		logger.Error(err, "Failed to get BackupStorageLocation")
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Failed to get BSL: %v", err)); err != nil {
 			return ctrl.Result{}, err
@@ -809,7 +935,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 			"sourceNamespace", vmRef.Namespace,
 			"targetNamespace", podNamespace)
 
-		rebindResult, err := rebindPVToNamespace(ctx, r.Client, logger, sourcePVCName, vmRef.Namespace, podNamespace, du.Name, string(du.UID), common.LabelDataUploadUID, common.AnnotationDataUploadName)
+		rebindResult, err := rebindPVToNamespace(ctx, r.Client, logger, sourcePVCName, vmRef.Namespace, podNamespace, du.Name, string(du.UID), common.LabelDataUploadUID, common.AnnotationDataUploadName, BindTargetCreate, "")
 		if err != nil {
 			// Fail without retry: PV rebind is a multi-step operation (delete PVC, patch PV, create new PVC).
 			// If it fails partway through, automatic retries could leave resources in an inconsistent state.
@@ -1021,11 +1147,22 @@ func (r *KubeVirtDataUploadReconciler) emitPodLogs(ctx context.Context, logger l
 		return
 	}
 	lines := strings.Split(strings.TrimRight(logs, "\n"), "\n")
+	skipped := 0
+	if len(lines) > maxEmittedPodLogLines {
+		skipped = len(lines) - maxEmittedPodLogLines
+		lines = lines[skipped:]
+	}
+	if skipped > 0 {
+		logger.Info("Datamover pod log truncated",
+			"source", "datamover-pod",
+			"pod", pod.Name,
+			"skippedLeadingLines", skipped)
+	}
 	for i, line := range lines {
 		logger.Info("Datamover pod log",
 			"source", "datamover-pod",
 			"pod", pod.Name,
-			"line", i+1,
+			"line", skipped+i+1,
 			"message", line)
 	}
 }
@@ -1037,7 +1174,7 @@ func (r *KubeVirtDataUploadReconciler) emitPodLogs(ctx context.Context, logger l
 // a later reconcile retry once the pod is confirmed gone.
 // See https://github.com/migtools/kubevirt-datamover-controller/issues/171.
 func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, podNamespace string) bool {
-	if cleanupNotReady := cleanupPodsByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), podNamespace, logger); cleanupNotReady {
+	if cleanupNotReady, _ := cleanupPodsByUID(ctx, r.Client, r.APIReader, common.LabelDataUploadUID, string(du.UID), podNamespace, logger); cleanupNotReady {
 		logger.Info("Datamover pod still terminating (or its status couldn't be confirmed), deferring PVC/PV cleanup to next reconcile")
 		return false
 	}
@@ -1109,7 +1246,11 @@ func (r *KubeVirtDataUploadReconciler) handleCanceling(ctx context.Context, logg
 
 // updatePhase updates the DataUpload phase and status message
 // Uses Update instead of Status().Patch() to match Velero's approach,
-// which works regardless of whether the CRD has status subresource enabled
+// which works regardless of whether the CRD has status subresource enabled --
+// confirmed via `oc get crd datauploads.velero.io -o jsonpath='{.spec.versions[*].subresources}'`
+// (empty {}): it does not, so Status().Update() would be a no-op here, not an
+// equally-valid alternative. checkOperationTimeoutCore's AcceptedTimestamp
+// backfill persist callback uses the same r.Update() for the same reason.
 func (r *KubeVirtDataUploadReconciler) updatePhase(ctx context.Context, du *velerov2alpha1.DataUpload, phase velerov2alpha1.DataUploadPhase, message string) error {
 	logger := log.FromContext(ctx)
 
@@ -1124,6 +1265,14 @@ func (r *KubeVirtDataUploadReconciler) updatePhase(ctx context.Context, du *vele
 	du.Status.Phase = phase
 	du.Status.Message = message
 
+	now := metav1.Now()
+	if phase == velerov2alpha1.DataUploadPhaseInProgress && du.Status.StartTimestamp == nil {
+		du.Status.StartTimestamp = &now
+	}
+	if isTerminalDataUploadPhase(phase) && du.Status.CompletionTimestamp == nil {
+		du.Status.CompletionTimestamp = &now
+	}
+
 	if err := r.Update(ctx, du); err != nil {
 		logger.Error(err, "Failed to update DataUpload phase",
 			"dataUpload", du.Name,
@@ -1137,6 +1286,18 @@ func (r *KubeVirtDataUploadReconciler) updatePhase(ctx context.Context, du *vele
 		"message", message)
 
 	return nil
+}
+
+// isTerminalDataUploadPhase reports whether phase is one of DataUpload's
+// terminal phases (Completed/Failed/Canceled), used by updatePhase to know
+// when to set Status.CompletionTimestamp.
+func isTerminalDataUploadPhase(phase velerov2alpha1.DataUploadPhase) bool {
+	switch phase {
+	case velerov2alpha1.DataUploadPhaseCompleted, velerov2alpha1.DataUploadPhaseFailed, velerov2alpha1.DataUploadPhaseCanceled:
+		return true
+	default:
+		return false
+	}
 }
 
 // getPodNamespace returns the namespace where datamover pods should run.
@@ -1187,16 +1348,13 @@ func (r *KubeVirtDataUploadReconciler) filterKubeVirtDataMover() predicate.Predi
 // while DataUpload is in OADP namespace (cross-namespace owner refs not allowed).
 // The PVC will be cleaned up during PV rebinding or explicit cleanup.
 func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, namespace string) (*corev1.PersistentVolumeClaim, error) {
-	pvcList := &corev1.PersistentVolumeClaimList{}
-	if err := r.List(ctx, pvcList, client.InNamespace(namespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
-		return nil, fmt.Errorf("failed to list temporary PVCs: %w", err)
+	existing, err := r.findTempPVC(ctx, du, namespace)
+	if err != nil {
+		return nil, err
 	}
-	if len(pvcList.Items) > 1 {
-		return nil, fmt.Errorf("found multiple temporary PVCs for DataUpload %s", du.Name)
-	}
-	if len(pvcList.Items) == 1 {
-		logger.V(1).Info("Temporary PVC already exists", "pvc", pvcList.Items[0].Name)
-		return &pvcList.Items[0], nil
+	if existing != nil {
+		logger.V(1).Info("Temporary PVC already exists", "pvc", existing.Name)
+		return existing, nil
 	}
 
 	pvcSize, err := r.calculateBackupPVCSize(ctx, logger, du, namespace)
@@ -1234,6 +1392,33 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 
 	logger.Info("Created temporary PVC", "generateName", pvc.GenerateName, "namespace", namespace, "size", pvcSize.String())
 	return pvc, nil
+}
+
+// findTempPVC finds the unique temporary backup PVC for a DataUpload, if any.
+// Tries the cached client first; if it finds nothing, retries via APIReader
+// (an uncached read) before the caller concludes none exists -- the informer
+// cache is only eventually consistent, so a PVC created moments ago in an
+// earlier reconcile may not yet be visible to a cached List.
+func (r *KubeVirtDataUploadReconciler) findTempPVC(ctx context.Context, du *velerov2alpha1.DataUpload, namespace string) (*corev1.PersistentVolumeClaim, error) {
+	pvc, err := listTempPVC(ctx, r.Client, du, namespace)
+	if err != nil || pvc != nil || r.APIReader == nil {
+		return pvc, err
+	}
+	return listTempPVC(ctx, r.APIReader, du, namespace)
+}
+
+func listTempPVC(ctx context.Context, reader client.Reader, du *velerov2alpha1.DataUpload, namespace string) (*corev1.PersistentVolumeClaim, error) {
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	if err := reader.List(ctx, pvcList, client.InNamespace(namespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		return nil, fmt.Errorf("failed to list temporary PVCs: %w", err)
+	}
+	if len(pvcList.Items) > 1 {
+		return nil, fmt.Errorf("found multiple temporary PVCs for DataUpload %s", du.Name)
+	}
+	if len(pvcList.Items) == 1 {
+		return &pvcList.Items[0], nil
+	}
+	return nil, nil
 }
 
 // sizeOverheadPercent is the percentage added on top of source PVC capacity when
@@ -1570,10 +1755,22 @@ func (r *KubeVirtDataUploadReconciler) getBackupStorageLocationForDU(ctx context
 	return bsl, nil
 }
 
-// findVMBForDataUpload finds the unique VirtualMachineBackup associated with a DataUpload.
+// findVMBForDataUpload finds the unique VirtualMachineBackup associated with a
+// DataUpload. Tries the cached client first; if it finds nothing, retries via
+// APIReader (an uncached read) before the caller concludes none exists -- the
+// informer cache is only eventually consistent, so a VMB created moments ago in
+// an earlier reconcile may not yet be visible to a cached List.
 func (r *KubeVirtDataUploadReconciler) findVMBForDataUpload(ctx context.Context, du *velerov2alpha1.DataUpload, namespace string) (*kubevirtbackupv1alpha1.VirtualMachineBackup, error) {
+	vmb, err := listVMBForDataUpload(ctx, r.Client, du, namespace)
+	if err != nil || vmb != nil || r.APIReader == nil {
+		return vmb, err
+	}
+	return listVMBForDataUpload(ctx, r.APIReader, du, namespace)
+}
+
+func listVMBForDataUpload(ctx context.Context, reader client.Reader, du *velerov2alpha1.DataUpload, namespace string) (*kubevirtbackupv1alpha1.VirtualMachineBackup, error) {
 	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
-	if err := r.List(ctx, vmbList, client.InNamespace(namespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+	if err := reader.List(ctx, vmbList, client.InNamespace(namespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
 		return nil, err
 	}
 	if len(vmbList.Items) == 0 {
@@ -1797,5 +1994,5 @@ func (r *KubeVirtDataUploadReconciler) lookupCheckpointFromBSL(ctx context.Conte
 
 // findPodForDataUpload finds the unique datamover pod associated with a DataUpload.
 func (r *KubeVirtDataUploadReconciler) findPodForDataUpload(ctx context.Context, du *velerov2alpha1.DataUpload, namespace string) (*corev1.Pod, error) {
-	return findPodByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), namespace)
+	return findPodByUID(ctx, r.Client, r.APIReader, common.LabelDataUploadUID, string(du.UID), namespace)
 }

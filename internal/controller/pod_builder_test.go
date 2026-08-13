@@ -17,10 +17,12 @@ limitations under the License.
 package controller
 
 import (
+	"path"
 	"strings"
 	"testing"
 
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/downloader"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
 	corev1 "k8s.io/api/core/v1"
 )
@@ -115,7 +117,8 @@ func TestBuildDatamoverPod(t *testing.T) {
 				NameAnnotationKey:    common.AnnotationDataDownloadName,
 				CredentialSecretName: "cloud-credentials",
 				CredentialSecretKey:  "cloud",
-				SourcePVCName:        "restore-scratch-pvc",
+				ScratchPVCName:       "restore-scratch-pvc",
+				TargetVolume:         "vm-disk-1",
 			},
 			validate: func(t *testing.T, pod *corev1.Pod) {
 				if pod.Labels[common.LabelDatamoverPod] != "download" {
@@ -133,6 +136,229 @@ func TestBuildDatamoverPod(t *testing.T) {
 				}
 				if len(container.Command) != 2 || container.Command[0] != "/manager" || container.Command[1] != "download" {
 					t.Errorf("container command = %v, want [/manager download]", container.Command)
+				}
+			},
+		},
+		{
+			name: "download mode with unset label/annotation keys defaults to DataDownload, not DataUpload",
+			config: &DatamoverPodConfig{
+				OperationMode: OperationModeDownload,
+				Name:          "test-dl",
+				Namespace:     "test-ns",
+				Image:         "quay.io/test/datamover:latest",
+				ResourceName:  "test-dd",
+				ResourceUID:   "uid-dl-456",
+				// UIDLabelKey/NameAnnotationKey deliberately left unset.
+			},
+			validate: func(t *testing.T, pod *corev1.Pod) {
+				if _, ok := pod.Labels[common.LabelDataUploadUID]; ok {
+					t.Error("download-mode pod with unset UIDLabelKey must not fall back to the DataUpload UID label")
+				}
+				if pod.Labels[common.LabelDataDownloadUID] != "uid-dl-456" {
+					t.Errorf("label %s = %q, want %q", common.LabelDataDownloadUID, pod.Labels[common.LabelDataDownloadUID], "uid-dl-456")
+				}
+				if _, ok := pod.Annotations[common.AnnotationDataUploadName]; ok {
+					t.Error("download-mode pod with unset NameAnnotationKey must not fall back to the DataUpload name annotation")
+				}
+				if pod.Annotations[common.AnnotationDataDownloadName] != "test-dd" {
+					t.Errorf("annotation %s = %q, want %q", common.AnnotationDataDownloadName, pod.Annotations[common.AnnotationDataDownloadName], "test-dd")
+				}
+			},
+		},
+		{
+			name: "download mode environment variables are set correctly",
+			config: &DatamoverPodConfig{
+				OperationMode:            OperationModeDownload,
+				Name:                     "test-dl",
+				Namespace:                "test-ns",
+				Image:                    "quay.io/test/datamover:latest",
+				BSLProvider:              "aws",
+				BSLBucket:                "my-bucket",
+				BSLPrefix:                "my-prefix",
+				BSLRegion:                "eu-west-1",
+				BSLS3URL:                 "https://minio.example.com",
+				BSLS3ForcePathStyle:      "true",
+				BSLInsecureSkipTLSVerify: "false",
+				BSLCACert:                "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----",
+				CredentialSecretName:     "cloud-credentials",
+				CredentialSecretKey:      "cloud",
+				VMName:                   "my-vm",
+				VMNamespace:              "my-ns",
+				VeleroBackupName:         "velero-backup",
+				ResourceName:             "dd-001",
+				ResourceUID:              "uid-dl-001",
+				UIDLabelKey:              common.LabelDataDownloadUID,
+				NameAnnotationKey:        common.AnnotationDataDownloadName,
+				ScratchPVCName:           "scratch-pvc-001",
+				TargetVolume:             "vm-disk-1",
+			},
+			validate: func(t *testing.T, pod *corev1.Pod) {
+				container := pod.Spec.Containers[0]
+				envMap := make(map[string]string)
+				for _, env := range container.Env {
+					envMap[env.Name] = env.Value
+				}
+
+				expectedEnvs := map[string]string{
+					common.EnvBSLProvider:              "aws",
+					common.EnvBSLBucket:                "my-bucket",
+					common.EnvBSLPrefix:                "my-prefix",
+					common.EnvBSLRegion:                "eu-west-1",
+					common.EnvBSLS3URL:                 "https://minio.example.com",
+					common.EnvBSLS3ForcePathStyle:      "true",
+					common.EnvBSLInsecureSkipTLSVerify: "false",
+					common.EnvBSLCACert:                "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----",
+					common.EnvCredentialsFile:          common.DefaultCredentialsPath,
+					downloader.EnvVMName:               "my-vm",
+					downloader.EnvVMNamespace:          "my-ns",
+					downloader.EnvVeleroBackupName:     "velero-backup",
+					downloader.EnvDataDownloadName:     "dd-001",
+					downloader.EnvDataDownloadUID:      "uid-dl-001",
+					downloader.EnvTargetVolume:         "vm-disk-1",
+					downloader.EnvScratchPath:          downloader.DefaultScratchPath,
+				}
+
+				for key, expected := range expectedEnvs {
+					if envMap[key] != expected {
+						t.Errorf("env %s = %q, want %q", key, envMap[key], expected)
+					}
+				}
+
+				// TargetPath must be disk.img at the scratch mount root -- the
+				// download pod has only one read-write volume, so the flattened raw
+				// image and the downloaded qcow2 chain share it until the final PV
+				// rebind, and disk.img matches the CDI/KubeVirt filesystem-mode
+				// PVC convention since this PV is rebound as the restore target.
+				targetPath := envMap[downloader.EnvTargetPath]
+				expectedTargetPath := path.Join(downloader.DefaultScratchPath, "disk.img")
+				if targetPath != expectedTargetPath {
+					t.Errorf("env %s = %q, want %q", downloader.EnvTargetPath, targetPath, expectedTargetPath)
+				}
+
+				// Upload-only env vars must not leak into download-mode pods.
+				for _, key := range []string{
+					uploader.EnvSourcePVCPath,
+					uploader.EnvCheckpointName,
+					uploader.EnvBackupType,
+					uploader.EnvVMBName,
+					uploader.EnvVMBTName,
+					uploader.EnvDataUploadName,
+					uploader.EnvDataUploadUID,
+					common.EnvBSLKMSKeyName,
+				} {
+					if _, ok := envMap[key]; ok {
+						t.Errorf("upload-only env %s should not be set in download mode", key)
+					}
+				}
+			},
+		},
+		{
+			name: "download mode volume mounts are configured correctly",
+			config: &DatamoverPodConfig{
+				OperationMode:        OperationModeDownload,
+				Name:                 "test-dl",
+				Namespace:            "test-ns",
+				Image:                "test-image",
+				CredentialSecretName: "cloud-creds",
+				CredentialSecretKey:  "credentials",
+				ScratchPVCName:       "scratch-pvc-001",
+			},
+			validate: func(t *testing.T, pod *corev1.Pod) {
+				container := pod.Spec.Containers[0]
+
+				if len(container.VolumeMounts) != 3 {
+					t.Fatalf("expected 3 volume mounts, got %d", len(container.VolumeMounts))
+				}
+
+				var scratchMount, credsMount, saTokenMount *corev1.VolumeMount
+				for i := range container.VolumeMounts {
+					switch container.VolumeMounts[i].Name {
+					case scratchDataVolumeName:
+						scratchMount = &container.VolumeMounts[i]
+					case cloudCredentialsVolumeName:
+						credsMount = &container.VolumeMounts[i]
+					case boundSATokenVolumeName:
+						saTokenMount = &container.VolumeMounts[i]
+					}
+				}
+
+				if scratchMount == nil {
+					t.Fatal("scratch-data volume mount not found")
+				}
+				if scratchMount.MountPath != downloader.DefaultScratchPath {
+					t.Errorf("scratch-data mount path = %q, want %q", scratchMount.MountPath, downloader.DefaultScratchPath)
+				}
+				if scratchMount.ReadOnly {
+					t.Error("scratch-data mount must be read-write (downloader writes the flattened image into it)")
+				}
+
+				if credsMount == nil {
+					t.Fatal("cloud-credentials volume mount not found")
+				}
+				expectedCredentialsDir := path.Dir(common.DefaultCredentialsPath)
+				if credsMount.MountPath != expectedCredentialsDir {
+					t.Errorf("cloud-credentials mount path = %q, want %q", credsMount.MountPath, expectedCredentialsDir)
+				}
+				if !credsMount.ReadOnly {
+					t.Error("cloud-credentials mount should be read-only")
+				}
+
+				if saTokenMount == nil {
+					t.Fatal("bound-sa-token volume mount not found")
+				}
+				if !saTokenMount.ReadOnly {
+					t.Error("bound-sa-token mount should be read-only")
+				}
+
+				if len(pod.Spec.Volumes) != 3 {
+					t.Fatalf("expected 3 volumes, got %d", len(pod.Spec.Volumes))
+				}
+
+				var pvcVolume, credentialsVolume *corev1.Volume
+				for i := range pod.Spec.Volumes {
+					switch pod.Spec.Volumes[i].Name {
+					case scratchDataVolumeName:
+						pvcVolume = &pod.Spec.Volumes[i]
+					case cloudCredentialsVolumeName:
+						credentialsVolume = &pod.Spec.Volumes[i]
+					}
+				}
+				if pvcVolume == nil || pvcVolume.PersistentVolumeClaim == nil {
+					t.Fatal("scratch-data PVC volume not found")
+				}
+				if pvcVolume.PersistentVolumeClaim.ClaimName != "scratch-pvc-001" {
+					t.Errorf("PVC claim name = %q, want %q", pvcVolume.PersistentVolumeClaim.ClaimName, "scratch-pvc-001")
+				}
+				if pvcVolume.PersistentVolumeClaim.ReadOnly {
+					t.Error("scratch-data PVC volume source must not be read-only")
+				}
+
+				if credentialsVolume == nil || credentialsVolume.Secret == nil {
+					t.Fatal("cloud-credentials secret volume not found")
+				}
+				if credentialsVolume.Secret.SecretName != "cloud-creds" {
+					t.Errorf("secret name = %q, want %q", credentialsVolume.Secret.SecretName, "cloud-creds")
+				}
+				if credentialsVolume.Secret.DefaultMode == nil || *credentialsVolume.Secret.DefaultMode != 0400 {
+					t.Errorf("credentials default mode = %v, want 0400", credentialsVolume.Secret.DefaultMode)
+				}
+				if len(credentialsVolume.Secret.Items) != 1 {
+					t.Errorf("credential item count = %d, want 1", len(credentialsVolume.Secret.Items))
+				} else {
+					item := credentialsVolume.Secret.Items[0]
+					if item.Key != "credentials" {
+						t.Errorf("credential key = %q, want %q", item.Key, "credentials")
+					}
+					if item.Path != path.Base(common.DefaultCredentialsPath) {
+						t.Errorf("credential path = %q, want %q", item.Path, path.Base(common.DefaultCredentialsPath))
+					}
+				}
+
+				// Upload-only backup-data mount must not be present.
+				for _, vm := range container.VolumeMounts {
+					if vm.Name == backupDataVolumeName {
+						t.Error("upload-only backup-data mount should not be present in download mode")
+					}
 				}
 			},
 		},
@@ -221,9 +447,9 @@ func TestBuildDatamoverPod(t *testing.T) {
 				var backupMount, credsMount, saTokenMount *corev1.VolumeMount
 				for i := range container.VolumeMounts {
 					switch container.VolumeMounts[i].Name {
-					case "backup-data":
+					case backupDataVolumeName:
 						backupMount = &container.VolumeMounts[i]
-					case "cloud-credentials":
+					case cloudCredentialsVolumeName:
 						credsMount = &container.VolumeMounts[i]
 					case "bound-sa-token":
 						saTokenMount = &container.VolumeMounts[i]
@@ -268,9 +494,9 @@ func TestBuildDatamoverPod(t *testing.T) {
 				var pvcVolume, secretVolume, saTokenVolume *corev1.Volume
 				for i := range pod.Spec.Volumes {
 					switch pod.Spec.Volumes[i].Name {
-					case "backup-data":
+					case backupDataVolumeName:
 						pvcVolume = &pod.Spec.Volumes[i]
-					case "cloud-credentials":
+					case cloudCredentialsVolumeName:
 						secretVolume = &pod.Spec.Volumes[i]
 					case "bound-sa-token":
 						saTokenVolume = &pod.Spec.Volumes[i]
@@ -382,6 +608,117 @@ func TestBuildDatamoverPod(t *testing.T) {
 			}
 			tt.validate(t, pod)
 		})
+	}
+}
+
+// TestBuildDatamoverPod_BlockModeTarget covers the two-scratch-volume design
+// for restoring into a Block-mode target: OutputPVCName set means a second,
+// Block-mode volume is added as a raw volumeDevice (not a filesystem mount),
+// EnvTargetPath points at its device path instead of a file inside the
+// (still-present, Filesystem-mode) scratch volume, and
+// EnvTargetIsBlockDevice is "true" so the downloader knows to skip the
+// temp-file+rename publish dance.
+func TestBuildDatamoverPod_BlockModeTarget(t *testing.T) {
+	config := &DatamoverPodConfig{
+		OperationMode:        OperationModeDownload,
+		Name:                 "test-dl-block",
+		Namespace:            "test-ns",
+		Image:                "test-image",
+		CredentialSecretName: "cloud-creds",
+		CredentialSecretKey:  "credentials",
+		ScratchPVCName:       "scratch-work-pvc",
+		OutputPVCName:        "scratch-output-pvc",
+	}
+
+	pod := buildDatamoverPod(config)
+	container := pod.Spec.Containers[0]
+
+	if len(container.VolumeMounts) != 3 {
+		t.Fatalf("expected 3 volume mounts (scratch work, credentials, sa-token), got %d", len(container.VolumeMounts))
+	}
+	foundScratchMount := false
+	for _, m := range container.VolumeMounts {
+		if m.Name == scratchDataVolumeName {
+			foundScratchMount = true
+			if m.MountPath != downloader.DefaultScratchPath {
+				t.Errorf("scratch mount path = %q, want %q", m.MountPath, downloader.DefaultScratchPath)
+			}
+		}
+	}
+	if !foundScratchMount {
+		t.Error("expected the Filesystem-mode scratch (qcow2 staging) volume mount to still be present")
+	}
+
+	if len(container.VolumeDevices) != 1 {
+		t.Fatalf("expected exactly 1 volume device, got %d", len(container.VolumeDevices))
+	}
+	if container.VolumeDevices[0].Name != restoreOutputVolumeName {
+		t.Errorf("volume device name = %q, want %q", container.VolumeDevices[0].Name, restoreOutputVolumeName)
+	}
+	if container.VolumeDevices[0].DevicePath != defaultOutputDevicePath {
+		t.Errorf("volume device path = %q, want %q", container.VolumeDevices[0].DevicePath, defaultOutputDevicePath)
+	}
+
+	var foundOutputVolume bool
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == restoreOutputVolumeName {
+			foundOutputVolume = true
+			if v.PersistentVolumeClaim == nil || v.PersistentVolumeClaim.ClaimName != config.OutputPVCName {
+				t.Errorf("output volume PVC = %+v, want claimName %q", v.PersistentVolumeClaim, config.OutputPVCName)
+			}
+		}
+	}
+	if !foundOutputVolume {
+		t.Error("expected a pod volume for OutputPVCName")
+	}
+
+	var targetPathEnv, isBlockDeviceEnv string
+	for _, e := range container.Env {
+		switch e.Name {
+		case downloader.EnvTargetPath:
+			targetPathEnv = e.Value
+		case downloader.EnvTargetIsBlockDevice:
+			isBlockDeviceEnv = e.Value
+		}
+	}
+	if targetPathEnv != defaultOutputDevicePath {
+		t.Errorf("%s = %q, want %q", downloader.EnvTargetPath, targetPathEnv, defaultOutputDevicePath)
+	}
+	if isBlockDeviceEnv != "true" {
+		t.Errorf("%s = %q, want %q", downloader.EnvTargetIsBlockDevice, isBlockDeviceEnv, "true")
+	}
+}
+
+// TestBuildDatamoverPod_FilesystemModeTarget_NoVolumeDevices covers the
+// unchanged Filesystem-mode path: OutputPVCName unset means no volume device
+// is added at all, and EnvTargetIsBlockDevice is "false".
+func TestBuildDatamoverPod_FilesystemModeTarget_NoVolumeDevices(t *testing.T) {
+	config := &DatamoverPodConfig{
+		OperationMode:        OperationModeDownload,
+		Name:                 "test-dl-fs",
+		Namespace:            "test-ns",
+		Image:                "test-image",
+		CredentialSecretName: "cloud-creds",
+		CredentialSecretKey:  "credentials",
+		ScratchPVCName:       "scratch-pvc",
+	}
+
+	pod := buildDatamoverPod(config)
+	container := pod.Spec.Containers[0]
+
+	if len(container.VolumeDevices) != 0 {
+		t.Errorf("expected no volume devices for a Filesystem-mode target, got %+v", container.VolumeDevices)
+	}
+	envMap := make(map[string]string, len(container.Env))
+	for _, e := range container.Env {
+		envMap[e.Name] = e.Value
+	}
+	got, ok := envMap[downloader.EnvTargetIsBlockDevice]
+	if !ok {
+		t.Fatalf("%s must always be set so the downloader can select the publish path", downloader.EnvTargetIsBlockDevice)
+	}
+	if got != "false" {
+		t.Errorf("%s = %q, want %q", downloader.EnvTargetIsBlockDevice, got, "false")
 	}
 }
 

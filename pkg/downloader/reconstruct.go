@@ -41,6 +41,12 @@ var runQemuImg = func(ctx context.Context, args ...string) (stdout, stderr strin
 	return outBuf.String(), errBuf.String(), err
 }
 
+// statOutputPath is a package var so tests can simulate a block device
+// target (os.ModeDevice requires a real device node, which isn't portable
+// to create in a test) without shelling out to mknod, mirroring the
+// runQemuImg injection pattern above.
+var statOutputPath = os.Stat
+
 // rebaseChain repoints each qcow2 file's backing-file reference (after the
 // first) onto the local path of its predecessor in the chain. The backing
 // path recorded at backup time refers to a path on the backup pod's
@@ -118,38 +124,106 @@ func inspectQcow2(ctx context.Context, path string) (qcow2Info, error) {
 // single flat raw disk image. qemu-img convert transparently follows the
 // backing chain, so this handles both a lone full backup (chain length 1)
 // and a full-plus-incrementals chain uniformly.
-func flattenToRaw(ctx context.Context, chainTipPath, outputPath string) error {
+//
+// outputIsBlockDevice must be true when outputPath is a raw block device (not
+// a regular file inside a mounted filesystem): unlinking a device special-file
+// node destroys the pod's only path to that volume for the rest of its
+// lifetime, unlike a disposable regular file that's safe to remove and retry,
+// so error paths skip removal in that case. Chmod'ing a device node's
+// permission bits is also skipped -- that's kubelet/CSI's responsibility for
+// a device special file, not application code's, and this pod's own copy of
+// the node is ephemeral (freshly created by kubelet per-pod) so any change
+// here wouldn't persist to future consumers anyway.
+func flattenToRaw(ctx context.Context, chainTipPath, outputPath string, outputIsBlockDevice bool) error {
+	removeOnError := func() {
+		if !outputIsBlockDevice {
+			_ = os.Remove(outputPath)
+		}
+	}
+
+	// A block device target must already exist as a device special file --
+	// kubelet/CSI provisions it, not this pod. Omitting O_CREATE below means
+	// a missing path fails loudly here with ENOENT; this Stat additionally
+	// catches the case where something exists at the path but isn't actually
+	// a device node (e.g. a misconfigured test or caller), which a bare
+	// OpenFile wouldn't distinguish from the happy path.
+	if outputIsBlockDevice {
+		info, err := statOutputPath(outputPath)
+		if err != nil {
+			return fmt.Errorf("output block device %q not found: %w", outputPath, err)
+		}
+		// os.ModeDevice alone matches BOTH block and character device
+		// special files -- a character device isn't a valid raw-disk write
+		// target, so it must be explicitly excluded rather than accepted
+		// alongside genuine block devices.
+		if info.Mode()&os.ModeDevice == 0 || info.Mode()&os.ModeCharDevice != 0 {
+			return fmt.Errorf("output path %q is not a block device", outputPath)
+		}
+	}
+
 	// Pre-create the output file with restrictive permissions: qemu-img
 	// convert writes into an existing file in place rather than recreating
 	// it, so this avoids a window where the restored VM disk briefly exists
 	// with the process's default (more permissive) umask. O_TRUNC and an
 	// explicit Chmod make this correct even if outputPath already existed
 	// with different content or permissions — the O_CREATE mode argument
-	// alone is only applied when the file doesn't already exist.
-	f, err := os.OpenFile(outputPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	// alone is only applied when the file doesn't already exist. A block
+	// device target omits O_CREATE entirely (verified to already exist
+	// above) so a race where it disappears between the Stat and this Open
+	// still fails loudly instead of silently creating a regular file in its
+	// place; O_TRUNC is still a safe no-op against a device node (the kernel
+	// ignores truncate semantics for special files). The Chmod calls below
+	// are skipped entirely for a block device target instead, rather than
+	// relying on that being a no-op too.
+	openFlags := os.O_CREATE | os.O_TRUNC | os.O_WRONLY
+	if outputIsBlockDevice {
+		openFlags = os.O_TRUNC | os.O_WRONLY
+	}
+	f, err := os.OpenFile(outputPath, openFlags, 0o600)
 	if err != nil {
 		return fmt.Errorf("failed to pre-create raw image %q: %w", outputPath, err)
 	}
-	if err := f.Chmod(0o600); err != nil {
-		_ = f.Close()
-		_ = os.Remove(outputPath)
-		return fmt.Errorf("failed to pre-create raw image %q: %w", outputPath, err)
+	if !outputIsBlockDevice {
+		if err := f.Chmod(0o600); err != nil {
+			_ = f.Close()
+			removeOnError()
+			return fmt.Errorf("failed to pre-create raw image %q: %w", outputPath, err)
+		}
 	}
 	if err := f.Close(); err != nil {
-		_ = os.Remove(outputPath)
+		removeOnError()
 		return fmt.Errorf("failed to pre-create raw image %q: %w", outputPath, err)
 	}
 
-	_, stderr, err := runQemuImg(ctx, "convert", "-p", "-f", "qcow2", "-O", "raw", chainTipPath, outputPath)
+	convertArgs := []string{"convert", "-p", "-f", "qcow2", "-O", "raw"}
+	if outputIsBlockDevice {
+		// -n skips qemu-img's own target-volume creation step: the block device
+		// is already provisioned (by Kubernetes, at its full size) rather than
+		// something qemu-img should be creating/truncating itself the way it
+		// would for a fresh regular-file target.
+		//
+		// -S 0 disables qemu-img's sparse-detection: without it, a zero-filled
+		// region of the source image is skipped rather than written, which is
+		// safe for a regular file (an unwritten range in a fresh/truncated file
+		// already reads as zero) but not for a block device -- a reused PV's
+		// device node can carry leftover data from whatever previously occupied
+		// it, and a skipped write there would leave that stale data in place
+		// instead of the source image's actual (zero) content.
+		convertArgs = append(convertArgs, "-n", "-S", "0")
+	}
+	convertArgs = append(convertArgs, chainTipPath, outputPath)
+	_, stderr, err := runQemuImg(ctx, convertArgs...)
 	if err != nil {
-		_ = os.Remove(outputPath)
+		removeOnError()
 		return fmt.Errorf("failed to flatten %q to raw %q: %w (%s)", chainTipPath, outputPath, err, stderr)
 	}
-	// Kept as defense in depth in case convert ever recreates the file
-	// instead of writing in place.
-	if err := os.Chmod(outputPath, 0o600); err != nil {
-		_ = os.Remove(outputPath)
-		return fmt.Errorf("failed to restrict permissions on raw image %q: %w", outputPath, err)
+	if !outputIsBlockDevice {
+		// Kept as defense in depth in case convert ever recreates the file
+		// instead of writing in place.
+		if err := os.Chmod(outputPath, 0o600); err != nil {
+			removeOnError()
+			return fmt.Errorf("failed to restrict permissions on raw image %q: %w", outputPath, err)
+		}
 	}
 	return nil
 }

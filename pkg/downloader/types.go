@@ -44,14 +44,15 @@ import "github.com/migtools/kubevirt-datamover-controller/pkg/common"
 // for the canonical definitions and their values, referenced directly at
 // call sites instead of re-exported here.
 const (
-	EnvVMName           = "KUBEVIRT_DM_VM_NAME"
-	EnvVMNamespace      = "KUBEVIRT_DM_VM_NAMESPACE"
-	EnvVeleroBackupName = "KUBEVIRT_DM_VELERO_BACKUP_NAME"
-	EnvDataDownloadName = "KUBEVIRT_DM_DATADOWNLOAD_NAME"
-	EnvDataDownloadUID  = "KUBEVIRT_DM_DATADOWNLOAD_UID"
-	EnvTargetVolume     = "KUBEVIRT_DM_TARGET_VOLUME"
-	EnvTargetPath       = "KUBEVIRT_DM_TARGET_PATH"
-	EnvScratchPath      = "KUBEVIRT_DM_SCRATCH_PATH"
+	EnvVMName              = "KUBEVIRT_DM_VM_NAME"
+	EnvVMNamespace         = "KUBEVIRT_DM_VM_NAMESPACE"
+	EnvVeleroBackupName    = "KUBEVIRT_DM_VELERO_BACKUP_NAME"
+	EnvDataDownloadName    = "KUBEVIRT_DM_DATADOWNLOAD_NAME"
+	EnvDataDownloadUID     = "KUBEVIRT_DM_DATADOWNLOAD_UID"
+	EnvTargetVolume        = "KUBEVIRT_DM_TARGET_VOLUME"
+	EnvTargetPath          = "KUBEVIRT_DM_TARGET_PATH"
+	EnvScratchPath         = "KUBEVIRT_DM_SCRATCH_PATH"
+	EnvTargetIsBlockDevice = "KUBEVIRT_DM_TARGET_IS_BLOCK_DEVICE"
 )
 
 // Default paths and values
@@ -86,6 +87,13 @@ type DownloaderConfig struct {
 
 	// TargetPath is where the reconstructed raw disk image is written.
 	TargetPath string
+
+	// TargetIsBlockDevice reports whether TargetPath is a raw block device
+	// (a rebound Block-mode PV, mounted as a volumeDevice) rather than a
+	// regular file path inside a mounted filesystem. Block-mode restores use
+	// a second, separate volume for this -- the qcow2 chain is always staged
+	// on the Filesystem-mode ScratchPath, regardless of the target's mode.
+	TargetIsBlockDevice bool
 
 	// ScratchPath is where downloaded qcow2 checkpoint files are staged.
 	ScratchPath string

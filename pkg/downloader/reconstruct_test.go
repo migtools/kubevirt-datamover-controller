@@ -23,7 +23,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 func withFakeQemuImg(t *testing.T, fn func(ctx context.Context, args ...string) (string, string, error)) {
@@ -31,6 +33,44 @@ func withFakeQemuImg(t *testing.T, fn func(ctx context.Context, args ...string) 
 	original := runQemuImg
 	runQemuImg = fn
 	t.Cleanup(func() { runQemuImg = original })
+}
+
+// fakeDeviceFileInfo implements os.FileInfo for a path that isn't a real
+// device node (mknod isn't portable in a test), reporting a caller-chosen
+// mode so flattenToRaw's block-device validation can be exercised against
+// both a genuine block device and a character device.
+type fakeDeviceFileInfo struct {
+	name string
+	mode os.FileMode
+}
+
+func (f fakeDeviceFileInfo) Name() string       { return f.name }
+func (f fakeDeviceFileInfo) Size() int64        { return 0 }
+func (f fakeDeviceFileInfo) Mode() os.FileMode  { return f.mode }
+func (f fakeDeviceFileInfo) ModTime() time.Time { return time.Time{} }
+func (f fakeDeviceFileInfo) IsDir() bool        { return false }
+func (f fakeDeviceFileInfo) Sys() any           { return nil }
+
+// withFakeBlockDevice stubs statOutputPath so a plain regular file at path
+// is treated as an existing block device, letting tests exercise
+// flattenToRaw's outputIsBlockDevice branches without a real device node.
+func withFakeBlockDevice(t *testing.T, path string) {
+	t.Helper()
+	withFakeStatMode(t, path, os.ModeDevice)
+}
+
+// withFakeStatMode stubs statOutputPath so path reports mode, letting tests
+// simulate device nodes (block or character) without a real one.
+func withFakeStatMode(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+	original := statOutputPath
+	statOutputPath = func(p string) (os.FileInfo, error) {
+		if p == path {
+			return fakeDeviceFileInfo{name: filepath.Base(path), mode: mode}, nil
+		}
+		return original(p)
+	}
+	t.Cleanup(func() { statOutputPath = original })
 }
 
 const (
@@ -217,7 +257,7 @@ func TestFlattenToRaw(t *testing.T) {
 			gotArgs = args
 			return "", "", nil
 		})
-		if err := flattenToRaw(context.Background(), "tip.qcow2", outputPath); err != nil {
+		if err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, false); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		want := []string{"convert", "-p", "-f", "qcow2", "-O", "raw", "tip.qcow2", outputPath}
@@ -241,7 +281,7 @@ func TestFlattenToRaw(t *testing.T) {
 			called = true
 			return "", fakeBoomErr, errors.New("qemu-img failed")
 		})
-		err := flattenToRaw(context.Background(), "tip.qcow2", outputPath)
+		err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, false)
 		if err == nil {
 			t.Fatal("expected error from failing qemu-img convert")
 		}
@@ -259,12 +299,112 @@ func TestFlattenToRaw(t *testing.T) {
 		withFakeQemuImg(t, func(_ context.Context, _ ...string) (string, string, error) {
 			return "", fakeBoomErr, errors.New("qemu-img failed")
 		})
-		if err := flattenToRaw(context.Background(), "tip.qcow2", outputPath); err == nil {
+		if err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, false); err == nil {
 			t.Fatal("expected error from failing qemu-img convert")
 		}
 
 		if _, statErr := os.Stat(outputPath); !os.IsNotExist(statErr) {
 			t.Errorf("expected partial output file to be removed, stat err = %v", statErr)
+		}
+	})
+
+	t.Run("outputIsBlockDevice passes -n and -S 0 (skip creation, disable sparse)", func(t *testing.T) {
+		// -n: the block device is already provisioned, so qemu-img shouldn't try
+		// to create/truncate it itself the way it would a fresh regular file.
+		// -S 0: a skipped (sparse) write is safe against a regular file -- an
+		// unwritten range in a fresh/truncated file already reads as zero --
+		// but not against a block device, which can carry leftover data from
+		// whatever previously occupied it. -S 0 forces every byte range to
+		// actually be written.
+		outputPath := filepath.Join(t.TempDir(), "disk.raw")
+		if err := os.WriteFile(outputPath, nil, 0o600); err != nil {
+			t.Fatalf("failed to seed output file: %v", err)
+		}
+		withFakeBlockDevice(t, outputPath)
+
+		var gotArgs []string
+		withFakeQemuImg(t, func(_ context.Context, args ...string) (string, string, error) {
+			gotArgs = args
+			return "", "", nil
+		})
+		if err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, true); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		want := []string{"convert", "-p", "-f", "qcow2", "-O", "raw", "-n", "-S", "0", "tip.qcow2", outputPath}
+		if !reflect.DeepEqual(gotArgs, want) {
+			t.Errorf("qemu-img args = %v, want %v", gotArgs, want)
+		}
+	})
+
+	t.Run("outputIsBlockDevice leaves the output path alone on failure", func(t *testing.T) {
+		// Models a raw block device target: unlinking it would destroy the
+		// pod's only path to that volume, unlike a disposable regular file.
+		outputPath := filepath.Join(t.TempDir(), "disk.raw")
+		if err := os.WriteFile(outputPath, []byte("partial"), 0o600); err != nil {
+			t.Fatalf("failed to seed partial output file: %v", err)
+		}
+		withFakeBlockDevice(t, outputPath)
+
+		withFakeQemuImg(t, func(_ context.Context, _ ...string) (string, string, error) {
+			return "", fakeBoomErr, errors.New("qemu-img failed")
+		})
+		if err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, true); err == nil {
+			t.Fatal("expected error from failing qemu-img convert")
+		}
+
+		if _, statErr := os.Stat(outputPath); statErr != nil {
+			t.Errorf("expected output path to be left alone (outputIsBlockDevice=true), stat err = %v", statErr)
+		}
+	})
+
+	t.Run("outputIsBlockDevice rejects a missing device path", func(t *testing.T) {
+		outputPath := filepath.Join(t.TempDir(), "does-not-exist.raw")
+
+		err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, true)
+		if err == nil {
+			t.Fatal("expected error for missing block device path")
+		}
+		if !strings.Contains(err.Error(), "not found") {
+			t.Errorf("error = %q, want it to reference the missing device", err)
+		}
+	})
+
+	t.Run("outputIsBlockDevice rejects a path that isn't a device node", func(t *testing.T) {
+		// A regular file at the target path (e.g. misconfigured caller)
+		// must be rejected instead of silently written into, since the
+		// whole point of the block-device path is to write directly onto
+		// an existing kubelet/CSI-provisioned device.
+		outputPath := filepath.Join(t.TempDir(), "not-a-device.raw")
+		if err := os.WriteFile(outputPath, []byte("regular file"), 0o600); err != nil {
+			t.Fatalf("failed to seed regular file: %v", err)
+		}
+
+		err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, true)
+		if err == nil {
+			t.Fatal("expected error for non-device output path")
+		}
+		if !strings.Contains(err.Error(), "not a block device") {
+			t.Errorf("error = %q, want it to reference the device-type mismatch", err)
+		}
+	})
+
+	t.Run("outputIsBlockDevice rejects a character device", func(t *testing.T) {
+		// os.ModeDevice alone doesn't distinguish block from character
+		// devices -- a character device (e.g. /dev/null-like special file)
+		// isn't a valid raw-disk write target and must be rejected too.
+		outputPath := filepath.Join(t.TempDir(), "char-device.raw")
+		if err := os.WriteFile(outputPath, []byte("placeholder"), 0o600); err != nil {
+			t.Fatalf("failed to seed placeholder file: %v", err)
+		}
+		withFakeStatMode(t, outputPath, os.ModeDevice|os.ModeCharDevice)
+
+		err := flattenToRaw(context.Background(), "tip.qcow2", outputPath, true)
+		if err == nil {
+			t.Fatal("expected error for character-device output path")
+		}
+		if !strings.Contains(err.Error(), "not a block device") {
+			t.Errorf("error = %q, want it to reference the device-type mismatch", err)
 		}
 	})
 }
@@ -299,7 +439,7 @@ func TestRebaseChainAndFlattenToRawWithRealQemuImg(t *testing.T) {
 	if err := rebaseChain(context.Background(), []string{fullPath, incPath}); err != nil {
 		t.Fatalf("rebaseChain failed against real qemu-img: %v", err)
 	}
-	if err := flattenToRaw(context.Background(), incPath, outputPath); err != nil {
+	if err := flattenToRaw(context.Background(), incPath, outputPath, false); err != nil {
 		t.Fatalf("flattenToRaw failed against real qemu-img: %v", err)
 	}
 

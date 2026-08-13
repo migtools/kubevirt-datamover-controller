@@ -7,6 +7,13 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
   - persistentvolumeclaims
   verbs:
   - create
@@ -85,6 +92,7 @@ rules:
   verbs:
   - get
   - list
+  - update
   - watch
 - apiGroups:
   - velero.io
@@ -97,6 +105,7 @@ rules:
 - apiGroups:
   - velero.io
   resources:
+  - datadownloads
   - datauploads
   verbs:
   - get
@@ -107,6 +116,7 @@ rules:
 - apiGroups:
   - velero.io
   resources:
+  - datadownloads/status
   - datauploads/status
   verbs:
   - get
