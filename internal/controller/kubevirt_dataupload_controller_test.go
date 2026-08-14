@@ -3364,18 +3364,19 @@ func TestBuildDatamoverPodConfig(t *testing.T) {
 	_ = velerov1.AddToScheme(scheme)
 
 	tests := []struct {
-		name           string
-		du             *velerov2alpha1.DataUpload
-		bsl            *velerov1.BackupStorageLocation
-		vmb            *kubevirtbackupv1alpha1.VirtualMachineBackup
-		vmRef          *common.VMReference
-		backupType     string
-		checkpointName string
-		vmbtName       string
-		datamoverImage string
-		expectError    bool
-		errorContains  string
-		validate       func(*testing.T, *DatamoverPodConfig)
+		name               string
+		du                 *velerov2alpha1.DataUpload
+		bsl                *velerov1.BackupStorageLocation
+		vmb                *kubevirtbackupv1alpha1.VirtualMachineBackup
+		vmRef              *common.VMReference
+		backupType         string
+		expectedBackupType string
+		checkpointName     string
+		vmbtName           string
+		datamoverImage     string
+		expectError        bool
+		errorContains      string
+		validate           func(*testing.T, *DatamoverPodConfig)
 	}{
 		{
 			name: "valid config",
@@ -3420,12 +3421,13 @@ func TestBuildDatamoverPodConfig(t *testing.T) {
 					Namespace: "vm-ns",
 				},
 			},
-			vmRef:          &common.VMReference{Name: "my-vm", Namespace: "vm-ns"},
-			backupType:     "full",
-			checkpointName: "checkpoint-001",
-			vmbtName:       "vmbt-my-vm-xyz",
-			datamoverImage: "quay.io/test/datamover:v1",
-			expectError:    false,
+			vmRef:              &common.VMReference{Name: "my-vm", Namespace: "vm-ns"},
+			backupType:         "full",
+			expectedBackupType: "incremental",
+			checkpointName:     "checkpoint-001",
+			vmbtName:           "vmbt-my-vm-xyz",
+			datamoverImage:     "quay.io/test/datamover:v1",
+			expectError:        false,
 			validate: func(t *testing.T, config *DatamoverPodConfig) {
 				if config.Name != "test-du" {
 					t.Errorf("Name = %q, want %q", config.Name, "test-du")
@@ -3453,6 +3455,9 @@ func TestBuildDatamoverPodConfig(t *testing.T) {
 				}
 				if config.BackupType != "full" {
 					t.Errorf("BackupType = %q, want %q", config.BackupType, "full")
+				}
+				if config.ExpectedBackupType != "incremental" {
+					t.Errorf("ExpectedBackupType = %q, want %q", config.ExpectedBackupType, "incremental")
 				}
 				if config.CheckpointName != "checkpoint-001" {
 					t.Errorf("CheckpointName = %q, want %q", config.CheckpointName, "checkpoint-001")
@@ -3592,6 +3597,7 @@ func TestBuildDatamoverPodConfig(t *testing.T) {
 				tt.vmb,
 				tt.vmRef,
 				tt.backupType,
+				tt.expectedBackupType,
 				tt.checkpointName,
 				tt.vmbtName,
 			)

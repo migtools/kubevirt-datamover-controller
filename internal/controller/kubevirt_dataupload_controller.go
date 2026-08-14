@@ -965,6 +965,8 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	// Detect mismatch between expected and actual backup type.
 	// This catches the case where the controller allowed incremental but
 	// virt-controller performed a full backup (e.g., VM lost its libvirt checkpoint).
+	// The expected type is forwarded to the datamover pod so the uploader can
+	// correct the S3 checkpoint index (record a full backup with no parent).
 	expectedBackupType := du.Annotations[common.AnnotationExpectedBackupType]
 	if expectedBackupType != "" && !strings.EqualFold(expectedBackupType, backupType) {
 		logger.Info("Backup type mismatch detected: VM may have lost its libvirt checkpoint",
@@ -993,7 +995,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	}
 
 	// Build datamover pod config - now using OADP namespace and rebound PVC
-	podConfig, err := r.buildDatamoverPodConfig(du, bsl, vmb, vmRef, backupType, checkpointName, vmbtName)
+	podConfig, err := r.buildDatamoverPodConfig(du, bsl, vmb, vmRef, backupType, expectedBackupType, checkpointName, vmbtName)
 	if err != nil {
 		logger.Error(err, "Failed to build datamover pod config")
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Failed to build pod config: %v", err)); err != nil {
@@ -1886,6 +1888,7 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 	vmb *kubevirtbackupv1alpha1.VirtualMachineBackup,
 	vmRef *common.VMReference,
 	backupType string,
+	expectedBackupType string,
 	checkpointName string,
 	vmbtName string,
 ) (*DatamoverPodConfig, error) {
@@ -1949,6 +1952,7 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		VMNamespace:                    vmRef.Namespace,
 		CheckpointName:                 checkpointName,
 		BackupType:                     backupType,
+		ExpectedBackupType:             expectedBackupType,
 		VeleroBackupName:               getVeleroBackupName(du.Labels),
 		ResourceName:                   du.Name,
 		ResourceUID:                    string(du.UID),

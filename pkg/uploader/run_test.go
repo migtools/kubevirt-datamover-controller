@@ -824,6 +824,156 @@ func TestUpdateVMIndex(t *testing.T) {
 	}
 }
 
+func TestUpdateVMIndex_BackupTypeMismatch(t *testing.T) {
+	scheme := getTestScheme()
+
+	tests := []struct {
+		name           string
+		config         *UploaderConfig
+		existingIndex  *VMIndex
+		validateResult func(*testing.T, *MockObjectStore)
+	}{
+		{
+			name: "records full backup with no parent",
+			config: &UploaderConfig{
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
+				VMName:             "test-vm",
+				VMNamespace:        "test-ns",
+				CheckpointName:     "cp-002",
+				BackupType:         "full",        // virt-controller actually performed a full backup
+				ExpectedBackupType: "incremental", // controller expected an incremental backup
+				VMBName:            "vmb-test-2",
+				VeleroBackupName:   "backup-002",
+			},
+			existingIndex: &VMIndex{
+				VMName:    "test-vm",
+				Namespace: "test-ns",
+				Checkpoints: []CheckpointEntry{
+					{
+						ID:       "cp-001",
+						Type:     "full",
+						VMBackup: "vmb-test",
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-test-disk1.qcow2"},
+						},
+					},
+				},
+			},
+			validateResult: func(t *testing.T, store *MockObjectStore) {
+				data, err := store.GetObjectBytes("checkpoints/test-ns/test-vm/index.json")
+				if err != nil {
+					t.Fatalf("failed to get index: %v", err)
+				}
+				// The corrected entry must be recorded as a full backup.
+				if !containsBytes(data, "\"type\": \"full\"") {
+					t.Errorf("corrected checkpoint should have type full, got: %s", string(data))
+				}
+				// It must not carry a parent pointer (it is a standalone image).
+				if containsBytes(data, "\"parent\"") {
+					t.Errorf("corrected full checkpoint should not have a parent pointer, got: %s", string(data))
+				}
+			},
+		},
+		{
+			name: "overwrites stale incremental entry",
+			config: &UploaderConfig{
+				ObjectStoreConfig: common.ObjectStoreConfig{
+					BSLBucket: "test-bucket",
+				},
+				VMName:             "test-vm",
+				VMNamespace:        "test-ns",
+				CheckpointName:     "cp-002",
+				BackupType:         "full",
+				ExpectedBackupType: "incremental",
+				VMBName:            "vmb-test-2",
+				VeleroBackupName:   "backup-002",
+			},
+			existingIndex: &VMIndex{
+				VMName:    "test-vm",
+				Namespace: "test-ns",
+				Checkpoints: []CheckpointEntry{
+					{
+						ID:       "cp-001",
+						Type:     "full",
+						VMBackup: "vmb-test",
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-test-disk1.qcow2"},
+						},
+					},
+					{
+						// A previous run incorrectly recorded cp-002 as incremental
+						// with a parent. The correction must overwrite it.
+						ID:       "cp-002",
+						Type:     "incremental",
+						Parent:   "cp-001",
+						VMBackup: "vmb-test-2",
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-test-2-disk1.qcow2"},
+						},
+					},
+				},
+			},
+			validateResult: func(t *testing.T, store *MockObjectStore) {
+				data, err := store.GetObjectBytes("checkpoints/test-ns/test-vm/index.json")
+				if err != nil {
+					t.Fatalf("failed to get index: %v", err)
+				}
+				if countOccurrences(data, "\"id\": \"cp-002\"") != 1 {
+					t.Errorf("should have exactly one cp-002 entry, got: %s", string(data))
+				}
+				// The stale parent pointer must be removed.
+				if containsBytes(data, "\"parent\": \"cp-001\"") {
+					t.Errorf("corrected entry should not retain parent pointer, got: %s", string(data))
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			files := []CheckpointFile{
+				{
+					Filename:   "vmb-test-2-disk1.qcow2",
+					DiskName:   "disk1",
+					Size:       512,
+					ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-test-2-disk1.qcow2",
+				},
+			}
+			archived := &archivedPaths{
+				VMBObjectPath:  "checkpoints/test-ns/test-vm/cp-002/vmb.json",
+				VMBTObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmbt.json",
+			}
+
+			store := NewMockObjectStore("test-bucket", "")
+			data, _ := json.Marshal(tt.existingIndex)
+			indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", tt.config.VMNamespace, tt.config.VMName)
+			_ = store.PutObjectBytes(indexPath, data)
+			for _, cp := range tt.existingIndex.Checkpoints {
+				for _, f := range cp.Files {
+					if f.ObjectPath != "" {
+						_ = store.PutObjectBytes(f.ObjectPath, []byte("fake-qcow2"))
+					}
+				}
+			}
+
+			objects := getTestClientObjects(tt.config, files)
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objects...).Build()
+
+			if err := updateVMIndex(
+				context.Background(), store, fakeClient, tt.config, files, archived, logr.Discard(),
+			); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			tt.validateResult(t, store)
+		})
+	}
+}
+
 func TestUpdateVMIndex_HyphenatedDiskNames(t *testing.T) {
 	scheme := getTestScheme()
 
