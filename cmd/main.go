@@ -107,6 +107,7 @@ func main() {
 	var datamoverImagePullPolicy string
 	var oadpNamespace string
 	var maxIncrementalBackups int
+	var maxConcurrentDataMovers int
 	var staleDataUploadThreshold time.Duration
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
@@ -136,6 +137,8 @@ func main() {
 		"Namespace where OADP/Velero resources are located")
 	flag.IntVar(&maxIncrementalBackups, "max-incremental-backups", 0,
 		"Maximum number of incremental backups per VM before forcing a full backup (0 = unlimited)")
+	flag.IntVar(&maxConcurrentDataMovers, "max-concurrent-data-movers", common.DefaultMaxConcurrentDataMovers,
+		"Maximum number of active DataDownloads (Accepted/Prepared/InProgress) allowed concurrently (0 = unlimited)")
 	flag.DurationVar(&staleDataUploadThreshold, "stale-dataupload-threshold",
 		common.DefaultStaleDataUploadThreshold,
 		"Duration after which a stale DataUpload stops blocking younger ones for the same VM")
@@ -147,6 +150,11 @@ func main() {
 
 	if maxIncrementalBackups < 0 {
 		fmt.Fprintln(os.Stderr, "--max-incremental-backups must be >= 0")
+		os.Exit(1)
+	}
+
+	if maxConcurrentDataMovers < 0 {
+		fmt.Fprintln(os.Stderr, "--max-concurrent-data-movers must be >= 0")
 		os.Exit(1)
 	}
 
@@ -293,6 +301,7 @@ func main() {
 		Scheme:                   mgr.GetScheme(),
 		Log:                      ctrl.Log.WithName("controllers").WithName("KubeVirtDataDownload"),
 		MaxConcurrentReconciles:  maxConcurrentReconciles,
+		MaxConcurrentDataMovers:  maxConcurrentDataMovers,
 		DatamoverImage:           datamoverImage,
 		DatamoverImagePullPolicy: corev1.PullPolicy(datamoverImagePullPolicy),
 		OADPNamespace:            oadpNamespace,

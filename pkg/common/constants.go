@@ -226,6 +226,11 @@ const (
 	// DataUpload in an active phase is considered stale and will no longer
 	// block younger DataUploads for the same VM.
 	DefaultStaleDataUploadThreshold = 2 * time.Hour
+
+	// DefaultMaxConcurrentDataMovers is the default value for
+	// --max-concurrent-data-movers (0 = unlimited, preserving current
+	// behavior until an operator opts in).
+	DefaultMaxConcurrentDataMovers = 0
 )
 
 // SnapshotType constants for DataUpload

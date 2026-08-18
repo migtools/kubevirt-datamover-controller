@@ -110,6 +110,16 @@ type KubeVirtDataDownloadReconciler struct {
 	// MaxConcurrentReconciles is the maximum number of concurrent Reconciles which can be run
 	MaxConcurrentReconciles int
 
+	// MaxConcurrentDataMovers caps how many DataDownloads may be in an active
+	// phase (Accepted/Prepared/InProgress) at once, gating pod creation in
+	// handlePrepared -- covers the full resource window (scratch/work/output
+	// PVCs + pod), not just running pods. 0 (default) disables the limit.
+	// This is a soft limit: the active count is read from the cached client,
+	// so with MaxConcurrentReconciles > 1 two reconciles can observe the same
+	// pre-update count and both proceed, briefly overshooting the cap by up
+	// to MaxConcurrentReconciles-1. Acceptable for a throttle; not a hard quota.
+	MaxConcurrentDataMovers int
+
 	// DatamoverImage is the image to use for datamover pods
 	DatamoverImage string
 
@@ -553,15 +563,24 @@ func (r *KubeVirtDataDownloadReconciler) handleAccepted(ctx context.Context, log
 	if isBlockTarget {
 		workSize := calculateWorkPVCSize(logger, files)
 		if _, err := r.ensureWorkPVC(ctx, logger, dd, targetPVC, workSize); err != nil {
+			if failed, updateErr := r.failIfImmutableScratchPVCMismatch(ctx, dd, err); failed {
+				return ctrl.Result{}, updateErr
+			}
 			return ctrl.Result{}, fmt.Errorf("failed to ensure work PVC: %w", err)
 		}
 		outputSize := calculateOutputPVCSize(logger, vmIndex, manifest.CheckpointChain, targetVolume, targetDiskCapacity)
 		if _, err := r.ensureOutputPVC(ctx, logger, dd, targetPVC, outputSize); err != nil {
+			if failed, updateErr := r.failIfImmutableScratchPVCMismatch(ctx, dd, err); failed {
+				return ctrl.Result{}, updateErr
+			}
 			return ctrl.Result{}, fmt.Errorf("failed to ensure output PVC: %w", err)
 		}
 	} else {
 		scratchPVCSize := calculateScratchPVCSize(logger, vmIndex, manifest.CheckpointChain, targetVolume, files, targetDiskCapacity)
 		if _, err := r.ensureScratchPVC(ctx, logger, dd, targetPVC, scratchPVCSize); err != nil {
+			if failed, updateErr := r.failIfImmutableScratchPVCMismatch(ctx, dd, err); failed {
+				return ctrl.Result{}, updateErr
+			}
 			return ctrl.Result{}, fmt.Errorf("failed to ensure scratch PVC: %w", err)
 		}
 	}
@@ -690,6 +709,16 @@ func calculateScratchPVCSize(logger logr.Logger, vmIndex uploader.VMIndex, chain
 
 	var totalFileSize int64
 	for _, f := range files {
+		if f.Size < 0 {
+			// A negative CheckpointFile.Size can only come from corrupt/invalid
+			// index data -- never a real file. Treat it as absent (0) rather than
+			// letting it subtract from the total: summing it in could silently
+			// undersize the scratch PVC below what the OTHER, legitimate files in
+			// the same list actually need (the 1Gi floor below only protects
+			// against an all-negative/all-absent list, not a mixed one).
+			logger.Info("Ignoring negative checkpoint file size", "targetVolume", targetVolume, "size", f.Size)
+			continue
+		}
 		totalFileSize += f.Size
 	}
 
@@ -774,6 +803,16 @@ func calculateWorkPVCSize(logger logr.Logger, files []uploader.CheckpointFile) r
 
 	var totalFileSize int64
 	for _, f := range files {
+		if f.Size < 0 {
+			// Same corrupt-index guard as calculateScratchPVCSize: a negative
+			// CheckpointFile.Size can only come from invalid index data, never
+			// a real file. Treat it as absent (0) rather than letting it
+			// subtract from the total, which could silently undersize this
+			// PVC below what the OTHER, legitimate files in the same list
+			// actually need.
+			logger.Info("Ignoring negative checkpoint file size", "size", f.Size)
+			continue
+		}
 		totalFileSize += f.Size
 	}
 
@@ -1138,16 +1177,28 @@ func (r *KubeVirtDataDownloadReconciler) ensureScratchPVCWithRole(
 	volumeMode *corev1.PersistentVolumeMode,
 	size resource.Quantity,
 ) (*corev1.PersistentVolumeClaim, error) {
-	if existing, err := r.findScratchPVC(ctx, dd, role); err != nil {
-		return nil, err
-	} else if existing != nil {
-		logger.V(1).Info("Scratch PVC already exists", "pvc", existing.Name, "role", role)
-		return existing, nil
-	}
-
 	accessModes := accessModesIn
 	if len(accessModes) == 0 {
 		accessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+	}
+
+	if existing, err := r.findScratchPVC(ctx, dd, role); err != nil {
+		return nil, err
+	} else if existing != nil {
+		// The values this role would request could in principle have drifted since
+		// this PVC was created (e.g. a fuller checkpoint chain resolved on a later
+		// reconcile now needs more space, or -- for the "" role -- the target PVC
+		// was deleted and recreated with a different spec; StorageClassName/
+		// VolumeMode/AccessModes are immutable on a live PVC, so delete+recreate is
+		// the only way that last one can happen). Detect that here rather than
+		// silently reusing a now-wrong-shaped scratch volume, which would only
+		// surface much later as an opaque bindExistingPVC failure (or worse, a
+		// successful-looking restore onto incompatible storage).
+		if err := validateScratchPVCShape(existing, storageClassName, volumeMode, accessModes, size); err != nil {
+			return nil, fmt.Errorf("existing scratch PVC %s (role %q) no longer matches what would be requested now: %w", existing.Name, role, err)
+		}
+		logger.V(1).Info("Scratch PVC already exists", "pvc", existing.Name, "role", role)
+		return existing, nil
 	}
 
 	generateNamePrefix := fmt.Sprintf("%s%s-", common.ScratchPVCNamePrefix, dd.Name)
@@ -1195,6 +1246,106 @@ func (r *KubeVirtDataDownloadReconciler) ensureScratchPVCWithRole(
 	return pvc, nil
 }
 
+// failIfImmutableScratchPVCMismatch reports whether err indicates a
+// scratch/work/output PVC's immutable shape no longer matches what would be
+// requested (errScratchPVCShapeMismatch), and if so transitions dd to Failed
+// with err's own message rather than letting the caller treat it as a
+// retryable reconcile error. Retrying can never resolve this class of
+// mismatch, so failing fast here beats leaving the DataDownload to retry via
+// controller-runtime's exponential backoff until Spec.OperationTimeout
+// eventually catches it -- often hours later, for a condition that was
+// knowable immediately. failed=false (err not this kind of mismatch, or nil)
+// means the caller should handle err itself, same as before this check existed.
+func (r *KubeVirtDataDownloadReconciler) failIfImmutableScratchPVCMismatch(ctx context.Context, dd *velerov2alpha1.DataDownload, err error) (failed bool, updateErr error) {
+	if !stderrors.Is(err, errScratchPVCShapeMismatch) {
+		return false, nil
+	}
+	return true, r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed, err.Error())
+}
+
+// errScratchPVCShapeMismatch wraps the immutable-field mismatches
+// validateScratchPVCShape reports (StorageClassName, VolumeMode,
+// AccessModes) -- deliberately not the size-too-small case, which is left as
+// a plain (non-wrapped) error. Those three fields can't change on a live PVC
+// without deleting and recreating it, so retrying can never resolve a
+// mismatch on them; size, by contrast, can genuinely differ on a later
+// reconcile as the checkpoint chain resolves further, so it stays retryable.
+// Callers use errors.Is(err, errScratchPVCShapeMismatch) to fail fast on the
+// immutable cases instead of leaving the DataDownload to retry via
+// reconcile-error backoff until Spec.OperationTimeout eventually catches it,
+// often hours later for a condition that was knowable immediately.
+var errScratchPVCShapeMismatch = stderrors.New("scratch PVC has an immutable shape mismatch")
+
+// validateScratchPVCShape checks an already-existing scratch PVC's requested
+// storage, StorageClassName, VolumeMode, and AccessModes against the values
+// ensureScratchPVC would request now (wantAccessModes is the caller's
+// already-defaulted value -- see the ReadWriteOnce fallback in ensureScratchPVC --
+// not the target PVC's raw, possibly-empty spec), so a false mismatch isn't
+// reported against a default that was only ever implicit. An existing PVC
+// requesting less than minSize is rejected -- e.g. a fuller checkpoint chain
+// resolved on a later reconcile than the one that originally created it -- but
+// one requesting the same or more is reused as-is (its size is never shrunk).
+func validateScratchPVCShape(existing *corev1.PersistentVolumeClaim, wantStorageClass *string, wantVolumeMode *corev1.PersistentVolumeMode, wantAccessModes []corev1.PersistentVolumeAccessMode, minSize resource.Quantity) error {
+	existingSize, hasSize := existing.Spec.Resources.Requests[corev1.ResourceStorage]
+	if !hasSize || existingSize.Cmp(minSize) < 0 {
+		existingSizeStr := "<unset>"
+		if hasSize {
+			existingSizeStr = existingSize.String()
+		}
+		return fmt.Errorf("requested storage %s is smaller than the required %s", existingSizeStr, minSize.String())
+	}
+	if !ptrEqual(existing.Spec.StorageClassName, wantStorageClass) {
+		return fmt.Errorf("%w: storageClassName %s does not match expected %s", errScratchPVCShapeMismatch,
+			ptrOrNone(existing.Spec.StorageClassName), ptrOrNone(wantStorageClass))
+	}
+	if !ptrEqual(existing.Spec.VolumeMode, wantVolumeMode) {
+		return fmt.Errorf("%w: volumeMode %s does not match expected %s", errScratchPVCShapeMismatch,
+			ptrOrNone(existing.Spec.VolumeMode), ptrOrNone(wantVolumeMode))
+	}
+	if !accessModesEqual(existing.Spec.AccessModes, wantAccessModes) {
+		return fmt.Errorf("%w: accessModes %v do not match expected %v", errScratchPVCShapeMismatch, existing.Spec.AccessModes, wantAccessModes)
+	}
+	return nil
+}
+
+// ptrEqual reports whether two pointers are both nil or point to equal values
+// (nil and non-nil never match). Nil-safe replacement for *a == *b.
+func ptrEqual[T comparable](a, b *T) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+// ptrOrNone renders a possibly-nil string-kinded pointer for error messages.
+func ptrOrNone[T ~string](p *T) string {
+	if p == nil {
+		return "<none>"
+	}
+	return string(*p)
+}
+
+// accessModesEqual compares two access mode lists as sets: order doesn't reflect any
+// semantic difference in a PVC spec, only membership does.
+func accessModesEqual(a, b []corev1.PersistentVolumeAccessMode) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[corev1.PersistentVolumeAccessMode]int, len(a))
+	for _, m := range a {
+		set[m]++
+	}
+	for _, m := range b {
+		set[m]--
+	}
+	for _, count := range set {
+		if count != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // handlePrepared processes DataDownloads in Prepared phase.
 // Launches the downloader pod against the scratch PVC and transitions to InProgress.
 func (r *KubeVirtDataDownloadReconciler) handlePrepared(ctx context.Context, logger logr.Logger, dd *velerov2alpha1.DataDownload) (ctrl.Result, error) {
@@ -1212,6 +1363,15 @@ func (r *KubeVirtDataDownloadReconciler) handlePrepared(ctx context.Context, log
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+	}
+
+	// Checked before any of the lookups below (VM ref, BSL, scratch/work/output
+	// PVCs) since none of that is needed while gated -- a deferred DataDownload
+	// would otherwise redo it every 30s for no reason.
+	if gated, result, err := r.checkConcurrentDataMoverLimit(ctx, logger, dd); err != nil {
+		return ctrl.Result{}, err
+	} else if gated {
+		return result, nil
 	}
 
 	vmRef, err := common.GetVMReferenceFromDataDownload(dd)
@@ -1350,6 +1510,11 @@ func (r *KubeVirtDataDownloadReconciler) buildDownloaderPodConfig(
 		pullPolicy = corev1.PullAlways
 	}
 
+	ssecName, ssecKey, err := parseSSECSecretRef(cfg.CustomerKeyEncryptionSecret)
+	if err != nil {
+		return nil, err
+	}
+
 	return &DatamoverPodConfig{
 		OperationMode:                  OperationModeDownload,
 		Name:                           dd.Name, // Used as a prefix for GenerateName
@@ -1363,7 +1528,14 @@ func (r *KubeVirtDataDownloadReconciler) buildDownloaderPodConfig(
 		BSLS3ForcePathStyle:            strconv.FormatBool(cfg.S3ForcePathStyle),
 		BSLInsecureSkipTLSVerify:       strconv.FormatBool(cfg.InsecureSkipTLSVerify),
 		BSLCACert:                      cfg.CACert,
+		BSLServerSideEncryption:        cfg.ServerSideEncryption,
+		BSLKMSKeyID:                    cfg.KMSKeyID,
+		BSLChecksumAlgorithm:           cfg.ChecksumAlgorithm,
+		BSLProfile:                     cfg.Profile,
+		SSECSecretName:                 ssecName,
+		SSECSecretKey:                  ssecKey,
 		BSLServiceAccount:              cfg.ServiceAccount,
+		BSLKMSKeyName:                  cfg.KMSKeyName,
 		BSLResourceGroup:               cfg.ResourceGroup,
 		BSLStorageAccount:              cfg.StorageAccount,
 		BSLStorageAccountKeyEnvVar:     cfg.StorageAccountKeyEnvVar,
@@ -1834,6 +2006,135 @@ func (r *KubeVirtDataDownloadReconciler) allSiblingDataDownloadsCompleted(ctx co
 		}
 	}
 	return true, nil
+}
+
+// checkConcurrentDataMoverLimit gates downloader pod creation against
+// MaxConcurrentDataMovers, called from handlePrepared right after the
+// existing-pod idempotency check -- before any of the VM-ref/BSL/scratch-PVC
+// lookups that only exist to build the pod, since none of that work is
+// needed while gated. Returns gated=true (with a RequeueAfterLong result)
+// when dd must wait its turn; gated=false when it's clear to proceed
+// (including when the limit is disabled, MaxConcurrentDataMovers <= 0).
+// Extracted out of handlePrepared to keep that function's cyclomatic
+// complexity down (gocyclo).
+func (r *KubeVirtDataDownloadReconciler) checkConcurrentDataMoverLimit(ctx context.Context, logger logr.Logger, dd *velerov2alpha1.DataDownload) (gated bool, result ctrl.Result, err error) {
+	if r.MaxConcurrentDataMovers <= 0 {
+		return false, ctrl.Result{}, nil
+	}
+
+	higherPriorityCount, err := r.countHigherPriorityActiveDataDownloads(ctx, dd)
+	if err != nil {
+		return false, ctrl.Result{}, err
+	}
+	if higherPriorityCount < r.MaxConcurrentDataMovers {
+		return false, ctrl.Result{}, nil
+	}
+
+	logger.Info("Deferring downloader pod creation, at concurrent data mover limit",
+		"higherPriorityCount", higherPriorityCount, "limit", r.MaxConcurrentDataMovers)
+	// Waiting for a concurrent-data-mover slot is intentional throttling, not a
+	// stalled operation -- advance AcceptedTimestamp by the same duration we're
+	// about to wait so this deferral doesn't consume the DataDownload's
+	// Spec.OperationTimeout budget (checked unconditionally on every reconcile
+	// in Reconcile, before dispatch reaches handlePrepared). A genuinely stuck
+	// higher-priority peer still ages out normally (its own AcceptedTimestamp
+	// is untouched by this), freeing this DD's slot once that peer times out
+	// or completes -- so this can't cause indefinite starvation, only push the
+	// deadline out for as long as this DD is legitimately waiting its turn.
+	if dd.Status.AcceptedTimestamp != nil {
+		// Re-fetch immediately before writing: this path runs every
+		// RequeueAfterLong for as long as dd stays gated -- potentially many
+		// times over a long queue wait -- far more often than any other write
+		// in this reconciler, so it's the one most likely to collide with a
+		// concurrent external update (e.g. an annotation patch) and hit a
+		// resource-version conflict. A Get failure here only costs this one
+		// cycle's timeout-budget exemption, not the gating decision itself, so
+		// it's logged and skipped rather than propagated as a reconcile error.
+		latest := dd.DeepCopy()
+		if getErr := r.Get(ctx, client.ObjectKeyFromObject(dd), latest); getErr != nil {
+			logger.Error(getErr, "Failed to re-fetch DataDownload before advancing AcceptedTimestamp, skipping this cycle's advance")
+		} else if latest.Status.AcceptedTimestamp != nil {
+			advanced := metav1.NewTime(latest.Status.AcceptedTimestamp.Add(RequeueAfterLong))
+			latest.Status.AcceptedTimestamp = &advanced
+			if err := r.Update(ctx, latest); err != nil {
+				return false, ctrl.Result{}, fmt.Errorf("failed to advance AcceptedTimestamp while gated: %w", err)
+			}
+			*dd = *latest
+		}
+	}
+	return true, ctrl.Result{RequeueAfter: RequeueAfterLong}, nil
+}
+
+// countHigherPriorityActiveDataDownloads counts kubevirt-datamover
+// DataDownloads in dd's namespace, excluding dd itself, that are in an active
+// phase (Accepted, Prepared, InProgress) AND outrank dd per
+// outranksDataDownload's ordering. Used by handlePrepared to gate pod
+// creation against MaxConcurrentDataMovers.
+//
+// Ranking (rather than a raw active-CR count) is what guarantees forward
+// progress when N siblings all reach Prepared together -- the normal
+// multi-disk-VM-restore case, since Velero creates every disk's DataDownload
+// for a VM restore at once. A raw "count of other active CRs >= limit" check
+// is symmetric across all of them: each sibling sees N-1 others active, and
+// if N-1 >= limit, every single one defers, forever -- none can ever create
+// a pod because reaching InProgress requires passing a gate that's held by
+// peers stuck at the very same gate. Ranking breaks that symmetry: it's a
+// stable total order (by CreationTimestamp, with UID as a final tiebreak for
+// exact ties) that every reconciler computes independently from the same
+// List, so exactly the first MaxConcurrentDataMovers-ranked siblings ever
+// see a higher-priority count below the limit and proceed. As earlier-ranked
+// ones complete (leaving the active set), later-ranked siblings' count drops
+// and they get their turn. Ranking deliberately does NOT use
+// Status.AcceptedTimestamp: handlePrepared's gate-defer path advances that
+// field forward to exempt legitimate queue-wait time from
+// Spec.OperationTimeout (see the defer branch below), and CreationTimestamp
+// staying untouched by that is what keeps ranking a fixed, fair order
+// instead of one a deferred DD could perturb by continuing to wait. New
+// (pre-provisioning) is excluded from the count, same as the phase set the
+// full resource window (scratch/work/output PVCs, mover pod) actually
+// covers.
+func (r *KubeVirtDataDownloadReconciler) countHigherPriorityActiveDataDownloads(ctx context.Context, dd *velerov2alpha1.DataDownload) (int, error) {
+	ddList := &velerov2alpha1.DataDownloadList{}
+	if err := r.List(ctx, ddList, client.InNamespace(dd.Namespace)); err != nil {
+		return 0, fmt.Errorf("failed to list DataDownloads: %w", err)
+	}
+
+	count := 0
+	for i := range ddList.Items {
+		other := &ddList.Items[i]
+		if other.UID == dd.UID {
+			continue
+		}
+		if other.Spec.DataMover != common.DataMoverKubeVirt {
+			continue
+		}
+		switch other.Status.Phase {
+		case velerov2alpha1.DataDownloadPhaseAccepted,
+			velerov2alpha1.DataDownloadPhasePrepared,
+			velerov2alpha1.DataDownloadPhaseInProgress:
+		default:
+			continue
+		}
+		if outranksDataDownload(other, dd) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+// outranksDataDownload reports whether a has priority over b for the
+// concurrent-data-mover gate: an earlier CreationTimestamp wins, with UID as
+// a tiebreaker for exact ties -- same convention as hasOlderActiveDUForVM's
+// per-VM serialization on the upload side. A strict total order over any set
+// of DataDownloads, computed identically by every reconciler from the same
+// List, is what lets countHigherPriorityActiveDataDownloads avoid the
+// gate-deadlock a raw active count would hit when siblings reach Prepared
+// together.
+func outranksDataDownload(a, b *velerov2alpha1.DataDownload) bool {
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return a.CreationTimestamp.Before(&b.CreationTimestamp)
+	}
+	return a.UID < b.UID
 }
 
 // getPodNamespace returns the namespace where downloader pods (and the scratch PVC)

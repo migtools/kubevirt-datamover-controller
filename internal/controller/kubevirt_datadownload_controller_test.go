@@ -20,8 +20,10 @@ package controller
 import (
 	"bytes"
 	"context"
+	stderrors "errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -938,6 +940,18 @@ func TestCalculateScratchPVCSize(t *testing.T) {
 					{DiskName: "disk-1"},
 				},
 			},
+			{
+				// PVCSizes deliberately shorter than Files -- unlike cp-1/cp-2, this
+				// entry IS in the matched chain but its PVCSizes entry for disk-1 is
+				// missing, exercising the `i >= len(entry.PVCSizes)` skip itself
+				// rather than the chain-never-matched case (see cp-99 tests below).
+				ID:       "cp-3",
+				PVCs:     []string{"pvc-3"},
+				PVCSizes: nil,
+				Files: []uploader.CheckpointFile{
+					{DiskName: "disk-1"},
+				},
+			},
 		},
 	}
 
@@ -1020,6 +1034,59 @@ func TestCalculateScratchPVCSize(t *testing.T) {
 				return &q
 			}(),
 		},
+		{
+			name:         "matched checkpoint with missing PVCSizes entry is skipped, still floored by target capacity",
+			chain:        []string{"cp-3"}, // chain DOES match this entry, unlike the case above
+			targetVolume: "disk-1",
+			files: []uploader.CheckpointFile{
+				{Size: 1 * 1024 * 1024 * 1024}, // 1Gi
+			},
+			targetDiskCapacity: resource.MustParse("20Gi"),
+			expectExact: func() *resource.Quantity {
+				base := resource.MustParse("20Gi")
+				base.Add(resource.MustParse("1Gi"))
+				q := addOverhead(base, sizeOverheadPercent)
+				return &q
+			}(),
+		},
+		{
+			// A nonzero (unlike the two "maxDiskSize zero" cases above) but tiny
+			// target disk capacity: this still reaches the final branch (total +
+			// overhead), which is what the 1Gi minimum actually guards -- the
+			// "maxDiskSize zero" branch above never reaches that floor at all.
+			name:               "small target disk capacity is floored to the 1Gi minimum",
+			chain:              []string{"cp-99"}, // no chain match
+			targetVolume:       "disk-1",
+			files:              nil,
+			targetDiskCapacity: resource.MustParse("100Mi"),
+			expectExact:        new(resource.MustParse("1Gi")),
+		},
+		{
+			name:         "negative file size is ignored, not summed, falling back to default",
+			chain:        []string{"cp-99"},
+			targetVolume: "disk-1",
+			files: []uploader.CheckpointFile{
+				{Size: -1024},
+			},
+			// The negative entry is dropped rather than summed (see
+			// calculateScratchPVCSize), so with no other size signal this hits the
+			// same default-fallback path as "maxDiskSize zero with small file chain"
+			// above.
+			expectExact: new(resource.MustParse(DefaultScratchPVCSize)),
+		},
+		{
+			name:         "negative file size does not offset a legitimate positive file size in the same list",
+			chain:        []string{"cp-99"},
+			targetVolume: "disk-1",
+			files: []uploader.CheckpointFile{
+				{Size: 20 * 1024 * 1024 * 1024}, // 20Gi -- legitimate, exceeds the default so doubling applies
+				{Size: -5 * 1024 * 1024 * 1024}, // -5Gi -- corrupt/invalid entry; must not subtract from the 20Gi above
+			},
+			expectExact: func() *resource.Quantity {
+				q := addOverhead(*resource.NewQuantity(40*1024*1024*1024, resource.BinarySI), sizeOverheadPercent)
+				return &q
+			}(),
+		},
 	}
 
 	for _, tt := range tests {
@@ -1061,6 +1128,24 @@ func TestCalculateWorkPVCSize(t *testing.T) {
 				{Size: 1024}, // 1KiB -- not zero, so no-metadata fallback must not apply
 			},
 			expectExact: resource.MustParse("1Gi"),
+		},
+		{
+			name: "negative file size is ignored, not summed, falling back to default",
+			files: []uploader.CheckpointFile{
+				{Size: -1024},
+			},
+			// The negative entry is dropped rather than summed (same guard as
+			// calculateScratchPVCSize), so with no other size signal totalFileSize
+			// stays 0 and this hits the no-metadata default fallback.
+			expectExact: resource.MustParse(DefaultScratchPVCSize),
+		},
+		{
+			name: "negative file size does not offset a legitimate positive file size in the same list",
+			files: []uploader.CheckpointFile{
+				{Size: 4 * 1024 * 1024 * 1024},  // 4Gi -- legitimate
+				{Size: -2 * 1024 * 1024 * 1024}, // -2Gi -- corrupt/invalid entry; must not subtract from the 4Gi above
+			},
+			expectExact: addOverhead(*resource.NewQuantity(4*1024*1024*1024, resource.BinarySI), sizeOverheadPercent),
 		},
 	}
 
@@ -1380,6 +1465,276 @@ func startFakeBinder(t *testing.T, fakeClient client.Client, scratchPV *corev1.P
 			t.Errorf("timed out waiting for fake-binder goroutine to finish")
 		}
 	}
+}
+
+// TestEnsureScratchPVC covers ensureScratchPVC's reuse path, including the
+// drift-validation branch added for Phase 4: an existing scratch PVC found for
+// dd.UID must still match what would be requested now (StorageClassName,
+// VolumeMode, AccessModes -- with the ReadWriteOnce default applied the same way
+// ensureScratchPVC itself applies it), or the reconcile should fail clearly
+// instead of silently reusing a wrong-shaped scratch volume.
+func TestEnsureScratchPVC(t *testing.T) {
+	scheme := ddScheme()
+
+	newFixture := func() (*velerov2alpha1.DataDownload, *corev1.PersistentVolumeClaim) {
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-dd", Namespace: "openshift-adp", UID: types.UID("dd-uid-1")},
+		}
+		targetPVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: "restored-disk-1", Namespace: "restore-ns"},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				StorageClassName: new("standard"),
+				VolumeMode:       new(corev1.PersistentVolumeFilesystem),
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+				},
+			},
+		}
+		return dd, targetPVC
+	}
+
+	existingScratchPVC := func(dd *velerov2alpha1.DataDownload, mutate func(*corev1.PersistentVolumeClaim)) *corev1.PersistentVolumeClaim {
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "scratch-pvc-existing", Namespace: "openshift-adp",
+				Labels: map[string]string{common.LabelDataDownloadUID: string(dd.UID)},
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				StorageClassName: new("standard"),
+				VolumeMode:       new(corev1.PersistentVolumeFilesystem),
+				// Matches the 15Gi requested size most subtests below pass to
+				// ensureScratchPVC, so the capacity check doesn't reject reuse
+				// unless a subtest explicitly mutates it to test that check.
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("15Gi")},
+				},
+			},
+		}
+		if mutate != nil {
+			mutate(pvc)
+		}
+		return pvc
+	}
+
+	t.Run("creates scratch PVC when none exists", func(t *testing.T) {
+		dd, targetPVC := newFixture()
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		pvc, err := r.ensureScratchPVC(context.Background(), logr.Discard(), dd, targetPVC, resource.MustParse("15Gi"))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if pvc == nil {
+			t.Fatal("expected scratch PVC to be created")
+		}
+	})
+
+	t.Run("reuses existing scratch PVC with matching shape", func(t *testing.T) {
+		dd, targetPVC := newFixture()
+		existing := existingScratchPVC(dd, nil)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, existing).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		pvc, err := r.ensureScratchPVC(context.Background(), logr.Discard(), dd, targetPVC, resource.MustParse("15Gi"))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if pvc.Name != existing.Name {
+			t.Errorf("expected existing scratch PVC %q to be reused, got %q", existing.Name, pvc.Name)
+		}
+	})
+
+	t.Run("errors when existing scratch PVC's storage class drifted from target PVC", func(t *testing.T) {
+		dd, targetPVC := newFixture()
+		existing := existingScratchPVC(dd, func(p *corev1.PersistentVolumeClaim) {
+			p.Spec.StorageClassName = new("different-class")
+		})
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, existing).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		_, err := r.ensureScratchPVC(context.Background(), logr.Discard(), dd, targetPVC, resource.MustParse("15Gi"))
+		if err == nil {
+			t.Fatal("expected error on storage class drift, got nil")
+		}
+		if !stderrors.Is(err, errScratchPVCShapeMismatch) {
+			t.Errorf("expected errScratchPVCShapeMismatch (immutable-field drift, must fail fast rather than retry), got: %v", err)
+		}
+	})
+
+	t.Run("errors when existing scratch PVC's volume mode drifted from target PVC", func(t *testing.T) {
+		dd, targetPVC := newFixture()
+		existing := existingScratchPVC(dd, func(p *corev1.PersistentVolumeClaim) {
+			p.Spec.VolumeMode = new(corev1.PersistentVolumeBlock)
+		})
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, existing).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		_, err := r.ensureScratchPVC(context.Background(), logr.Discard(), dd, targetPVC, resource.MustParse("15Gi"))
+		if err == nil {
+			t.Fatal("expected error on volume mode drift, got nil")
+		}
+		if !stderrors.Is(err, errScratchPVCShapeMismatch) {
+			t.Errorf("expected errScratchPVCShapeMismatch (immutable-field drift, must fail fast rather than retry), got: %v", err)
+		}
+	})
+
+	t.Run("errors when existing scratch PVC's access modes drifted from target PVC", func(t *testing.T) {
+		dd, targetPVC := newFixture()
+		existing := existingScratchPVC(dd, func(p *corev1.PersistentVolumeClaim) {
+			p.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+		})
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, existing).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		_, err := r.ensureScratchPVC(context.Background(), logr.Discard(), dd, targetPVC, resource.MustParse("15Gi"))
+		if err == nil {
+			t.Fatal("expected error on access modes drift, got nil")
+		}
+		if !stderrors.Is(err, errScratchPVCShapeMismatch) {
+			t.Errorf("expected errScratchPVCShapeMismatch (immutable-field drift, must fail fast rather than retry), got: %v", err)
+		}
+	})
+
+	t.Run("defaults target PVC's empty access modes to ReadWriteOnce before comparing", func(t *testing.T) {
+		dd, targetPVC := newFixture()
+		targetPVC.Spec.AccessModes = nil // target PVC itself has no access modes set
+		existing := existingScratchPVC(dd, nil)
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, existing).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		if _, err := r.ensureScratchPVC(context.Background(), logr.Discard(), dd, targetPVC, resource.MustParse("15Gi")); err != nil {
+			t.Errorf("unexpected error comparing existing scratch PVC against the effective ReadWriteOnce default: %v", err)
+		}
+	})
+
+	t.Run("treats nil storage class and volume mode on both sides as matching (default storage class case)", func(t *testing.T) {
+		dd, targetPVC := newFixture()
+		targetPVC.Spec.StorageClassName = nil // rely on the cluster's default storage class
+		targetPVC.Spec.VolumeMode = nil
+		existing := existingScratchPVC(dd, func(p *corev1.PersistentVolumeClaim) {
+			p.Spec.StorageClassName = nil // scratch PVC was created from the same nil-valued target spec
+			p.Spec.VolumeMode = nil
+		})
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, existing).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		pvc, err := r.ensureScratchPVC(context.Background(), logr.Discard(), dd, targetPVC, resource.MustParse("15Gi"))
+		if err != nil {
+			t.Fatalf("nil==nil storage class/volume mode must not be reported as drift: %v", err)
+		}
+		if pvc.Name != existing.Name {
+			t.Errorf("expected existing scratch PVC %q to be reused, got %q", existing.Name, pvc.Name)
+		}
+	})
+
+	t.Run("errors when only one side's storage class is nil (nil vs explicit is drift, not a match)", func(t *testing.T) {
+		dd, targetPVC := newFixture() // target keeps its explicit "standard" storage class
+		existing := existingScratchPVC(dd, func(p *corev1.PersistentVolumeClaim) {
+			p.Spec.StorageClassName = nil // scratch was created back when the target relied on the cluster default
+		})
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, existing).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		_, err := r.ensureScratchPVC(context.Background(), logr.Discard(), dd, targetPVC, resource.MustParse("15Gi"))
+		if err == nil {
+			t.Fatal("expected error when existing scratch PVC has nil storage class but target PVC has an explicit one, got nil")
+		}
+		if !stderrors.Is(err, errScratchPVCShapeMismatch) {
+			t.Errorf("expected errScratchPVCShapeMismatch (immutable-field drift, must fail fast rather than retry), got: %v", err)
+		}
+	})
+
+	t.Run("treats access modes as a set: same modes in a different order still match", func(t *testing.T) {
+		dd, targetPVC := newFixture()
+		targetPVC.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce, corev1.ReadOnlyMany}
+		existing := existingScratchPVC(dd, func(p *corev1.PersistentVolumeClaim) {
+			p.Spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany, corev1.ReadWriteOnce}
+		})
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, existing).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		pvc, err := r.ensureScratchPVC(context.Background(), logr.Discard(), dd, targetPVC, resource.MustParse("15Gi"))
+		if err != nil {
+			t.Fatalf("reordered-but-identical access modes must not be reported as drift: %v", err)
+		}
+		if pvc.Name != existing.Name {
+			t.Errorf("expected existing scratch PVC %q to be reused, got %q", existing.Name, pvc.Name)
+		}
+	})
+
+	t.Run("errors when existing scratch PVC's storage is smaller than required", func(t *testing.T) {
+		dd, targetPVC := newFixture()
+		existing := existingScratchPVC(dd, func(p *corev1.PersistentVolumeClaim) {
+			p.Spec.Resources.Requests = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")}
+		})
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, existing).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		_, err := r.ensureScratchPVC(context.Background(), logr.Discard(), dd, targetPVC, resource.MustParse("15Gi"))
+		if err == nil {
+			t.Fatal("expected error when existing scratch PVC (10Gi) is smaller than the newly required size (15Gi), got nil")
+		}
+		if stderrors.Is(err, errScratchPVCShapeMismatch) {
+			t.Error("size-too-small must stay a plain retryable error, not errScratchPVCShapeMismatch -- a later reconcile's recalculated size could genuinely differ and resolve on its own")
+		}
+	})
+
+	t.Run("errors when existing scratch PVC has no storage request at all", func(t *testing.T) {
+		dd, targetPVC := newFixture()
+		existing := existingScratchPVC(dd, func(p *corev1.PersistentVolumeClaim) {
+			// No storage request recorded at all -- validateScratchPVCShape must
+			// treat this the same as too-small (reject), not silently reuse a PVC
+			// whose capacity it can't verify.
+			p.Spec.Resources.Requests = nil
+		})
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, existing).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		_, err := r.ensureScratchPVC(context.Background(), logr.Discard(), dd, targetPVC, resource.MustParse("15Gi"))
+		if err == nil {
+			t.Fatal("expected error when existing scratch PVC has no storage request set, got nil")
+		}
+		if stderrors.Is(err, errScratchPVCShapeMismatch) {
+			t.Error("size-too-small must stay a plain retryable error, not errScratchPVCShapeMismatch")
+		}
+	})
+
+	t.Run("reuses existing scratch PVC whose size exactly matches what's required", func(t *testing.T) {
+		dd, targetPVC := newFixture()
+		existing := existingScratchPVC(dd, func(p *corev1.PersistentVolumeClaim) {
+			p.Spec.Resources.Requests = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("15Gi")}
+		})
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, existing).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		pvc, err := r.ensureScratchPVC(context.Background(), logr.Discard(), dd, targetPVC, resource.MustParse("15Gi"))
+		if err != nil {
+			t.Fatalf("unexpected error reusing an exactly-sized scratch PVC: %v", err)
+		}
+		if pvc.Name != existing.Name {
+			t.Errorf("expected existing scratch PVC %q to be reused, got %q", existing.Name, pvc.Name)
+		}
+	})
+
+	t.Run("reuses existing scratch PVC whose size is larger than what's required", func(t *testing.T) {
+		dd, targetPVC := newFixture()
+		existing := existingScratchPVC(dd, func(p *corev1.PersistentVolumeClaim) {
+			p.Spec.Resources.Requests = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("50Gi")}
+		})
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, existing).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		pvc, err := r.ensureScratchPVC(context.Background(), logr.Discard(), dd, targetPVC, resource.MustParse("15Gi"))
+		if err != nil {
+			t.Fatalf("unexpected error reusing an oversized scratch PVC: %v", err)
+		}
+		if pvc.Name != existing.Name {
+			t.Errorf("expected existing scratch PVC %q to be reused (never shrunk), got %q", existing.Name, pvc.Name)
+		}
+	})
 }
 
 // ddTestFixture bundles the objects needed to exercise handleAccepted/handlePrepared/
@@ -1863,6 +2218,63 @@ func TestHandleAcceptedDataDownload(t *testing.T) {
 	}
 }
 
+// TestHandleAcceptedDataDownload_ScratchPVCShapeMismatch pins the fail-fast
+// behavior introduced for CodeRabbit's finding on validateScratchPVCShape's
+// immutable-field mismatches: an existing scratch PVC whose StorageClassName/
+// VolumeMode/AccessModes no longer matches what would be requested must fail
+// the DataDownload immediately (errScratchPVCShapeMismatch, via
+// failIfImmutableScratchPVCMismatch), not leave it retrying every reconcile
+// via a plain error -- retrying can never resolve an immutable-field mismatch,
+// so the prior behavior only surfaced it hours later, once
+// Spec.OperationTimeout finally caught it.
+func TestHandleAcceptedDataDownload_ScratchPVCShapeMismatch(t *testing.T) {
+	f := newDDTestFixture(t)
+	scheme := ddScheme()
+	// Pre-seed a scratch PVC (role "", the Filesystem-mode single-PVC path
+	// f.targetPVC's VolumeMode selects) whose StorageClassName ("different")
+	// no longer matches the target PVC's ("standard") -- immutable on a live
+	// PVC, so this can only have happened via delete+recreate of the target,
+	// not a normal in-place drift.
+	existingScratchPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "scratch-pvc-preexisting", Namespace: "openshift-adp",
+			Labels: map[string]string{common.LabelDataDownloadUID: string(f.dd.UID)},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			StorageClassName: new("different"),
+			VolumeMode:       new(corev1.PersistentVolumeFilesystem),
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("50Gi")},
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, f.bsl, f.credSec, f.targetPVC, existingScratchPVC).Build()
+	r := &KubeVirtDataDownloadReconciler{
+		Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) { return f.mockStore, nil },
+	}
+
+	result, err := r.handleAccepted(context.Background(), logr.Discard(), f.dd)
+	if err != nil {
+		t.Fatalf("unexpected error: %v (immutable shape mismatch must fail the DataDownload, not return a retryable reconcile error)", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("RequeueAfter = %v, want 0 (a Failed DataDownload should not be requeued)", result.RequeueAfter)
+	}
+
+	var updated velerov2alpha1.DataDownload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: f.dd.Name, Namespace: f.dd.Namespace}, &updated); err != nil {
+		t.Fatalf("failed to get DataDownload: %v", err)
+	}
+	if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseFailed {
+		t.Fatalf("phase = %q, want %q (message: %s)", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseFailed, updated.Status.Message)
+	}
+	if !strings.Contains(updated.Status.Message, "storageClassName") {
+		t.Errorf("Status.Message = %q, want it to mention the storageClassName mismatch", updated.Status.Message)
+	}
+}
+
 // TestHandleAcceptedDataDownload_BlockMode covers a Block-mode restore target:
 // handleAccepted must provision both a Filesystem-mode work PVC (staging the
 // qcow2 chain) and a Block-mode output PVC (sized to target capacity, holding
@@ -2078,6 +2490,379 @@ func TestHandlePreparedDataDownload(t *testing.T) {
 			t.Errorf("expected no pod to be created, got %d", len(pods.Items))
 		}
 	})
+}
+
+// TestCountHigherPriorityActiveDataDownloads pins the counting semantics
+// countHigherPriorityActiveDataDownloads relies on for the concurrency gate:
+// only Accepted/Prepared/InProgress peers that outrank dd (per
+// outranksDataDownload) count -- New is pre-provisioning and always
+// excluded, the DD being reconciled itself is never counted, non-kubevirt
+// DataMover CRs are ignored, and a peer that's active but ranks *behind* dd
+// (later timestamp, or a tiebreak-losing UID at an equal timestamp) does not
+// count against dd. This ranking is what lets the gate avoid deadlocking
+// when N siblings all reach Prepared together (see the placement comment on
+// countHigherPriorityActiveDataDownloads).
+func TestCountHigherPriorityActiveDataDownloads(t *testing.T) {
+	scheme := ddScheme()
+	oadpNS := "openshift-adp"
+	baseTime := metav1.NewTime(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+	olderTime := metav1.NewTime(time.Date(2026, 1, 1, 11, 59, 0, 0, time.UTC))
+	newerTime := metav1.NewTime(time.Date(2026, 1, 1, 12, 1, 0, 0, time.UTC))
+
+	makeDD := func(name string, uid types.UID, phase velerov2alpha1.DataDownloadPhase, dataMover string, created *metav1.Time) *velerov2alpha1.DataDownload {
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: oadpNS, UID: uid},
+			Spec:       velerov2alpha1.DataDownloadSpec{DataMover: dataMover},
+			Status:     velerov2alpha1.DataDownloadStatus{Phase: phase},
+		}
+		if created != nil {
+			dd.CreationTimestamp = *created
+		}
+		return dd
+	}
+
+	self := makeDD("dd-self", "self-uid", velerov2alpha1.DataDownloadPhasePrepared, common.DataMoverKubeVirt, &baseTime)
+
+	tests := []struct {
+		name      string
+		otherDDs  []client.Object
+		wantCount int
+	}{
+		{name: "no other DDs", otherDDs: nil, wantCount: 0},
+		{
+			name: "counts higher-priority (older) Accepted/Prepared/InProgress peers",
+			otherDDs: []client.Object{
+				makeDD("dd-accepted", "uid-1", velerov2alpha1.DataDownloadPhaseAccepted, common.DataMoverKubeVirt, &olderTime),
+				makeDD("dd-prepared", "uid-2", velerov2alpha1.DataDownloadPhasePrepared, common.DataMoverKubeVirt, &olderTime),
+				makeDD("dd-inprogress", "uid-3", velerov2alpha1.DataDownloadPhaseInProgress, common.DataMoverKubeVirt, &olderTime),
+			},
+			wantCount: 3,
+		},
+		{
+			name: "excludes terminal phases even if older",
+			otherDDs: []client.Object{
+				makeDD("dd-completed", "uid-1", velerov2alpha1.DataDownloadPhaseCompleted, common.DataMoverKubeVirt, &olderTime),
+				makeDD("dd-failed", "uid-2", velerov2alpha1.DataDownloadPhaseFailed, common.DataMoverKubeVirt, &olderTime),
+				makeDD("dd-canceled", "uid-3", velerov2alpha1.DataDownloadPhaseCanceled, common.DataMoverKubeVirt, &olderTime),
+			},
+			wantCount: 0,
+		},
+		{
+			name: "excludes New (pre-provisioning) even if older",
+			otherDDs: []client.Object{
+				makeDD("dd-new", "uid-1", velerov2alpha1.DataDownloadPhaseNew, common.DataMoverKubeVirt, &olderTime),
+			},
+			wantCount: 0,
+		},
+		{
+			name: "excludes non-kubevirt DataMover CRs even if older and active",
+			otherDDs: []client.Object{
+				makeDD("dd-other-mover", "uid-1", velerov2alpha1.DataDownloadPhaseInProgress, "csi", &olderTime),
+			},
+			wantCount: 0,
+		},
+		{
+			name: "excludes an active peer with a later timestamp (lower priority)",
+			otherDDs: []client.Object{
+				makeDD("dd-newer", "uid-1", velerov2alpha1.DataDownloadPhaseInProgress, common.DataMoverKubeVirt, &newerTime),
+			},
+			wantCount: 0,
+		},
+		{
+			name: "counts an equal-timestamp peer whose UID tiebreaks ahead",
+			otherDDs: []client.Object{
+				makeDD("aaa-uid-wins-tiebreak", "aaa-uid", velerov2alpha1.DataDownloadPhaseInProgress, common.DataMoverKubeVirt, &baseTime),
+			},
+			wantCount: 1,
+		},
+		{
+			name: "excludes an equal-timestamp peer whose UID tiebreaks behind",
+			otherDDs: []client.Object{
+				makeDD("zzz-uid-loses-tiebreak", "zzz-uid", velerov2alpha1.DataDownloadPhaseInProgress, common.DataMoverKubeVirt, &baseTime),
+			},
+			wantCount: 0,
+		},
+		{
+			name: "ranking is unaffected by Status.AcceptedTimestamp (only CreationTimestamp matters)",
+			otherDDs: []client.Object{
+				func() *velerov2alpha1.DataDownload {
+					// A newer CreationTimestamp but an older AcceptedTimestamp --
+					// if ranking still consulted AcceptedTimestamp (as it did
+					// before handlePrepared started advancing that field to
+					// exempt gate-wait time from Spec.OperationTimeout) this peer
+					// would wrongly outrank self. It must not: CreationTimestamp
+					// alone decides rank now.
+					dd := makeDD("dd-newer-creation-older-accepted", "uid-1", velerov2alpha1.DataDownloadPhaseInProgress, common.DataMoverKubeVirt, &newerTime)
+					dd.Status.AcceptedTimestamp = &olderTime
+					return dd
+				}(),
+			},
+			wantCount: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objs := append([]client.Object{self}, tt.otherDDs...)
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+			r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+			count, err := r.countHigherPriorityActiveDataDownloads(context.Background(), self)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if count != tt.wantCount {
+				t.Errorf("count = %d, want %d", count, tt.wantCount)
+			}
+		})
+	}
+}
+
+// TestHandlePreparedDataDownload_ConcurrencyLimit covers issue #175: gating
+// downloader pod creation in handlePrepared against MaxConcurrentDataMovers.
+func TestHandlePreparedDataDownload_ConcurrencyLimit(t *testing.T) {
+	baseTime := metav1.NewTime(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+	olderTime := metav1.NewTime(time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC))
+
+	// newFixtureWithOthers seeds otherActiveCount peers strictly OLDER than
+	// f.dd (by CreationTimestamp) so they always outrank f.dd regardless of
+	// UID -- these tests are exercising the count/limit comparison itself,
+	// not ranking direction (that's TestCountHigherPriorityActiveDataDownloads's
+	// job). f.dd's own AcceptedTimestamp is separately seeded to exercise the
+	// gate's advance-on-defer behavior (see "requeues ... advances
+	// AcceptedTimestamp" below) -- ranking never reads it.
+	newFixtureWithOthers := func(t *testing.T, otherActiveCount int) (*ddTestFixture, []client.Object) {
+		t.Helper()
+		f := newDDTestFixture(t)
+		f.dd.Annotations[AnnotationTargetDiskName] = "disk1"
+		f.dd.Status.Phase = velerov2alpha1.DataDownloadPhasePrepared
+		f.dd.CreationTimestamp = baseTime
+		f.dd.Status.AcceptedTimestamp = &baseTime
+		scratchPVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "scratch-pvc-1", Namespace: "openshift-adp",
+				Labels: map[string]string{common.LabelDataDownloadUID: string(f.dd.UID)},
+			},
+		}
+		objs := make([]client.Object, 0, 4+otherActiveCount)
+		objs = append(objs, f.dd, f.bsl, f.credSec, scratchPVC)
+		for i := range otherActiveCount {
+			other := &velerov2alpha1.DataDownload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: fmt.Sprintf("other-dd-%d", i), Namespace: "openshift-adp", UID: types.UID(fmt.Sprintf("other-uid-%d", i)),
+					CreationTimestamp: olderTime,
+				},
+				Spec:   velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseInProgress, AcceptedTimestamp: &olderTime},
+			}
+			objs = append(objs, other)
+		}
+		return f, objs
+	}
+
+	t.Run("proceeds when under the limit", func(t *testing.T) {
+		f, objs := newFixtureWithOthers(t, 2)
+		scheme := ddScheme()
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+		r := &KubeVirtDataDownloadReconciler{
+			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 3,
+		}
+
+		if _, err := r.handlePrepared(context.Background(), logr.Discard(), f.dd); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated velerov2alpha1.DataDownload
+		_ = fakeClient.Get(context.Background(), types.NamespacedName{Name: f.dd.Name, Namespace: f.dd.Namespace}, &updated)
+		if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseInProgress {
+			t.Errorf("phase = %q, want %q (should proceed: 2 others < limit 3)", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseInProgress)
+		}
+	})
+
+	t.Run("requeues without creating a pod when at the limit", func(t *testing.T) {
+		f, objs := newFixtureWithOthers(t, 3)
+		scheme := ddScheme()
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+		r := &KubeVirtDataDownloadReconciler{
+			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 3,
+		}
+
+		result, err := r.handlePrepared(context.Background(), logr.Discard(), f.dd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.RequeueAfter != RequeueAfterLong {
+			t.Errorf("RequeueAfter = %v, want %v", result.RequeueAfter, RequeueAfterLong)
+		}
+
+		var updated velerov2alpha1.DataDownload
+		_ = fakeClient.Get(context.Background(), types.NamespacedName{Name: f.dd.Name, Namespace: f.dd.Namespace}, &updated)
+		if updated.Status.Phase != velerov2alpha1.DataDownloadPhasePrepared {
+			t.Errorf("phase = %q, want still %q (at limit 3, must not proceed)", updated.Status.Phase, velerov2alpha1.DataDownloadPhasePrepared)
+		}
+
+		pod, err := r.findPodForDataDownload(context.Background(), f.dd, "openshift-adp")
+		if err != nil {
+			t.Fatalf("failed to find pod: %v", err)
+		}
+		if pod != nil {
+			t.Error("expected no downloader pod to be created while gated")
+		}
+
+		// Deferring due to the concurrency limit is intentional throttling, not a
+		// stalled operation -- AcceptedTimestamp must advance by exactly the
+		// requeue interval so this wait doesn't consume Spec.OperationTimeout's
+		// budget (see the gate's defer branch in handlePrepared).
+		wantAdvanced := baseTime.Add(RequeueAfterLong)
+		if updated.Status.AcceptedTimestamp == nil || !updated.Status.AcceptedTimestamp.Time.Equal(wantAdvanced) {
+			t.Errorf("AcceptedTimestamp = %v, want %v (baseTime + RequeueAfterLong)", updated.Status.AcceptedTimestamp, wantAdvanced)
+		}
+	})
+
+	t.Run("unlimited (MaxConcurrentDataMovers=0) always proceeds", func(t *testing.T) {
+		f, objs := newFixtureWithOthers(t, 50)
+		scheme := ddScheme()
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+		r := &KubeVirtDataDownloadReconciler{
+			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 0,
+		}
+
+		if _, err := r.handlePrepared(context.Background(), logr.Discard(), f.dd); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated velerov2alpha1.DataDownload
+		_ = fakeClient.Get(context.Background(), types.NamespacedName{Name: f.dd.Name, Namespace: f.dd.Namespace}, &updated)
+		if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseInProgress {
+			t.Errorf("phase = %q, want %q (limit disabled, must proceed regardless of active count)", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseInProgress)
+		}
+	})
+}
+
+// TestHandlePreparedDataDownload_MultiDiskDeadlockRegression pins the fix for
+// a deadlock CodeRabbit and a human reviewer both independently found in
+// #186: when N DataDownloads for the same multi-disk VM restore all reach
+// Prepared together (Velero creates every disk's DataDownload for a restore
+// at once, so this is the *normal* case, not an edge case), a raw
+// active-count gate is symmetric -- every sibling sees N-1 others active,
+// and if N-1 >= limit, all of them defer forever, since none can reach
+// InProgress without passing a gate that's held by peers stuck at the same
+// gate. Ranking (countHigherPriorityActiveDataDownloads) breaks that
+// symmetry: exactly the first MaxConcurrentDataMovers-ranked siblings must
+// proceed regardless of the order handlePrepared happens to be called in.
+func TestHandlePreparedDataDownload_MultiDiskDeadlockRegression(t *testing.T) {
+	const (
+		vmName      = "test-vm"
+		vmNamespace = "vm-ns"
+		oadpNS      = "openshift-adp"
+		siblings    = 5
+		limit       = 2
+	)
+	baseTime := metav1.NewTime(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: oadpNS},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{Bucket: "test-bucket", Prefix: "velero"},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{Phase: velerov1.BackupStorageLocationPhaseAvailable},
+	}
+	credSec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cloud-creds", Namespace: oadpNS},
+		Data:       map[string][]byte{"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n")},
+	}
+
+	scheme := ddScheme()
+	objs := make([]client.Object, 0, 2+2*siblings)
+	objs = append(objs, bsl, credSec)
+	dds := make([]*velerov2alpha1.DataDownload, siblings)
+	for i := range siblings {
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("dd-disk-%d", i), Namespace: oadpNS, UID: types.UID(fmt.Sprintf("dd-disk-%d-uid", i)),
+				// Same CreationTimestamp for every sibling -- exactly what
+				// Velero creating all of a VM's DataDownloads together
+				// produces. Ranking falls through to the UID tiebreak, which
+				// is still a strict total order, so this is the deadlock
+				// scenario at its sharpest: no timestamp differences to
+				// accidentally break the symmetry.
+				CreationTimestamp: baseTime,
+				Annotations: map[string]string{
+					common.AnnotationVMName:      vmName,
+					common.AnnotationVMNamespace: vmNamespace,
+					AnnotationTargetDiskName:     fmt.Sprintf("disk%d", i),
+				},
+			},
+			Spec: velerov2alpha1.DataDownloadSpec{
+				DataMover:             common.DataMoverKubeVirt,
+				SourceNamespace:       vmNamespace,
+				BackupStorageLocation: "default",
+				TargetVolume:          velerov2alpha1.TargetVolumeSpec{PVC: fmt.Sprintf("restored-disk-%d", i), Namespace: "restore-ns"},
+			},
+			Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhasePrepared, AcceptedTimestamp: &baseTime},
+		}
+		scratchPVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("scratch-pvc-%d", i), Namespace: oadpNS,
+				Labels: map[string]string{common.LabelDataDownloadUID: string(dd.UID)},
+			},
+		}
+		dds[i] = dd
+		objs = append(objs, dd, scratchPVC)
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	r := &KubeVirtDataDownloadReconciler{
+		Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: oadpNS,
+		DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: limit,
+	}
+
+	// Reconcile every sibling exactly once, in reverse order -- if the gate's
+	// decisions depended on call order rather than each DD's own precomputed
+	// rank, this would expose it (the deadlocked version of the gate defers
+	// every single one regardless of order, so this alone would already
+	// catch that bug; processing backwards additionally rules out an
+	// order-dependent partial fix).
+	for i := siblings - 1; i >= 0; i-- {
+		if _, err := r.handlePrepared(context.Background(), logr.Discard(), dds[i]); err != nil {
+			t.Fatalf("dd-disk-%d: unexpected error: %v", i, err)
+		}
+	}
+
+	inProgress, prepared := 0, 0
+	for i := range siblings {
+		var updated velerov2alpha1.DataDownload
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: dds[i].Name, Namespace: oadpNS}, &updated); err != nil {
+			t.Fatalf("dd-disk-%d: failed to get DataDownload: %v", i, err)
+		}
+		switch updated.Status.Phase {
+		case velerov2alpha1.DataDownloadPhaseInProgress:
+			inProgress++
+		case velerov2alpha1.DataDownloadPhasePrepared:
+			prepared++
+		default:
+			t.Errorf("dd-disk-%d: phase = %q, want InProgress or Prepared", i, updated.Status.Phase)
+		}
+	}
+
+	if inProgress != limit {
+		t.Errorf("got %d DataDownloads InProgress, want exactly %d (MaxConcurrentDataMovers) -- %d stuck deferred forever means the gate deadlocked",
+			inProgress, limit, prepared)
+	}
+	if prepared != siblings-limit {
+		t.Errorf("got %d DataDownloads still Prepared (deferred), want %d", prepared, siblings-limit)
+	}
 }
 
 // TestHandlePreparedDataDownload_BlockMode covers a Block-mode restore target:
@@ -2808,6 +3593,360 @@ func TestHandleInProgressDataDownload_PodNotFoundRequeuesInsteadOfFailing(t *tes
 	}
 }
 
+// ddDiskFixture is one disk's worth of state for TestDataDownloadReconcile_ConcurrentMultiDisk:
+// a DataDownload targeting one disk of a shared multi-disk VM backup, its Velero-created
+// target PVC, and the name to use for its simulated scratch PV.
+type ddDiskFixture struct {
+	diskName      string
+	targetPVCName string
+	scratchPVName string
+	dd            *velerov2alpha1.DataDownload
+	targetPVC     *corev1.PersistentVolumeClaim
+}
+
+// simulateDDDiskLifecycle simulates the parts of a real Kubernetes/KubeVirt
+// environment a fake client doesn't run for us, for one disk's restore, in the
+// order the controller itself depends on:
+//  1. Dynamic-provision the scratch PVC once handleAccepted creates it (bind it to
+//     a PV).
+//  2. Complete the downloader pod once handlePrepared creates it (mark it
+//     Succeeded) -- only after step 1, since handleInProgress's rebind requires the
+//     scratch PVC already Bound at the moment it sees the pod Succeeded.
+//  3. Finish the PV controller's side of the rebind once handleInProgress patches
+//     the PV's claimRef at the target PVC (what rebindPVToNamespace itself writes).
+//
+// Runs as a single goroutine per disk -- since each disk rebinds an independent
+// PV/target-PVC pair, one instance must never observe (or complete) another disk's
+// PVC/pod/PV. timeout is captured by the caller before spawning, not read from the
+// pvRebindTimeout package var here: the caller's test shrinks that var for the
+// duration of the test and restores it via defer once the pipeline goroutines
+// finish; if this goroutine's first statement ran after that restore, it would
+// silently pick up the real multi-minute production default. Each of the three
+// stages above gets its own fresh timeout window (the deadline is reset at the
+// start of each stage, not computed once for all three) -- they're sequential
+// and each depends on the last, so a single shared budget would let a slow
+// stage eat into a later one's time, or even start the last stage with the
+// deadline already expired. ctx lets the caller force an exit once its own
+// Reconcile loop is done, win or lose.
+func simulateDDDiskLifecycle(ctx context.Context, r *KubeVirtDataDownloadReconciler, timeout time.Duration, d *ddDiskFixture) {
+	var deadline time.Time
+	wait := func() bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(2 * time.Millisecond):
+			return time.Now().Before(deadline)
+		}
+	}
+	bg := context.Background()
+
+	// deadline is reset at the start of each stage below (not computed once
+	// up front) -- these three stages are sequential and each depends on the
+	// prior one completing, so a single shared budget would let a slow first
+	// stage eat into a later one's time, or even leave the deadline already
+	// expired by the time the last stage starts. Each stage gets its own full
+	// timeout window instead.
+
+	deadline = time.Now().Add(timeout)
+	for {
+		scratchPVC, err := r.findScratchPVC(bg, d.dd, "")
+		if err == nil && scratchPVC != nil {
+			if scratchPVC.Status.Phase == corev1.ClaimBound {
+				break
+			}
+			scratchPV := &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: d.scratchPVName},
+				Spec: corev1.PersistentVolumeSpec{
+					Capacity:                      corev1.ResourceList{corev1.ResourceStorage: scratchPVC.Spec.Resources.Requests[corev1.ResourceStorage]},
+					AccessModes:                   scratchPVC.Spec.AccessModes,
+					PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimDelete,
+					StorageClassName:              *scratchPVC.Spec.StorageClassName,
+					VolumeMode:                    scratchPVC.Spec.VolumeMode,
+				},
+			}
+			if r.Create(bg, scratchPV) == nil {
+				scratchPVC.Spec.VolumeName = d.scratchPVName
+				if r.Update(bg, scratchPVC) == nil {
+					scratchPVC.Status.Phase = corev1.ClaimBound
+					if r.Status().Update(bg, scratchPVC) == nil {
+						break
+					}
+				}
+			}
+		}
+		if !wait() {
+			return
+		}
+	}
+
+	deadline = time.Now().Add(timeout)
+	for {
+		pod, err := r.findPodForDataDownload(bg, d.dd, r.getPodNamespace(d.dd))
+		if err == nil && pod != nil {
+			if pod.Status.Phase == corev1.PodSucceeded {
+				break
+			}
+			pod.Status.Phase = corev1.PodSucceeded
+			if r.Status().Update(bg, pod) == nil {
+				break
+			}
+		}
+		if !wait() {
+			return
+		}
+	}
+
+	deadline = time.Now().Add(timeout)
+	for {
+		pv := &corev1.PersistentVolume{}
+		if err := r.Get(bg, types.NamespacedName{Name: d.scratchPVName}, pv); err == nil &&
+			pv.Spec.ClaimRef != nil && pv.Spec.ClaimRef.Name == d.targetPVC.Name && pv.Spec.ClaimRef.Namespace == d.targetPVC.Namespace {
+			pvc := &corev1.PersistentVolumeClaim{}
+			if err := r.Get(bg, types.NamespacedName{Name: d.targetPVC.Name, Namespace: d.targetPVC.Namespace}, pvc); err == nil {
+				pvc.Spec.VolumeName = d.scratchPVName
+				if r.Update(bg, pvc) == nil {
+					pvc.Status.Phase = corev1.ClaimBound
+					if r.Status().Update(bg, pvc) == nil {
+						return
+					}
+				}
+			}
+		}
+		if !wait() {
+			return
+		}
+	}
+}
+
+// runDDDiskPipeline drives one disk's DataDownload through New->Accepted->Prepared->
+// InProgress->Completed by repeatedly calling the reconciler's public Reconcile
+// method -- the same production entry point controller-runtime itself calls, and
+// the same one MaxConcurrentReconciles lets run concurrently for different
+// objects -- rather than invoking internal phase handlers directly, so this test
+// exercises the actual concurrency surface instead of just the handlers in
+// isolation. A background goroutine (simulateDDDiskLifecycle) plays the parts of
+// the cluster a fake client doesn't run. Intended to be run concurrently (one
+// goroutine per disk) against a reconciler/fake client shared with other disks of
+// the same VM.
+func runDDDiskPipeline(r *KubeVirtDataDownloadReconciler, d *ddDiskFixture) error {
+	ctx := context.Background()
+	nn := types.NamespacedName{Name: d.dd.Name, Namespace: d.dd.Namespace}
+
+	// lifecycleTimeout is captured synchronously, before spawning -- see
+	// simulateDDDiskLifecycle's doc comment for why. cancelLifecycle+lifecycleWG.Wait()
+	// below guarantee that goroutine exits before this function returns on any
+	// path, so it never outlives the pipeline (or the test's own deferred
+	// pvRebindTimeout restore).
+	lifecycleTimeout := pvRebindTimeout
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	var lifecycleWG sync.WaitGroup
+	lifecycleWG.Go(func() {
+		simulateDDDiskLifecycle(lifecycleCtx, r, lifecycleTimeout, d)
+	})
+	defer func() {
+		cancelLifecycle()
+		lifecycleWG.Wait()
+	}()
+
+	const maxReconciles = 50
+	for i := range maxReconciles {
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: nn}); err != nil {
+			return fmt.Errorf("%s: Reconcile (call %d): %w", d.dd.Name, i, err)
+		}
+
+		var current velerov2alpha1.DataDownload
+		if err := r.Get(ctx, nn, &current); err != nil {
+			return fmt.Errorf("%s: get after Reconcile: %w", d.dd.Name, err)
+		}
+
+		switch current.Status.Phase {
+		case velerov2alpha1.DataDownloadPhaseCompleted:
+			if got := current.Annotations[AnnotationTargetDiskName]; got != d.diskName {
+				return fmt.Errorf("%s: target disk annotation = %q, want %q (cross-contamination if this is the other disk's name)",
+					d.dd.Name, got, d.diskName)
+			}
+			var boundPV corev1.PersistentVolume
+			if err := r.Get(ctx, types.NamespacedName{Name: d.scratchPVName}, &boundPV); err != nil {
+				return fmt.Errorf("%s: get rebound PV: %w", d.dd.Name, err)
+			}
+			if boundPV.Spec.ClaimRef == nil || boundPV.Spec.ClaimRef.Name != d.targetPVC.Name || boundPV.Spec.ClaimRef.Namespace != d.targetPVC.Namespace {
+				return fmt.Errorf("%s: PV %s claimRef = %+v, want %s/%s (cross-contamination if it points elsewhere)",
+					d.dd.Name, d.scratchPVName, boundPV.Spec.ClaimRef, d.targetPVC.Namespace, d.targetPVC.Name)
+			}
+			return nil
+		case velerov2alpha1.DataDownloadPhaseFailed:
+			return fmt.Errorf("%s: reached Failed phase: %s", d.dd.Name, current.Status.Message)
+		}
+	}
+	return fmt.Errorf("%s: did not reach Completed within %d Reconcile calls", d.dd.Name, maxReconciles)
+}
+
+// TestDataDownloadReconcile_ConcurrentMultiDisk drives two DataDownloads for the same
+// VM's different disks through the full Accepted->Prepared->InProgress->Completed
+// sequence concurrently against one shared reconciler/fake client, to prove Phase 4's
+// isolation goal: every child-resource lookup (scratch PVC, downloader pod, PV rebind)
+// is keyed by dd.UID or dd.Spec.TargetVolume.{PVC,Namespace}, so two disks of the same
+// VM never cross-contaminate even when reconciled at the same time. Run with -race.
+func TestDataDownloadReconcile_ConcurrentMultiDisk(t *testing.T) {
+	origInterval, origTimeout := pvRebindPollInterval, pvRebindTimeout
+	pvRebindPollInterval = 10 * time.Millisecond
+	pvRebindTimeout = 2 * time.Second
+	defer func() {
+		pvRebindPollInterval = origInterval
+		pvRebindTimeout = origTimeout
+	}()
+
+	const (
+		vmName       = "test-vm"
+		vmNamespace  = "vm-ns"
+		oadpNS       = "openshift-adp"
+		backupName   = "backup-001"
+		restoreNS    = "restore-ns"
+		checkpointID = "cp-001"
+	)
+
+	scheme := ddScheme()
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: oadpNS},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{Bucket: "test-bucket", Prefix: "velero"},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{Phase: velerov1.BackupStorageLocationPhaseAvailable},
+	}
+	credSec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cloud-creds", Namespace: oadpNS},
+		Data:       map[string][]byte{"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n")},
+	}
+
+	disks := []*ddDiskFixture{
+		{diskName: "disk1", targetPVCName: "restored-disk-1", scratchPVName: "pv-scratch-disk1"},
+		{diskName: "disk2", targetPVCName: "restored-disk-2", scratchPVName: "pv-scratch-disk2"},
+	}
+
+	// One checkpoint entry covering both disks of the same VM backup -- realistic
+	// shape for a multi-disk VM, and it exercises resolveTargetDiskName/
+	// calculateScratchPVCSize's index-aligned PVCs/Files/PVCSizes matching per disk.
+	checkpointEntry := uploader.CheckpointEntry{
+		ID:       checkpointID,
+		Type:     "full",
+		PVCs:     make([]string, len(disks)),
+		PVCSizes: make([]resource.Quantity, len(disks)),
+		Files:    make([]uploader.CheckpointFile, len(disks)),
+	}
+	for i, d := range disks {
+		checkpointEntry.PVCs[i] = d.targetPVCName
+		checkpointEntry.PVCSizes[i] = resource.MustParse("10Gi")
+		checkpointEntry.Files[i] = uploader.CheckpointFile{
+			Filename:   "vmb-" + checkpointID + "-" + d.diskName + ".qcow2",
+			DiskName:   d.diskName,
+			Size:       1024 * 1024 * 1024,
+			ObjectPath: "checkpoints/" + vmNamespace + "/" + vmName + "/" + checkpointID + "/vmb-" + checkpointID + "-" + d.diskName + ".qcow2",
+		}
+	}
+
+	mockStore := uploader.NewMockObjectStore("test-bucket", "velero-kubevirt-datamover")
+	vmIndex := uploader.VMIndex{
+		VMName:      vmName,
+		Namespace:   vmNamespace,
+		Checkpoints: []uploader.CheckpointEntry{checkpointEntry},
+	}
+	if err := uploader.PutVMIndex(mockStore, vmNamespace, vmName, "test-bucket", vmIndex); err != nil {
+		t.Fatalf("failed to seed VM index: %v", err)
+	}
+	manifest := uploader.VMBackupManifest{
+		Namespace:       vmNamespace,
+		Name:            vmName,
+		CheckpointChain: []string{checkpointID},
+		BackupName:      backupName,
+	}
+	if err := uploader.PutVMBackupManifest(mockStore, vmNamespace, vmName, backupName, "test-bucket", manifest); err != nil {
+		t.Fatalf("failed to seed VM backup manifest: %v", err)
+	}
+
+	objs := make([]client.Object, 0, 2+2*len(disks))
+	objs = append(objs, bsl, credSec)
+	for _, d := range disks {
+		d.dd = &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-dd-" + d.diskName,
+				Namespace: oadpNS,
+				UID:       types.UID("dd-uid-" + d.diskName),
+				Annotations: map[string]string{
+					common.AnnotationVMName:      vmName,
+					common.AnnotationVMNamespace: vmNamespace,
+				},
+				Labels: map[string]string{
+					common.LabelVeleroBackupName: backupName,
+				},
+			},
+			Spec: velerov2alpha1.DataDownloadSpec{
+				DataMover:             common.DataMoverKubeVirt,
+				SourceNamespace:       vmNamespace,
+				BackupStorageLocation: "default",
+				TargetVolume: velerov2alpha1.TargetVolumeSpec{
+					PVC:       d.targetPVCName,
+					Namespace: restoreNS,
+				},
+			},
+			Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseAccepted},
+		}
+		d.targetPVC = &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: d.targetPVCName, Namespace: restoreNS},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				StorageClassName: new("standard"),
+				VolumeMode:       new(corev1.PersistentVolumeFilesystem),
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+				},
+			},
+			Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimPending},
+		}
+		objs = append(objs, d.dd, d.targetPVC)
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	r := &KubeVirtDataDownloadReconciler{
+		Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: oadpNS,
+		DatamoverImage:     "quay.io/test/datamover:latest",
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) { return mockStore, nil },
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(disks))
+	for _, d := range disks {
+		wg.Add(1)
+		go func(d *ddDiskFixture) {
+			defer wg.Done()
+			errCh <- runDDDiskPipeline(r, d)
+		}(d)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+
+	// No leftover downloader pods: both disks' handleInProgress should have
+	// cleaned up their own pod after reaching Completed, independently.
+	var pods corev1.PodList
+	_ = fakeClient.List(context.Background(), &pods)
+	if len(pods.Items) != 0 {
+		t.Errorf("expected all downloader pods cleaned up, found %d", len(pods.Items))
+	}
+}
+
 func TestHandleCancelingDataDownload(t *testing.T) {
 	f := newDDTestFixture(t)
 	scheme := ddScheme()
@@ -3087,6 +4226,55 @@ func TestBuildDownloaderPodConfig(t *testing.T) {
 	}
 	if cfg.BSLActiveDirectoryAuthorityURI != "https://login.microsoftonline.com" {
 		t.Errorf("BSLActiveDirectoryAuthorityURI = %q, want %q", cfg.BSLActiveDirectoryAuthorityURI, "https://login.microsoftonline.com")
+	}
+}
+
+// TestBuildDownloaderPodConfig_S3Fields pins issue #184: buildDownloaderPodConfig
+// must propagate the same S3-specific BSL fields buildDatamoverPodConfig (upload)
+// does -- SSE, KMS key ID, checksum algorithm, profile, and the SSEC secret
+// reference -- so a restore from a BSL configured with these doesn't silently
+// ignore them.
+func TestBuildDownloaderPodConfig_S3Fields(t *testing.T) {
+	f := newDDTestFixture(t)
+	f.bsl.Spec.Provider = "aws"
+	f.bsl.Spec.Config = map[string]string{
+		"region":                      "us-east-1",
+		"serverSideEncryption":        "aws:kms",
+		"kmsKeyId":                    "arn:aws:kms:us-east-1:123456789012:key/test-key",
+		"checksumAlgorithm":           "SHA256",
+		"profile":                     "minio",
+		"customerKeyEncryptionSecret": "my-ssec-secret/key.b64",
+	}
+	scheme := ddScheme()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, f.bsl, f.credSec).Build()
+	r := &KubeVirtDataDownloadReconciler{
+		Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+		DatamoverImage: "quay.io/test/datamover:latest",
+	}
+	vmRef := &common.VMReference{Name: "test-vm", Namespace: "vm-ns"}
+
+	cfg, err := r.buildDownloaderPodConfig(f.dd, f.bsl, vmRef, "scratch-pvc-1", "", "disk1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.BSLServerSideEncryption != "aws:kms" {
+		t.Errorf("BSLServerSideEncryption = %q, want %q", cfg.BSLServerSideEncryption, "aws:kms")
+	}
+	if cfg.BSLKMSKeyID != "arn:aws:kms:us-east-1:123456789012:key/test-key" {
+		t.Errorf("BSLKMSKeyID = %q, want %q", cfg.BSLKMSKeyID, "arn:aws:kms:us-east-1:123456789012:key/test-key")
+	}
+	if cfg.BSLChecksumAlgorithm != "SHA256" {
+		t.Errorf("BSLChecksumAlgorithm = %q, want %q", cfg.BSLChecksumAlgorithm, "SHA256")
+	}
+	if cfg.BSLProfile != "minio" {
+		t.Errorf("BSLProfile = %q, want %q", cfg.BSLProfile, "minio")
+	}
+	if cfg.SSECSecretName != "my-ssec-secret" {
+		t.Errorf("SSECSecretName = %q, want %q", cfg.SSECSecretName, "my-ssec-secret")
+	}
+	if cfg.SSECSecretKey != "key.b64" {
+		t.Errorf("SSECSecretKey = %q, want %q", cfg.SSECSecretKey, "key.b64")
 	}
 }
 
