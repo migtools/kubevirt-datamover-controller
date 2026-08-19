@@ -97,6 +97,12 @@ type KubeVirtDataUploadReconciler struct {
 	// MaxConcurrentReconciles is the maximum number of concurrent Reconciles which can be run
 	MaxConcurrentReconciles int
 
+	// MaxConcurrentDataMovers caps how many DataUploads may be in an active
+	// phase (Accepted/Prepared/InProgress) at once, gating pod creation in
+	// handlePrepared -- covers the full resource window (backup PVC + pod),
+	// not just running pods. 0 (default) disables the limit.
+	MaxConcurrentDataMovers int
+
 	// DatamoverImage is the image to use for datamover pods
 	DatamoverImage string
 
@@ -877,6 +883,15 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+	}
+
+	// Checked before any of the lookups below (BSL, VMB, PV rebind) since none
+	// of that is needed while gated -- a deferred DataUpload would otherwise
+	// redo it every 30s for no reason.
+	if gated, result, err := r.checkConcurrentDataMoverLimit(ctx, logger, du); err != nil {
+		return ctrl.Result{}, err
+	} else if gated {
+		return result, nil
 	}
 
 	// Validate BSL and VMB exist BEFORE rebinding PV
@@ -1879,6 +1894,131 @@ func (r *KubeVirtDataUploadReconciler) hasOlderActiveDUForVM(ctx context.Context
 		}
 	}
 	return false, "", nil
+}
+
+// checkConcurrentDataMoverLimit gates datamover pod creation against
+// MaxConcurrentDataMovers, called from handlePrepared right after the
+// existing-pod idempotency check -- before any of the BSL/VMB/PV-rebind
+// lookups that only exist to build the pod, since none of that work is
+// needed while gated. Returns gated=true (with a RequeueAfterLong result)
+// when du must wait its turn; gated=false when it's clear to proceed
+// (including when the limit is disabled, MaxConcurrentDataMovers <= 0).
+func (r *KubeVirtDataUploadReconciler) checkConcurrentDataMoverLimit(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload) (gated bool, result ctrl.Result, err error) {
+	if r.MaxConcurrentDataMovers <= 0 {
+		return false, ctrl.Result{}, nil
+	}
+
+	higherPriorityCount, err := r.countHigherPriorityActiveDataUploads(ctx, du)
+	if err != nil {
+		return false, ctrl.Result{}, err
+	}
+	if higherPriorityCount < r.MaxConcurrentDataMovers {
+		return false, ctrl.Result{}, nil
+	}
+
+	logger.Info("Deferring datamover pod creation, at concurrent data mover limit",
+		"higherPriorityCount", higherPriorityCount, "limit", r.MaxConcurrentDataMovers)
+	// Waiting for a concurrent-data-mover slot is intentional throttling, not a
+	// stalled operation -- advance AcceptedTimestamp by the same duration we're
+	// about to wait so this deferral doesn't consume the DataUpload's
+	// Spec.OperationTimeout budget (checked unconditionally on every reconcile
+	// in Reconcile, before dispatch reaches handlePrepared). A genuinely stuck
+	// higher-priority peer still ages out normally (its own AcceptedTimestamp
+	// is untouched by this), freeing this DU's slot once that peer times out
+	// or completes -- so this can't cause indefinite starvation, only push the
+	// deadline out for as long as this DU is legitimately waiting its turn.
+	if du.Status.AcceptedTimestamp != nil {
+		// Re-fetch immediately before writing: this path runs every
+		// RequeueAfterLong for as long as du stays gated -- potentially many
+		// times over a long queue wait -- far more often than any other write
+		// in this reconciler, so it's the one most likely to collide with a
+		// concurrent external update (e.g. an annotation patch) and hit a
+		// resource-version conflict. A Get failure here only costs this one
+		// cycle's timeout-budget exemption, not the gating decision itself, so
+		// it's logged and skipped rather than propagated as a reconcile error.
+		latest := du.DeepCopy()
+		if getErr := r.Get(ctx, client.ObjectKeyFromObject(du), latest); getErr != nil {
+			logger.Error(getErr, "Failed to re-fetch DataUpload before advancing AcceptedTimestamp, skipping this cycle's advance")
+		} else if latest.Status.AcceptedTimestamp != nil {
+			advanced := metav1.NewTime(latest.Status.AcceptedTimestamp.Add(RequeueAfterLong))
+			latest.Status.AcceptedTimestamp = &advanced
+			if err := r.Update(ctx, latest); err != nil {
+				return false, ctrl.Result{}, fmt.Errorf("failed to advance AcceptedTimestamp while gated: %w", err)
+			}
+			*du = *latest
+		}
+	}
+	return true, ctrl.Result{RequeueAfter: RequeueAfterLong}, nil
+}
+
+// countHigherPriorityActiveDataUploads counts kubevirt-datamover DataUploads
+// in du's namespace, excluding du itself, that are in an active phase
+// (Accepted, Prepared, InProgress) AND outrank du per outranksDataUpload's
+// ordering. Used by handlePrepared to gate pod creation against
+// MaxConcurrentDataMovers.
+//
+// Ranking (rather than a raw active-CR count) is what guarantees forward
+// progress when N DataUploads all reach Prepared together (e.g. a Backup
+// targeting several VMs at once). A raw "count of other active CRs >= limit"
+// check is symmetric across all of them: each sibling sees N-1 others
+// active, and if N-1 >= limit, every single one defers, forever -- none can
+// ever create a pod because reaching InProgress requires passing a gate
+// that's held by peers stuck at the very same gate. Ranking breaks that
+// symmetry: it's a stable total order (by CreationTimestamp, with UID as a
+// final tiebreak for exact ties) that every reconciler computes
+// independently from the same List, so exactly the first
+// MaxConcurrentDataMovers-ranked siblings ever see a higher-priority count
+// below the limit and proceed. As earlier-ranked ones complete (leaving the
+// active set), later-ranked siblings' count drops and they get their turn.
+// Ranking deliberately does NOT use Status.AcceptedTimestamp:
+// checkConcurrentDataMoverLimit's gate-defer path advances that field
+// forward to exempt legitimate queue-wait time from Spec.OperationTimeout,
+// and CreationTimestamp staying untouched by that is what keeps ranking a
+// fixed, fair order instead of one a deferred DU could perturb by
+// continuing to wait. New (pre-provisioning) is excluded from the count,
+// same as the phase set the full resource window (backup PVC, mover pod)
+// actually covers.
+func (r *KubeVirtDataUploadReconciler) countHigherPriorityActiveDataUploads(ctx context.Context, du *velerov2alpha1.DataUpload) (int, error) {
+	duList := &velerov2alpha1.DataUploadList{}
+	if err := r.List(ctx, duList, client.InNamespace(du.Namespace)); err != nil {
+		return 0, fmt.Errorf("failed to list DataUploads: %w", err)
+	}
+
+	count := 0
+	for i := range duList.Items {
+		other := &duList.Items[i]
+		if other.UID == du.UID {
+			continue
+		}
+		if other.Spec.DataMover != common.DataMoverKubeVirt {
+			continue
+		}
+		switch other.Status.Phase {
+		case velerov2alpha1.DataUploadPhaseAccepted,
+			velerov2alpha1.DataUploadPhasePrepared,
+			velerov2alpha1.DataUploadPhaseInProgress:
+		default:
+			continue
+		}
+		if outranksDataUpload(other, du) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+// outranksDataUpload reports whether a has priority over b for the
+// concurrent-data-mover gate: an earlier CreationTimestamp wins, with UID as
+// a tiebreaker for exact ties -- same convention as hasOlderActiveDUForVM's
+// per-VM serialization. A strict total order over any set of DataUploads,
+// computed identically by every reconciler from the same List, is what lets
+// countHigherPriorityActiveDataUploads avoid the gate-deadlock a raw active
+// count would hit when siblings reach Prepared together.
+func outranksDataUpload(a, b *velerov2alpha1.DataUpload) bool {
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return a.CreationTimestamp.Before(&b.CreationTimestamp)
+	}
+	return a.UID < b.UID
 }
 
 // buildDatamoverPodConfig assembles the configuration for the datamover pod

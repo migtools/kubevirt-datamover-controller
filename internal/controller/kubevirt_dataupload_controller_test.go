@@ -4008,6 +4008,461 @@ func TestHandlePrepared(t *testing.T) {
 	}
 }
 
+// TestHandlePreparedDataUpload_ConcurrencyLimit covers issue #174: gating
+// datamover pod creation in handlePrepared against MaxConcurrentDataMovers.
+// TestCountHigherPriorityActiveDataUploads exercises the ranking rules
+// countHigherPriorityActiveDataUploads applies on top of the raw active-phase
+// filter: phase/DataMover inclusion, and CreationTimestamp-first/UID-tiebreak
+// ranking against a fixed self DU.
+func TestCountHigherPriorityActiveDataUploads(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	oadpNS := "openshift-adp"
+	baseTime := metav1.NewTime(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+	olderTime := metav1.NewTime(time.Date(2026, 1, 1, 11, 59, 0, 0, time.UTC))
+	newerTime := metav1.NewTime(time.Date(2026, 1, 1, 12, 1, 0, 0, time.UTC))
+
+	makeDU := func(name string, uid types.UID, phase velerov2alpha1.DataUploadPhase, dataMover string, created *metav1.Time) *velerov2alpha1.DataUpload {
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: oadpNS, UID: uid},
+			Spec:       velerov2alpha1.DataUploadSpec{DataMover: dataMover},
+			Status:     velerov2alpha1.DataUploadStatus{Phase: phase},
+		}
+		if created != nil {
+			du.CreationTimestamp = *created
+		}
+		return du
+	}
+
+	self := makeDU("du-self", "self-uid", velerov2alpha1.DataUploadPhasePrepared, common.DataMoverKubeVirt, &baseTime)
+
+	tests := []struct {
+		name      string
+		otherDUs  []client.Object
+		wantCount int
+	}{
+		{name: "no other DUs", otherDUs: nil, wantCount: 0},
+		{
+			name: "counts higher-priority (older) Accepted/Prepared/InProgress peers",
+			otherDUs: []client.Object{
+				makeDU("du-accepted", "uid-1", velerov2alpha1.DataUploadPhaseAccepted, common.DataMoverKubeVirt, &olderTime),
+				makeDU("du-prepared", "uid-2", velerov2alpha1.DataUploadPhasePrepared, common.DataMoverKubeVirt, &olderTime),
+				makeDU("du-inprogress", "uid-3", velerov2alpha1.DataUploadPhaseInProgress, common.DataMoverKubeVirt, &olderTime),
+			},
+			wantCount: 3,
+		},
+		{
+			name: "excludes terminal phases even if older",
+			otherDUs: []client.Object{
+				makeDU("du-completed", "uid-1", velerov2alpha1.DataUploadPhaseCompleted, common.DataMoverKubeVirt, &olderTime),
+				makeDU("du-failed", "uid-2", velerov2alpha1.DataUploadPhaseFailed, common.DataMoverKubeVirt, &olderTime),
+				makeDU("du-canceled", "uid-3", velerov2alpha1.DataUploadPhaseCanceled, common.DataMoverKubeVirt, &olderTime),
+			},
+			wantCount: 0,
+		},
+		{
+			name: "excludes New (pre-provisioning) even if older",
+			otherDUs: []client.Object{
+				makeDU("du-new", "uid-1", velerov2alpha1.DataUploadPhaseNew, common.DataMoverKubeVirt, &olderTime),
+			},
+			wantCount: 0,
+		},
+		{
+			name: "excludes non-kubevirt DataMover CRs even if older and active",
+			otherDUs: []client.Object{
+				makeDU("du-other-mover", "uid-1", velerov2alpha1.DataUploadPhaseInProgress, "csi", &olderTime),
+			},
+			wantCount: 0,
+		},
+		{
+			name: "excludes an active peer with a later timestamp (lower priority)",
+			otherDUs: []client.Object{
+				makeDU("du-newer", "uid-1", velerov2alpha1.DataUploadPhaseInProgress, common.DataMoverKubeVirt, &newerTime),
+			},
+			wantCount: 0,
+		},
+		{
+			name: "counts an equal-timestamp peer whose UID tiebreaks ahead",
+			otherDUs: []client.Object{
+				makeDU("aaa-uid-wins-tiebreak", "aaa-uid", velerov2alpha1.DataUploadPhaseInProgress, common.DataMoverKubeVirt, &baseTime),
+			},
+			wantCount: 1,
+		},
+		{
+			name: "excludes an equal-timestamp peer whose UID tiebreaks behind",
+			otherDUs: []client.Object{
+				makeDU("zzz-uid-loses-tiebreak", "zzz-uid", velerov2alpha1.DataUploadPhaseInProgress, common.DataMoverKubeVirt, &baseTime),
+			},
+			wantCount: 0,
+		},
+		{
+			name: "ranking is unaffected by Status.AcceptedTimestamp (only CreationTimestamp matters)",
+			otherDUs: []client.Object{
+				func() *velerov2alpha1.DataUpload {
+					// A newer CreationTimestamp but an older AcceptedTimestamp --
+					// if ranking still consulted AcceptedTimestamp this peer
+					// would wrongly outrank self. It must not: CreationTimestamp
+					// alone decides rank.
+					du := makeDU("du-newer-creation-older-accepted", "uid-1", velerov2alpha1.DataUploadPhaseInProgress, common.DataMoverKubeVirt, &newerTime)
+					du.Status.AcceptedTimestamp = &olderTime
+					return du
+				}(),
+			},
+			wantCount: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objs := append([]client.Object{self}, tt.otherDUs...)
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+			r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+			count, err := r.countHigherPriorityActiveDataUploads(context.Background(), self)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if count != tt.wantCount {
+				t.Errorf("count = %d, want %d", count, tt.wantCount)
+			}
+		})
+	}
+}
+
+// TestHandlePreparedDataUpload_ConcurrencyLimit covers issue #174: gating
+// datamover pod creation in handlePrepared against MaxConcurrentDataMovers.
+func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	baseTime := metav1.NewTime(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+	olderTime := metav1.NewTime(time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC))
+
+	// newFixtureWithOthers seeds otherActiveCount peers strictly OLDER than du
+	// (by CreationTimestamp) so they always outrank du regardless of UID --
+	// these tests exercise the count/limit comparison itself, not ranking
+	// direction (that's TestCountHigherPriorityActiveDataUploads's job). du's
+	// own AcceptedTimestamp is separately seeded to exercise the gate's
+	// advance-on-defer behavior -- ranking never reads it.
+	newFixtureWithOthers := func(otherActiveCount int) (*velerov2alpha1.DataUpload, []runtime.Object) {
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "test-du",
+				Namespace:         "openshift-adp",
+				UID:               types.UID("du-uid-123"),
+				CreationTimestamp: baseTime,
+				Annotations: map[string]string{
+					common.AnnotationVMName:      "test-vm",
+					common.AnnotationVMNamespace: "vm-ns",
+					AnnotationVMBTName:           "vmbt-test-vm-abc",
+				},
+				Labels: map[string]string{
+					common.LabelVeleroBackupName: "velero-backup",
+				},
+			},
+			Spec: velerov2alpha1.DataUploadSpec{
+				DataMover:             common.DataMoverKubeVirt,
+				BackupStorageLocation: "default",
+				SourceNamespace:       "vm-ns",
+			},
+			Status: velerov2alpha1.DataUploadStatus{
+				Phase:             velerov2alpha1.DataUploadPhasePrepared,
+				AcceptedTimestamp: &baseTime,
+			},
+		}
+
+		bsl := &velerov1.BackupStorageLocation{
+			ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "openshift-adp"},
+			Spec: velerov1.BackupStorageLocationSpec{
+				Provider: "aws",
+				StorageType: velerov1.StorageType{
+					ObjectStorage: &velerov1.ObjectStorageLocation{Bucket: "test-bucket", Prefix: "velero"},
+				},
+				Config: map[string]string{"region": "us-east-1"},
+				Credential: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+					Key:                  "cloud",
+				},
+			},
+		}
+
+		checkpointName := "checkpoint-001"
+		tempPVCName := "kubevirt-backup-test-du-abc12"
+		vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "vmb-test-du",
+				Namespace: "vm-ns",
+				Labels:    map[string]string{common.LabelDataUploadUID: "du-uid-123"},
+			},
+			Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{PvcName: &tempPVCName},
+			Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+				Type:           kubevirtbackupv1alpha1.Full,
+				CheckpointName: &checkpointName,
+			},
+		}
+
+		reboundPVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: common.ReboundPVCNamePrefix + "test-du", Namespace: "openshift-adp"},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				VolumeName:  "pv-123",
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+				},
+			},
+			Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+		}
+
+		objs := make([]runtime.Object, 0, 3+otherActiveCount)
+		objs = append(objs, bsl, vmb, reboundPVC)
+		for i := range otherActiveCount {
+			other := &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: fmt.Sprintf("other-du-%d", i), Namespace: "openshift-adp", UID: types.UID(fmt.Sprintf("other-uid-%d", i)),
+					CreationTimestamp: olderTime,
+				},
+				Spec:   velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+				Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseInProgress, AcceptedTimestamp: &olderTime},
+			}
+			objs = append(objs, other)
+		}
+		return du, objs
+	}
+
+	t.Run("proceeds when under the limit", func(t *testing.T) {
+		du, objs := newFixtureWithOthers(2)
+		builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du)
+		for _, obj := range objs {
+			builder = builder.WithRuntimeObjects(obj)
+		}
+		fakeClient := builder.Build()
+		r := &KubeVirtDataUploadReconciler{
+			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 3,
+		}
+
+		if _, err := r.handlePrepared(context.Background(), logr.Discard(), du); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated velerov2alpha1.DataUpload
+		_ = fakeClient.Get(context.Background(), types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, &updated)
+		if updated.Status.Phase != velerov2alpha1.DataUploadPhaseInProgress {
+			t.Errorf("phase = %q, want %q (should proceed: 2 others < limit 3)", updated.Status.Phase, velerov2alpha1.DataUploadPhaseInProgress)
+		}
+	})
+
+	t.Run("requeues without creating a pod when at the limit", func(t *testing.T) {
+		du, objs := newFixtureWithOthers(3)
+		builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du)
+		for _, obj := range objs {
+			builder = builder.WithRuntimeObjects(obj)
+		}
+		fakeClient := builder.Build()
+		r := &KubeVirtDataUploadReconciler{
+			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 3,
+		}
+
+		result, err := r.handlePrepared(context.Background(), logr.Discard(), du)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.RequeueAfter != RequeueAfterLong {
+			t.Errorf("RequeueAfter = %v, want %v", result.RequeueAfter, RequeueAfterLong)
+		}
+
+		var updated velerov2alpha1.DataUpload
+		_ = fakeClient.Get(context.Background(), types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, &updated)
+		if updated.Status.Phase != velerov2alpha1.DataUploadPhasePrepared {
+			t.Errorf("phase = %q, want still %q (at limit 3, must not proceed)", updated.Status.Phase, velerov2alpha1.DataUploadPhasePrepared)
+		}
+
+		pod, err := r.findPodForDataUpload(context.Background(), du, "openshift-adp")
+		if err != nil {
+			t.Fatalf("failed to find pod: %v", err)
+		}
+		if pod != nil {
+			t.Error("expected no datamover pod to be created while gated")
+		}
+
+		// Deferring due to the concurrency limit is intentional throttling, not
+		// a stalled operation -- AcceptedTimestamp must advance by exactly the
+		// requeue interval so this wait doesn't consume Spec.OperationTimeout's
+		// budget (see the gate's defer branch in checkConcurrentDataMoverLimit).
+		wantAdvanced := baseTime.Add(RequeueAfterLong)
+		if updated.Status.AcceptedTimestamp == nil || !updated.Status.AcceptedTimestamp.Time.Equal(wantAdvanced) {
+			t.Errorf("AcceptedTimestamp = %v, want %v (baseTime + RequeueAfterLong)", updated.Status.AcceptedTimestamp, wantAdvanced)
+		}
+	})
+
+	t.Run("unlimited (MaxConcurrentDataMovers=0) always proceeds", func(t *testing.T) {
+		du, objs := newFixtureWithOthers(50)
+		builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du)
+		for _, obj := range objs {
+			builder = builder.WithRuntimeObjects(obj)
+		}
+		fakeClient := builder.Build()
+		r := &KubeVirtDataUploadReconciler{
+			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 0,
+		}
+
+		if _, err := r.handlePrepared(context.Background(), logr.Discard(), du); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated velerov2alpha1.DataUpload
+		_ = fakeClient.Get(context.Background(), types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, &updated)
+		if updated.Status.Phase != velerov2alpha1.DataUploadPhaseInProgress {
+			t.Errorf("phase = %q, want %q (limit disabled, must proceed regardless of active count)", updated.Status.Phase, velerov2alpha1.DataUploadPhaseInProgress)
+		}
+	})
+}
+
+// TestHandlePreparedDataUpload_ConcurrentDeadlockRegression pins the fix for
+// the livelock found during this PR's own live-cluster validation (see PR
+// #187 review comments): when N DataUploads for different VMs (e.g. a Backup
+// targeting several VMs at once) all reach Prepared together, a raw
+// active-count gate is symmetric -- every sibling sees N-1 others active,
+// and if N-1 >= limit, all of them defer forever, since none can reach
+// InProgress without passing a gate that's held by peers stuck at the same
+// gate. Ranking (countHigherPriorityActiveDataUploads) breaks that symmetry:
+// exactly the first MaxConcurrentDataMovers-ranked siblings must proceed
+// regardless of the order handlePrepared happens to be called in.
+func TestHandlePreparedDataUpload_ConcurrentDeadlockRegression(t *testing.T) {
+	const (
+		oadpNS   = "openshift-adp"
+		siblings = 5
+		limit    = 2
+	)
+	baseTime := metav1.NewTime(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: oadpNS},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{Bucket: "test-bucket", Prefix: "velero"},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	objs := make([]client.Object, 0, 1+3*siblings)
+	objs = append(objs, bsl)
+	dus := make([]*velerov2alpha1.DataUpload, siblings)
+	for i := range siblings {
+		checkpointName := fmt.Sprintf("checkpoint-%d", i)
+		tempPVCName := fmt.Sprintf("kubevirt-backup-du-%d-abc12", i)
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("du-vm-%d", i), Namespace: oadpNS, UID: types.UID(fmt.Sprintf("du-vm-%d-uid", i)),
+				// Same CreationTimestamp for every sibling -- exactly what a
+				// Backup targeting several VMs at once produces. Ranking falls
+				// through to the UID tiebreak, which is still a strict total
+				// order, so this is the deadlock scenario at its sharpest: no
+				// timestamp differences to accidentally break the symmetry.
+				CreationTimestamp: baseTime,
+				Annotations: map[string]string{
+					common.AnnotationVMName:      fmt.Sprintf("vm-%d", i),
+					common.AnnotationVMNamespace: "vm-ns",
+					AnnotationVMBTName:           fmt.Sprintf("vmbt-vm-%d", i),
+				},
+				Labels: map[string]string{
+					common.LabelVeleroBackupName: "velero-backup",
+				},
+			},
+			Spec: velerov2alpha1.DataUploadSpec{
+				DataMover:             common.DataMoverKubeVirt,
+				BackupStorageLocation: "default",
+				SourceNamespace:       "vm-ns",
+			},
+			Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhasePrepared, AcceptedTimestamp: &baseTime},
+		}
+		vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("vmb-vm-%d", i),
+				Namespace: "vm-ns",
+				Labels:    map[string]string{common.LabelDataUploadUID: string(du.UID)},
+			},
+			Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{PvcName: &tempPVCName},
+			Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+				Type:           kubevirtbackupv1alpha1.Full,
+				CheckpointName: &checkpointName,
+			},
+		}
+		reboundPVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("%sdu-vm-%d", common.ReboundPVCNamePrefix, i), Namespace: oadpNS},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				VolumeName:  fmt.Sprintf("pv-%d", i),
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+				},
+			},
+			Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+		}
+		dus[i] = du
+		objs = append(objs, du, vmb, reboundPVC)
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	r := &KubeVirtDataUploadReconciler{
+		Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: oadpNS,
+		DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: limit,
+	}
+
+	// Reconcile every sibling exactly once, in reverse order -- if the gate's
+	// decisions depended on call order rather than each DU's own precomputed
+	// rank, this would expose it (the deadlocked version of the gate defers
+	// every single one regardless of order, so this alone would already
+	// catch that bug; processing backwards additionally rules out an
+	// order-dependent partial fix).
+	for i := siblings - 1; i >= 0; i-- {
+		if _, err := r.handlePrepared(context.Background(), logr.Discard(), dus[i]); err != nil {
+			t.Fatalf("du-vm-%d: unexpected error: %v", i, err)
+		}
+	}
+
+	inProgress, prepared := 0, 0
+	for i := range siblings {
+		var updated velerov2alpha1.DataUpload
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: dus[i].Name, Namespace: oadpNS}, &updated); err != nil {
+			t.Fatalf("du-vm-%d: failed to get DataUpload: %v", i, err)
+		}
+		switch updated.Status.Phase {
+		case velerov2alpha1.DataUploadPhaseInProgress:
+			inProgress++
+		case velerov2alpha1.DataUploadPhasePrepared:
+			prepared++
+		default:
+			t.Errorf("du-vm-%d: phase = %q, want InProgress or Prepared", i, updated.Status.Phase)
+		}
+	}
+
+	if inProgress != limit {
+		t.Errorf("got %d DataUploads InProgress, want exactly %d (MaxConcurrentDataMovers) -- %d stuck deferred forever means the gate deadlocked",
+			inProgress, limit, prepared)
+	}
+	if prepared != siblings-limit {
+		t.Errorf("got %d DataUploads still Prepared (deferred), want %d", prepared, siblings-limit)
+	}
+}
+
 func TestGetCredentialsFromBSL(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov1.AddToScheme(scheme)
