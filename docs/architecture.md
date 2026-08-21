@@ -59,7 +59,7 @@ stateDiagram-v2
     Accepted --> Prepared: VMBT/VMB created, VMB Done=True
     Prepared --> InProgress: datamover pod launched
     InProgress --> Completed: pod succeeded, cleanup done
-    InProgress --> Canceling: cancel requested
+    InProgress --> Canceling: status.phase set to Canceling externally
     Canceling --> Canceled
     New --> Failed
     Accepted --> Failed
@@ -69,6 +69,15 @@ stateDiagram-v2
     Failed --> [*]
     Canceled --> [*]
 ```
+
+A note on cancellation: the DataUpload reconciler does not watch `spec.Cancel` itself. It
+only reacts once something else, typically Velero's own DataUpload controller, has already
+set `status.phase` to `Canceling`; `handleCanceling` then runs cleanup (deleting the datamover
+pod, temporary PVC, and any VMB it created). This is different from the DataDownload
+reconciler below, which does watch `spec.Cancel` directly on every reconcile. If you are
+debugging a stuck cancellation, check whether `spec.Cancel` was set but `status.phase` never
+moved to `Canceling`, since that would mean something upstream (Velero, or a user editing the
+object directly) needs to make that transition for a DataUpload.
 
 ### New to Accepted (`handleNew`)
 
@@ -222,7 +231,10 @@ graph LR
 ## Restore (DataDownload) reconciliation phases
 
 The `KubeVirtDataDownloadReconciler`
-(`internal/controller/kubevirt_datadownload_controller.go`) follows the same phase model:
+(`internal/controller/kubevirt_datadownload_controller.go`) follows the same phase names, but
+unlike the DataUpload reconciler above, it watches `spec.Cancel` directly on every reconcile
+and drives its own transition into `Canceling` (with special handling if a cancel races an
+already-provisioned restore):
 
 ```mermaid
 stateDiagram-v2

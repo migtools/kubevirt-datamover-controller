@@ -38,18 +38,27 @@ make lint-fix   # auto-fix what it can
 
 ### Kubebuilder-scaffolded e2e suite
 
-`test/e2e/e2e_test.go` is Kubebuilder's default scaffolded suite (Ginkgo/Gomega). It expects a
-cluster reachable via the current kubeconfig context, deploys the controller with
-`make deploy`, and checks that the controller-manager pod comes up and serves metrics. Run it
-against a disposable [Kind](https://kind.sigs.k8s.io/) cluster, never a real dev or prod
-cluster:
+`test/e2e/e2e_test.go` is Kubebuilder's default scaffolded suite (Ginkgo/Gomega). Its
+`BeforeSuite` (`test/e2e/e2e_suite_test.go`) builds and loads its own manager image
+(`example.com/kubevirt-datamover-controller:v0.0.1`, hardcoded), installs cert-manager if it
+isn't already present, deploys the controller with `make deploy`, and checks that the
+controller-manager pod comes up and serves metrics. Run it against a disposable
+[Kind](https://kind.sigs.k8s.io/) cluster, never a real dev or prod cluster:
 
 ```bash
 kind create cluster --name kdm-e2e
-make docker-build IMG=kdm-e2e:latest
-kind load docker-image kdm-e2e:latest --name kdm-e2e
+export KIND_CLUSTER=kdm-e2e
 go test ./test/e2e/... -tags e2e -v
 ```
+
+Setting `KIND_CLUSTER` matters: the suite's own image-loading step
+(`utils.LoadImageToKindClusterWithName`) loads into whatever cluster that variable names, and
+falls back to a cluster literally named `kind` if it isn't set. You do not need to
+`docker-build`/`kind load` anything yourself first, the suite does that for you with its own
+hardcoded image name.
+
+If cert-manager is already installed on the cluster, or you'd rather skip the automatic
+install/teardown, set `CERT_MANAGER_INSTALL_SKIP=true` before running the suite.
 
 This suite validates the manager deployment and metrics endpoint. It does **not** exercise
 the CBT backup/restore flow, since that needs a real KubeVirt installation with a running VM,
