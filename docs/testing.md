@@ -38,11 +38,12 @@ make lint-fix   # auto-fix what it can
 
 ### Kubebuilder-scaffolded e2e suite
 
-`test/e2e/e2e_test.go` is Kubebuilder's default scaffolded suite (Ginkgo/Gomega). Its
-`BeforeSuite` (`test/e2e/e2e_suite_test.go`) builds and loads its own manager image
-(`example.com/kubevirt-datamover-controller:v0.0.1`, hardcoded), installs cert-manager if it
-isn't already present, deploys the controller with `make deploy`, and checks that the
-controller-manager pod comes up and serves metrics. Run it against a disposable
+`test/e2e/e2e_test.go` is Kubebuilder's default scaffolded suite (Ginkgo/Gomega).
+`test/e2e/e2e_suite_test.go`'s `BeforeSuite` builds and loads its own manager image
+(`example.com/kubevirt-datamover-controller:v0.0.1`, hardcoded) and installs cert-manager if
+it isn't already present. `e2e_test.go`'s own `BeforeAll` then installs the CRDs and deploys
+the controller with `make deploy`, and its test cases check that the controller-manager pod
+comes up and serves metrics. Run it against a disposable
 [Kind](https://kind.sigs.k8s.io/) cluster, never a real dev or prod cluster:
 
 ```bash

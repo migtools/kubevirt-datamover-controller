@@ -193,7 +193,7 @@ make run
 
 ## Kubebuilder
 
-The project was generated using kubebuilder version `v4.6.0`, running the following commands:
+The project was generated using kubebuilder version `v4.11.0`, running the following commands:
 ```sh
 kubebuilder init \
     --plugins go.kubebuilder.io/v4 \
