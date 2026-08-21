@@ -114,8 +114,9 @@ This is where most of the work happens:
    - Otherwise, look up the archived `vmbt.json` from the BSL's per-VM checkpoint index (see
      [Object storage layout](#object-storage-layout-and-the-checkpoint-chain) below) and
      recreate the VMBT on-cluster with `status.latestCheckpoint` restored from that archive.
-     This is what lets incremental backups keep working even though the VMBT and VMB are
-     deleted from the cluster after every backup.
+     This fallback only matters if the on-cluster VMBT is ever missing, since in normal
+     operation the VMBT stays on the cluster across backups and only the VMB gets deleted
+     after each one (see "What the datamover pod does during upload" below).
 5. **Backup mode resolution** (`resolveBackupMode`/`validateBSLCheckpoint`): decide whether
    this backup must be a **full** backup or can be **incremental**, in this priority order:
    - The `kubevirt-datamover.io/force-full-backup: "true"` annotation.
@@ -174,8 +175,12 @@ The pod runs `/manager upload` (`pkg/uploader/run.go`), which:
 3. Uploads them to `checkpoints/<vm-namespace>/<vm-name>/<checkpoint-id>/*.qcow2` in the BSL
    bucket.
 4. Archives the VMB and VMBT as JSON (`vmb.json`/`vmbt.json`) alongside the checkpoint, then
-   **deletes the VMB and VMBT from the cluster** (they get recreated from these archives on
-   the next backup, see step 4 above).
+   **deletes the VMB from the cluster** (`cleanupKubeResources` in `pkg/uploader/run.go`). The
+   VMBT is deliberately left on the cluster, not deleted, so KubeVirt can reuse it to redefine
+   the VM's libvirt checkpoint across restarts and live migrations (see step 4 in "Prepared to
+   InProgress" above and `prepareVMBackupTracker`). The archived `vmbt.json` only comes into
+   play as a fallback if the on-cluster VMBT is ever missing, for example if the VM's namespace
+   was recreated.
 5. Updates the per-VM `index.json` checkpoint index and the per-Velero-backup manifest
    (details below), correcting the index if there's a backup-type mismatch (for example, the
    VM unexpectedly lost its libvirt checkpoint and KubeVirt performed a full backup when an
@@ -225,9 +230,10 @@ graph LR
   index.
 - **Deletion**: when a Velero backup is deleted, the plugin's `DeleteItemAction`
   (`vm/delete.go` in kubevirt-datamover-plugin) removes that backup from each referenced
-  checkpoint's `referencedBy`, and only deletes the checkpoint's qcow2 files, VMB, and VMBT
-  once no backup references it anymore. So deleting an old full backup that a newer
-  incremental still depends on won't break the chain.
+  checkpoint's `referencedBy`, and only deletes the checkpoint's qcow2 files and archived
+  `vmb.json`/`vmbt.json` from object storage once no backup references it anymore. This is
+  purely an object storage cleanup, it has no effect on the live, on-cluster VMBT. So deleting
+  an old full backup that a newer incremental still depends on won't break the chain.
 
 ## Restore (DataDownload) reconciliation phases
 
