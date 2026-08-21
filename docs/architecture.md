@@ -142,9 +142,10 @@ This is where most of the work happens:
 
 ### Prepared to InProgress (`handlePrepared`)
 
-1. Enforce `--max-concurrent-data-movers` if it's set. This caps how many DataUploads and
-   DataDownloads may be in an active phase at once, gating pod creation before any further
-   work happens.
+1. Enforce `--max-concurrent-data-movers` if it's set. Each reconciler applies this limit to
+   its own resource type independently, so a value of `5` allows up to 5 DataUploads active
+   at once and, separately, up to 5 DataDownloads active at once, not 5 total across both.
+   This gates pod creation before any further work happens.
 2. **Rebind the PV** holding the temp backup PVC from the VM's namespace into the OADP
    namespace (`rebindPVToNamespace` in `pv_rebind.go`). This is needed because the datamover
    pod has to access both the backed-up data and the BSL credentials/config at the same time,
