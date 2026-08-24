@@ -217,13 +217,23 @@ func TestValidateExistingPVCForBind(t *testing.T) {
 			errorContains: "access mode",
 		},
 		{
-			name: "selector does not match PV labels",
+			name: "selector matchExpressions is rejected",
+			pv:   basePV(nil),
+			pvc: basePVC(func(p *corev1.PersistentVolumeClaim) {
+				p.Spec.Selector = &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "some-label", Operator: metav1.LabelSelectorOpExists},
+				}}
+			}),
+			expectError:   true,
+			errorContains: "matchExpressions",
+		},
+		{
+			name: "selector matchLabels not yet on PV is reconciled onto it instead of failing",
 			pv:   basePV(nil),
 			pvc: basePVC(func(p *corev1.PersistentVolumeClaim) {
 				p.Spec.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"some-label": "some-value"}}
 			}),
-			expectError:   true,
-			errorContains: "selector",
+			expectError: false,
 		},
 		{
 			name: "target PVC being deleted fails",
@@ -247,6 +257,9 @@ func TestValidateExistingPVCForBind(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			builder := fake.NewClientBuilder().WithScheme(scheme)
+			if tt.pv != nil {
+				builder = builder.WithObjects(tt.pv)
+			}
 			if !tt.skipCreatePVC && tt.pvc != nil {
 				builder = builder.WithObjects(tt.pvc)
 			}
@@ -271,6 +284,17 @@ func TestValidateExistingPVCForBind(t *testing.T) {
 			}
 			if result.Name != "target-pvc" {
 				t.Errorf("result.Name = %q, want %q", result.Name, "target-pvc")
+			}
+			if tt.name == "selector matchLabels not yet on PV is reconciled onto it instead of failing" {
+				var gotPV corev1.PersistentVolume
+				if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: tt.pv.Name}, &gotPV); err != nil {
+					t.Fatalf("failed to re-fetch PV: %v", err)
+				}
+				for k, v := range tt.pvc.Spec.Selector.MatchLabels {
+					if gotPV.Labels[k] != v {
+						t.Errorf("PV label %q = %q, want %q (selector should have been reconciled onto the PV)", k, gotPV.Labels[k], v)
+					}
+				}
 			}
 		})
 	}

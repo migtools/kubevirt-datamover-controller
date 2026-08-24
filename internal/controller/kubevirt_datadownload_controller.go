@@ -436,12 +436,19 @@ func (r *KubeVirtDataDownloadReconciler) handleAccepted(ctx context.Context, log
 		return ctrl.Result{}, fmt.Errorf("failed to get target PVC: %w", err)
 	}
 
-	// The final rebind patches the scratch PV's claimRef onto this PVC. A selector
-	// on the target PVC must match the rebound PV's labels, so reject it now,
-	// before any download work, instead of after a full download fails to bind.
-	if targetPVC.Spec.Selector != nil {
+	// The final rebind patches the scratch PV's claimRef onto this PVC. A
+	// matchLabels-only Spec.Selector is accepted -- validateExistingPVCForBind
+	// (called from completeSuccessfulDownload's rebindPVToNamespace) reconciles
+	// the rebound PV's labels to satisfy it rather than treating it as a
+	// conflict. This is the same technique Velero's own built-in CSI
+	// DataDownload restore path uses (velero.io/dynamic-pv-restore) to keep the
+	// dynamic provisioner from racing this rebind, regardless of the target
+	// StorageClass's volumeBindingMode. Only matchExpressions has no general
+	// way to be satisfied, so that shape is still rejected here, before any
+	// download work, instead of after a full download fails to bind.
+	if targetPVC.Spec.Selector != nil && len(targetPVC.Spec.Selector.MatchExpressions) > 0 {
 		if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed,
-			fmt.Sprintf("target PVC %s/%s declares spec.selector, which is not supported for restore rebinding",
+			fmt.Sprintf("target PVC %s/%s declares spec.selector.matchExpressions, which is not supported for restore rebinding (only matchLabels)",
 				dd.Spec.TargetVolume.Namespace, dd.Spec.TargetVolume.PVC)); err != nil {
 			return ctrl.Result{}, err
 		}
