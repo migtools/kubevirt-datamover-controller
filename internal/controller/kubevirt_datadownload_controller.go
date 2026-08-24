@@ -1135,6 +1135,10 @@ func (r *KubeVirtDataDownloadReconciler) ensureScratchPVC(
 // DatamoverPodConfig.ScratchPVCName's doc comment). Always Filesystem mode
 // regardless of the target's own VolumeMode: the downloader stages multiple
 // named chain files on it, which a Block-mode volume has no way to hold.
+// Always ReadWriteOnce too, deliberately not the target's own AccessModes:
+// exactly one pod (this controller's downloader) ever mounts it, on one
+// node, and several CSI drivers (e.g. Ceph RBD) reject ReadWriteMany on a
+// Filesystem-mode volume outright even when the target itself is RWX.
 func (r *KubeVirtDataDownloadReconciler) ensureWorkPVC(
 	ctx context.Context,
 	logger logr.Logger,
@@ -1143,7 +1147,8 @@ func (r *KubeVirtDataDownloadReconciler) ensureWorkPVC(
 	size resource.Quantity,
 ) (*corev1.PersistentVolumeClaim, error) {
 	filesystemMode := corev1.PersistentVolumeFilesystem
-	return r.ensureScratchPVCWithRole(ctx, logger, dd, common.ScratchVolumeRoleWork, targetPVC.Spec.AccessModes, targetPVC.Spec.StorageClassName, &filesystemMode, size)
+	workAccessModes := []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+	return r.ensureScratchPVCWithRole(ctx, logger, dd, common.ScratchVolumeRoleWork, workAccessModes, targetPVC.Spec.StorageClassName, &filesystemMode, size)
 }
 
 // ensureOutputPVC creates or retrieves the Block-mode output PVC that
