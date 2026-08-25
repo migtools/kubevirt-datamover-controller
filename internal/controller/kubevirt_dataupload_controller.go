@@ -589,63 +589,7 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 	}
 
 	if doneCond != nil && doneCond.Status == corev1.ConditionTrue {
-		// Done=True can mean "finished with error" — KubeVirt sets Done=True together with
-		// Progressing=False when the backup fails (e.g., "No space left on device"), but the
-		// Reason is a descriptive string like "Backup has failed: <details>" rather than the
-		// literal "Failed". Detect failure via a case-insensitive "failed" substring match on
-		// either condition, and take the failure detail from whichever condition actually
-		// carries it — never from a condition just because it happens to have non-empty text.
-		var progressingCandidate *kubevirtbackupv1alpha1.Condition
-		if progressingCond != nil && progressingCond.Status == corev1.ConditionFalse {
-			progressingCandidate = progressingCond
-		}
-		if conditionIndicatesFailure(progressingCandidate) || conditionIndicatesFailure(doneCond) {
-			reason, failureMessage := pickFailureDetail(progressingCandidate, doneCond)
-			logger.Error(nil, "VirtualMachineBackup failed (Done=True with failure)",
-				"vmb", vmb.Name, "reason", reason, "message", failureMessage)
-			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
-				fmt.Sprintf("VMBackup failed: %s", failureMessage)); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{}, nil
-		}
-		// By default quiescing is enabled (SkipQuiesce=false), so a freeze
-		// failure means the application-consistent guarantee was not met even
-		// though KubeVirt reports the backup as Done=True. Fail the DataUpload
-		// so the user gets a clear signal. When AnnotationSkipQuiesce is set,
-		// the user explicitly opted out of quiescing, so freeze warnings are
-		// moot and we allow the backup to proceed. Fixes #14.
-		//
-		// In KubeVirt v1.8.0 the freeze-failure text is propagated via
-		// virt-launcher's BackupMsg → resolveCompletion → SyncInfo.reason →
-		// newDoneCondition, which only populates the condition's Reason field.
-		// We also check Message defensively for forward compatibility.
-		skipQuiesce := du.Annotations[common.AnnotationSkipQuiesce] == skipQuiesceValue
-		freezeFailed := strings.Contains(doneCond.Reason, common.FreezeFailureMarker) ||
-			strings.Contains(doneCond.Message, common.FreezeFailureMarker)
-		if !skipQuiesce && freezeFailed {
-			logger.Error(nil, "VirtualMachineBackup completed but guest filesystem freeze failed",
-				"vmb", vmb.Name,
-				"reason", doneCond.Reason,
-				"message", doneCond.Message)
-			detail := strings.TrimSpace(doneCond.Reason + " " + doneCond.Message)
-			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
-				fmt.Sprintf("Application-consistent backup failed: %s", detail)); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{}, nil
-		}
-
-		logger.Info("VirtualMachineBackup completed",
-			"vmb", vmb.Name,
-			"type", vmb.Status.Type,
-			"checkpoint", vmb.Status.CheckpointName)
-
-		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhasePrepared,
-			fmt.Sprintf("VMBackup completed (type=%s)", vmb.Status.Type)); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+		return r.handleVMBackupDoneTrue(ctx, logger, du, vmb, doneCond, progressingCond)
 	}
 
 	if doneCond != nil && doneCond.Status == corev1.ConditionFalse {
@@ -695,6 +639,72 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 
 	// No Done condition yet, or backup still running - requeue
 	logger.Info("VirtualMachineBackup in progress, requeuing")
+	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+}
+
+// handleVMBackupDoneTrue processes a VirtualMachineBackup that has reached Done=True,
+// handling success, failure-marked-as-done, and freeze failures.
+func (r *KubeVirtDataUploadReconciler) handleVMBackupDoneTrue(
+	ctx context.Context, logger logr.Logger,
+	du *velerov2alpha1.DataUpload, vmb *kubevirtbackupv1alpha1.VirtualMachineBackup,
+	doneCond, progressingCond *kubevirtbackupv1alpha1.Condition,
+) (ctrl.Result, error) {
+	// Done=True can mean "finished with error" — KubeVirt sets Done=True together with
+	// Progressing=False when the backup fails (e.g., "No space left on device"), but the
+	// Reason is a descriptive string like "Backup has failed: <details>" rather than the
+	// literal "Failed". Detect failure via a case-insensitive "failed" substring match on
+	// either condition, and take the failure detail from whichever condition actually
+	// carries it — never from a condition just because it happens to have non-empty text.
+	var progressingCandidate *kubevirtbackupv1alpha1.Condition
+	if progressingCond != nil && progressingCond.Status == corev1.ConditionFalse {
+		progressingCandidate = progressingCond
+	}
+	if conditionIndicatesFailure(progressingCandidate) || conditionIndicatesFailure(doneCond) {
+		reason, failureMessage := pickFailureDetail(progressingCandidate, doneCond)
+		logger.Error(nil, "VirtualMachineBackup failed (Done=True with failure)",
+			"vmb", vmb.Name, "reason", reason, "message", failureMessage)
+		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+			fmt.Sprintf("VMBackup failed: %s", failureMessage)); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+	// By default quiescing is enabled (SkipQuiesce=false), so a freeze
+	// failure means the application-consistent guarantee was not met even
+	// though KubeVirt reports the backup as Done=True. Fail the DataUpload
+	// so the user gets a clear signal. When AnnotationSkipQuiesce is set,
+	// the user explicitly opted out of quiescing, so freeze warnings are
+	// moot and we allow the backup to proceed. Fixes #14.
+	//
+	// In KubeVirt v1.8.0 the freeze-failure text is propagated via
+	// virt-launcher's BackupMsg → resolveCompletion → SyncInfo.reason →
+	// newDoneCondition, which only populates the condition's Reason field.
+	// We also check Message defensively for forward compatibility.
+	skipQuiesce := du.Annotations[common.AnnotationSkipQuiesce] == skipQuiesceValue
+	freezeFailed := strings.Contains(doneCond.Reason, common.FreezeFailureMarker) ||
+		strings.Contains(doneCond.Message, common.FreezeFailureMarker)
+	if !skipQuiesce && freezeFailed {
+		logger.Error(nil, "VirtualMachineBackup completed but guest filesystem freeze failed",
+			"vmb", vmb.Name,
+			"reason", doneCond.Reason,
+			"message", doneCond.Message)
+		detail := strings.TrimSpace(doneCond.Reason + " " + doneCond.Message)
+		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+			fmt.Sprintf("Application-consistent backup failed: %s", detail)); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	logger.Info("VirtualMachineBackup completed",
+		"vmb", vmb.Name,
+		"type", vmb.Status.Type,
+		"checkpoint", vmb.Status.CheckpointName)
+
+	if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhasePrepared,
+		fmt.Sprintf("VMBackup completed (type=%s)", vmb.Status.Type)); err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 }
 
@@ -832,7 +842,7 @@ func (r *KubeVirtDataUploadReconciler) validateBSLCheckpoint(ctx context.Context
 			"reason", bslErr.Error())
 	} else {
 		var err error
-		checkpointLookup, err = r.lookupCheckpointFromBSL(ctx, bsl, vmRef.Namespace, vmRef.Name)
+		checkpointLookup, err = r.lookupCheckpointFromBSL(ctx, bsl, vmNamespace, vmRef.Name)
 		if err != nil {
 			// Checkpoint lookup failure is non-fatal. Validation will be retried
 			// on the next reconcile.
