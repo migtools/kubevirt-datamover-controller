@@ -4485,6 +4485,42 @@ func TestRestoreVMRunStateIfAllSiblingsCompleted(t *testing.T) {
 		}
 	})
 
+	t.Run("does not flip while an incomplete sibling from the same restore exists", func(t *testing.T) {
+		scheme := ddSchemeWithKubeVirt()
+		dd := newDD("dd-1", velerov2alpha1.DataDownloadPhaseCompleted)
+		dd.Labels = map[string]string{common.LabelVeleroRestoreName: "restore-current"}
+		sibling := newDD("dd-2", velerov2alpha1.DataDownloadPhaseInProgress)
+		sibling.Labels = map[string]string{common.LabelVeleroRestoreName: "restore-current"}
+		vm := &kubevirtcorev1.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      vmName,
+				Namespace: vmNamespace,
+				Annotations: map[string]string{
+					common.AnnotationOriginalRunStrategy:       string(kubevirtcorev1.RunStrategyAlways),
+					common.AnnotationOriginalRunStrategySource: common.RunStrategySourceRunStrategy,
+				},
+			},
+			Spec: kubevirtcorev1.VirtualMachineSpec{RunStrategy: new(kubevirtcorev1.RunStrategyHalted)},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, sibling, vm).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+		if err := r.restoreVMRunStateIfAllSiblingsCompleted(context.Background(), logr.Discard(), dd); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated kubevirtcorev1.VirtualMachine
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: vmName, Namespace: vmNamespace}, &updated); err != nil {
+			t.Fatalf("failed to get VM: %v", err)
+		}
+		if updated.Spec.RunStrategy == nil || *updated.Spec.RunStrategy != kubevirtcorev1.RunStrategyHalted {
+			t.Errorf("RunStrategy = %v, want still %q (sibling from the SAME restore is still InProgress)", updated.Spec.RunStrategy, kubevirtcorev1.RunStrategyHalted)
+		}
+		if _, ok := updated.Annotations[common.AnnotationOriginalRunStrategy]; !ok {
+			t.Error("stash annotation should not have been removed while a same-restore sibling is incomplete")
+		}
+	})
+
 	t.Run("tolerates VM already gone", func(t *testing.T) {
 		scheme := ddSchemeWithKubeVirt()
 		dd := newDD("dd-1", velerov2alpha1.DataDownloadPhaseCompleted)
