@@ -75,6 +75,9 @@ const (
 	// hotplug volume name as "<vmb-name>-backup-target-pvc" which must be a
 	// valid DNS label (≤ 63 chars). Reserve 18 chars for that suffix.
 	maxVMBNameLen = 63 - len("-backup-target-pvc") // = 45
+
+	// skipQuiesceValue is the value set on the skipQuiesce annotation to enable it
+	skipQuiesceValue = "true"
 )
 
 // KubeVirtDataUploadReconciler reconciles DataUpload objects where Spec.DataMover is "kubevirt"
@@ -509,7 +512,7 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		// Default is application-consistent (SkipQuiesce=false), matching
 		// KubeVirt's own default. Users opt out via AnnotationSkipQuiesce
 		// on the DataUpload (propagated from Backup or VM). Fixes #14.
-		skipQuiesce := du.Annotations[common.AnnotationSkipQuiesce] == "true"
+		skipQuiesce := du.Annotations[common.AnnotationSkipQuiesce] == skipQuiesceValue
 		var created bool
 		vmb, created, err = r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmRef.Namespace, forceFullBackup, skipQuiesce)
 		if err != nil {
@@ -617,7 +620,7 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 		// virt-launcher's BackupMsg → resolveCompletion → SyncInfo.reason →
 		// newDoneCondition, which only populates the condition's Reason field.
 		// We also check Message defensively for forward compatibility.
-		skipQuiesce := du.Annotations[common.AnnotationSkipQuiesce] == "true"
+		skipQuiesce := du.Annotations[common.AnnotationSkipQuiesce] == skipQuiesceValue
 		freezeFailed := strings.Contains(doneCond.Reason, common.FreezeFailureMarker) ||
 			strings.Contains(doneCond.Message, common.FreezeFailureMarker)
 		if !skipQuiesce && freezeFailed {
