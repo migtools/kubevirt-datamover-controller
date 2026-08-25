@@ -1322,7 +1322,7 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 		expectRequeue           bool
 		skipVMBT                bool   // when true, do not create the VMBT (simulates deleted VMBT)
 		expectedMessageContains string // when set, DataUpload's failure message must contain this
-		skipQuiesce             bool // when true, set the skip-quiesce annotation on the DU
+		skipQuiesce             bool   // when true, set the skip-quiesce annotation on the DU
 	}{
 		{
 			name: "VMB Done True transitions to Prepared",
@@ -7089,6 +7089,7 @@ func TestHandleAccepted_QuiesceByDefault(t *testing.T) {
 		},
 	}
 
+	apiGroup := "kubevirt.io"
 	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "vmbt-" + vmName,
@@ -7096,7 +7097,7 @@ func TestHandleAccepted_QuiesceByDefault(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: &apiGroup,
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -7181,6 +7182,7 @@ func TestHandleAccepted_SkipQuiesceAnnotation(t *testing.T) {
 		},
 	}
 
+	apiGroup := "kubevirt.io"
 	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "vmbt-" + vmName,
@@ -7188,7 +7190,7 @@ func TestHandleAccepted_SkipQuiesceAnnotation(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: &apiGroup,
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
