@@ -30,7 +30,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8slabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -458,13 +457,23 @@ func createNewBoundPVC(
 
 // validateExistingPVCForBind validates that an already-existing target PVC (created by an
 // external actor, e.g. Velero's restore) can be bound to the given PV, and returns the live
-// PVC. It performs no writes -- patchPVBinding (called later in rebindPVToNamespace) actually
-// commits the bind. Used by the download path (BindTargetExisting), where the destination
-// PVC's exact name is dictated by DataDownload.Spec.TargetVolume.PVC.
+// PVC. patchPVBinding (called later in rebindPVToNamespace) commits the actual claimRef bind;
+// the only write this function performs itself is the one described below for a selector-
+// bearing PVC. Used by the download path (BindTargetExisting), where the destination PVC's
+// exact name is dictated by DataDownload.Spec.TargetVolume.PVC.
 //
 // Storage compatibility (StorageClassName, requested capacity, VolumeMode, AccessModes) is
 // validated up front so an incompatible pairing fails fast with a specific error, instead of
 // silently wedging in Pending until waitForPVCBound's timeout with no useful diagnostic.
+//
+// A matchLabels-only Spec.Selector is treated as a request to reconcile, not a conflict: this
+// is the same technique Velero's own built-in CSI DataDownload restore path uses (see
+// velero.io/dynamic-pv-restore) to stop the dynamic provisioner from racing this rebind --
+// setting Selector on a PVC makes provisioners skip it outright, independent of the target
+// StorageClass's volumeBindingMode. Since our PV is one this controller fully owns, its
+// labels are patched to satisfy the selector rather than requiring the caller (the restore
+// plugin) to coordinate a label value with us in advance. matchExpressions is rejected: there's
+// no general way to synthesize a label set satisfying an arbitrary expression.
 func validateExistingPVCForBind(
 	ctx context.Context,
 	k8sClient client.Client,
@@ -547,13 +556,28 @@ func validateExistingPVCForBind(
 	}
 
 	if pvc.Spec.Selector != nil {
-		selector, err := metav1.LabelSelectorAsSelector(pvc.Spec.Selector)
-		if err != nil {
-			return nil, fmt.Errorf("target PVC %s/%s has an invalid label selector: %w", targetNamespace, existingPVCName, err)
+		if len(pvc.Spec.Selector.MatchExpressions) > 0 {
+			return nil, fmt.Errorf("target PVC %s/%s has an unsupported label selector (matchExpressions is not supported for restore rebinding, only matchLabels): %v",
+				targetNamespace, existingPVCName, pvc.Spec.Selector.MatchExpressions)
 		}
-		if !selector.Matches(k8slabels.Set(pv.Labels)) {
-			return nil, fmt.Errorf("target PVC %s/%s selector %s does not match PV %s labels %v",
-				targetNamespace, existingPVCName, selector.String(), pv.Name, pv.Labels)
+		var toPatch map[string]string
+		for k, v := range pvc.Spec.Selector.MatchLabels {
+			if pv.Labels[k] != v {
+				if toPatch == nil {
+					toPatch = make(map[string]string, len(pvc.Spec.Selector.MatchLabels))
+				}
+				toPatch[k] = v
+			}
+		}
+		if toPatch != nil {
+			if err := patchPVLabels(ctx, k8sClient, pv, toPatch); err != nil {
+				return nil, fmt.Errorf("failed to apply target PVC %s/%s selector labels to PV %s: %w",
+					targetNamespace, existingPVCName, pv.Name, err)
+			}
+			if pv.Labels == nil {
+				pv.Labels = make(map[string]string, len(toPatch))
+			}
+			maps.Copy(pv.Labels, toPatch)
 		}
 	}
 

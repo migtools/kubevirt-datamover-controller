@@ -2163,11 +2163,13 @@ func TestHandleAcceptedDataDownload(t *testing.T) {
 		noScratchMsg string
 	}{
 		{
-			name: "target PVC with spec.selector fails without creating a scratch PVC",
+			name: "target PVC with spec.selector.matchExpressions fails without creating a scratch PVC",
 			mutate: func(pvc *corev1.PersistentVolumeClaim) {
-				pvc.Spec.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"some-label": "some-value"}}
+				pvc.Spec.Selector = &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "some-label", Operator: metav1.LabelSelectorOpExists},
+				}}
 			},
-			noScratchMsg: "expected no scratch PVC to be created for a target PVC with spec.selector set",
+			noScratchMsg: "expected no scratch PVC to be created for a target PVC with spec.selector.matchExpressions set",
 		},
 		{
 			name: "target PVC already bound to a foreign PV fails without creating a scratch PVC",
@@ -2215,6 +2217,44 @@ func TestHandleAcceptedDataDownload(t *testing.T) {
 				t.Error(tc.noScratchMsg)
 			}
 		})
+	}
+}
+
+// TestHandleAcceptedDataDownload_MatchLabelsSelectorSucceeds pins that a
+// matchLabels-only Spec.Selector on the target PVC (the shape Velero's own
+// built-in CSI DataDownload restore path sets via velero.io/dynamic-pv-restore
+// to keep the dynamic provisioner from racing the rebind) is accepted, not
+// treated as a conflict: validateExistingPVCForBind reconciles the rebound
+// PV's labels to satisfy it later, at completeSuccessfulDownload, rather than
+// requiring the caller to pre-arrange a matching PV label.
+func TestHandleAcceptedDataDownload_MatchLabelsSelectorSucceeds(t *testing.T) {
+	f := newDDTestFixture(t)
+	scheme := ddScheme()
+	f.targetPVC.Spec.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"velero.io/dynamic-pv-restore": "some-unique-value"}}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.dd, f.bsl, f.credSec, f.targetPVC).Build()
+	r := &KubeVirtDataDownloadReconciler{
+		Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) { return f.mockStore, nil },
+	}
+
+	if _, err := r.handleAccepted(context.Background(), logr.Discard(), f.dd); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var updated velerov2alpha1.DataDownload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: f.dd.Name, Namespace: f.dd.Namespace}, &updated); err != nil {
+		t.Fatalf("failed to get DataDownload: %v", err)
+	}
+	if updated.Status.Phase != velerov2alpha1.DataDownloadPhasePrepared {
+		t.Fatalf("phase = %q, want %q (message: %s)", updated.Status.Phase, velerov2alpha1.DataDownloadPhasePrepared, updated.Status.Message)
+	}
+
+	scratchPVC, err := r.findScratchPVC(context.Background(), f.dd, "")
+	if err != nil {
+		t.Fatalf("failed to check for scratch PVC: %v", err)
+	}
+	if scratchPVC == nil {
+		t.Error("expected a scratch PVC to be created for a target PVC with a matchLabels-only selector")
 	}
 }
 
