@@ -22,6 +22,7 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1735,6 +1736,49 @@ func TestEnsureScratchPVC(t *testing.T) {
 			t.Errorf("expected existing scratch PVC %q to be reused (never shrunk), got %q", existing.Name, pvc.Name)
 		}
 	})
+}
+
+// TestEnsureWorkPVC pins the fix for #197: ensureWorkPVC must always request
+// ReadWriteOnce for the Filesystem-mode work PVC, regardless of the restore
+// target's own AccessModes. Ceph RBD's CSI driver rejects ReadWriteMany on a
+// Filesystem-mode volume outright ("multi node access modes are only
+// supported on rbd block type volumes"), and the work PVC -- mounted by
+// exactly one pod, on one node -- never needed RWX in the first place.
+func TestEnsureWorkPVC(t *testing.T) {
+	scheme := ddScheme()
+
+	dd := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-dd", Namespace: "openshift-adp", UID: types.UID("dd-uid-1")},
+	}
+	targetPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "restored-disk-1", Namespace: "restore-ns"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			// A typical KubeVirt VM disk PVC's AccessModes -- the shape that
+			// caused #197 when copied verbatim onto the Filesystem-mode work PVC.
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+			StorageClassName: new("standard"),
+			VolumeMode:       new(corev1.PersistentVolumeBlock),
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			},
+		},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd).Build()
+	r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+	pvc, err := r.ensureWorkPVC(context.Background(), logr.Discard(), dd, targetPVC, resource.MustParse("15Gi"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pvc == nil {
+		t.Fatal("expected work PVC to be created")
+	}
+	if want := []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}; !slices.Equal(pvc.Spec.AccessModes, want) {
+		t.Errorf("work PVC AccessModes = %v, want %v (must never inherit the target's RWX)", pvc.Spec.AccessModes, want)
+	}
+	if pvc.Spec.VolumeMode == nil || *pvc.Spec.VolumeMode != corev1.PersistentVolumeFilesystem {
+		t.Errorf("work PVC VolumeMode = %v, want %q", pvc.Spec.VolumeMode, corev1.PersistentVolumeFilesystem)
+	}
 }
 
 // ddTestFixture bundles the objects needed to exercise handleAccepted/handlePrepared/
