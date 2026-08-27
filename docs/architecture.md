@@ -40,9 +40,10 @@ treating the PVC as an opaque blob of data.
 - **KubeVirt `VirtualMachine`** (`kubevirt.io/v1`): read to validate prerequisites
   (`pkg/common.ValidateVMForBackup`) and to list the VM's PVCs and DataVolumes
   (`pkg/common.GetVolumesForVm`).
-- **`PersistentVolumeClaim`/`PersistentVolume`**: the controller creates temporary PVCs,
-  rebinds PVs across namespaces (VM namespace to OADP namespace and back), and provisions
-  restore target PVCs.
+- **`PersistentVolumeClaim`/`PersistentVolume`**: the controller creates temporary/scratch
+  PVCs and rebinds PVs across namespaces (VM namespace to OADP namespace and back). The
+  restore target PVC itself is created by Velero's restore before this controller acts; the
+  controller waits for it and rebinds the reconstructed PV onto it.
 - **`Pod`**: short-lived datamover pods (`kubevirt-dm-*` for uploads, `kubevirt-dm-dl-*` for
   downloads) run the same controller binary in `upload`/`download` subcommand mode
   (`/manager upload` or `/manager download`) to move qcow2 data.
@@ -70,12 +71,12 @@ stateDiagram-v2
     Canceled --> [*]
 ```
 
-A note on cancellation: the DataUpload reconciler does not watch `spec.Cancel` itself. It
+A note on cancellation: the DataUpload reconciler does not watch `spec.cancel` itself. It
 only reacts once something else, typically Velero's own DataUpload controller, has already
 set `status.phase` to `Canceling`; `handleCanceling` then runs cleanup (deleting the datamover
 pod, temporary PVC, and any VMB it created). This is different from the DataDownload
-reconciler below, which does watch `spec.Cancel` directly on every reconcile. If you are
-debugging a stuck cancellation, check whether `spec.Cancel` was set but `status.phase` never
+reconciler below, which does watch `spec.cancel` directly on every reconcile. If you are
+debugging a stuck cancellation, check whether `spec.cancel` was set but `status.phase` never
 moved to `Canceling`, since that would mean something upstream (Velero, or a user editing the
 object directly) needs to make that transition for a DataUpload.
 
@@ -174,17 +175,19 @@ The pod runs `/manager upload` (`pkg/uploader/run.go`), which:
 2. Reads the qcow2 file(s) from the mounted (rebound) temp PVC.
 3. Uploads them to `checkpoints/<vm-namespace>/<vm-name>/<checkpoint-id>/*.qcow2` in the BSL
    bucket.
-4. Archives the VMB and VMBT as JSON (`vmb.json`/`vmbt.json`) alongside the checkpoint, then
-   **deletes the VMB from the cluster** (`cleanupKubeResources` in `pkg/uploader/run.go`). The
-   VMBT is deliberately left on the cluster, not deleted, so KubeVirt can reuse it to redefine
-   the VM's libvirt checkpoint across restarts and live migrations (see step 4 in "Prepared to
-   InProgress" above and `prepareVMBackupTracker`). The archived `vmbt.json` only comes into
-   play as a fallback if the on-cluster VMBT is ever missing, for example if the VM's namespace
-   was recreated.
+4. Archives the VMB and VMBT as JSON (`vmb.json`/`vmbt.json`) alongside the checkpoint.
 5. Updates the per-VM `index.json` checkpoint index and the per-Velero-backup manifest
    (details below), correcting the index if there's a backup-type mismatch (for example, the
    VM unexpectedly lost its libvirt checkpoint and KubeVirt performed a full backup when an
    incremental one was expected).
+6. Only once the index and manifests are committed does it **delete the VMB from the cluster**
+   (`cleanupKubeResources` in `pkg/uploader/run.go`); this ordering means a failure updating the
+   index/manifests leaves the live VMB available for a retry instead of deleting it prematurely.
+   The VMBT is deliberately left on the cluster, not deleted, so KubeVirt can reuse it to
+   redefine the VM's libvirt checkpoint across restarts and live migrations (see step 4 in
+   "Prepared to InProgress" above and `prepareVMBackupTracker`). The archived `vmbt.json` only
+   comes into play as a fallback if the on-cluster VMBT is ever missing, for example if the VM's
+   namespace was recreated.
 
 ## Object storage layout and the checkpoint chain
 
@@ -239,7 +242,7 @@ graph LR
 
 The `KubeVirtDataDownloadReconciler`
 (`internal/controller/kubevirt_datadownload_controller.go`) follows the same phase names, but
-unlike the DataUpload reconciler above, it watches `spec.Cancel` directly on every reconcile
+unlike the DataUpload reconciler above, it watches `spec.cancel` directly on every reconcile
 and drives its own transition into `Canceling` (with special handling if a cancel races an
 already-provisioned restore):
 
@@ -295,8 +298,12 @@ stateDiagram-v2
   bounds controller-runtime worker goroutines.
 - **`spec.operationTimeout`** is enforced across the non-terminal phases (Accepted, Prepared,
   InProgress) so a stuck backup or restore eventually fails instead of blocking younger
-  DataUploads/DataDownloads for the same VM forever. Enforcement is skipped once a datamover
-  pod has already reported success, so a slow cleanup step is never mistaken for failure.
+  DataUploads/DataDownloads for the same VM forever. The exception differs by direction: for a
+  DataUpload, enforcement is skipped as soon as the datamover pod has reported success, so a
+  slow local cleanup step is never mistaken for failure. For a DataDownload, enforcement keeps
+  running even after the downloader pod succeeds, and is only skipped once the restored PV has
+  already been rebound onto the target PVC, since the rebind itself can still legitimately fail
+  or need retrying.
 - **Idempotent phase handlers**: every phase handler re-checks for already-created resources
   (existing VMB, pod, rebound PVC) before creating new ones, so a reconcile retried after a
   partial failure or cache staleness doesn't duplicate work.

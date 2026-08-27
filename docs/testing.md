@@ -14,7 +14,9 @@ intermediate state.
 make test
 ```
 
-This runs `go test` against `internal/controller/...` and `pkg/...` using
+This runs `go test` against every package returned by `go list ./...` except `test/e2e`
+(`Makefile:74`), which currently means `internal/controller/...` and `pkg/...`, but also
+picks up any new package added elsewhere in the module. It uses
 [envtest](https://book.kubebuilder.io/reference/envtest.html), which spins up a real
 `kube-apiserver` and `etcd` (no full cluster, no kubelet) so reconcilers can be tested against
 actual API server behavior instead of a fake client. `make test` also regenerates manifests
@@ -87,14 +89,12 @@ against a dedicated OpenShift cluster, not a local Kind cluster.
 
 Two separate HCO configurations are needed.
 
-Enable the `incrementalBackup` feature gate:
+Enable the `incrementalBackup` feature gate. `spec.featureGates` on the HCO CR is a list of
+gate objects (not a map keyed by name), so it must be patched as an array entry:
 
 ```bash
-oc patch hyperconverged kubevirt-hyperconverged -n openshift-cnv --type merge -p '
-spec:
-  featureGates:
-    incrementalBackup: true
-'
+oc patch hyperconverged kubevirt-hyperconverged -n openshift-cnv --type merge -p \
+  '{"spec":{"featureGates":[{"name":"incrementalBackup"}]}}'
 ```
 
 This also turns on the `IncrementalBackup` and `UtilityVolumes` feature gates on the
@@ -248,7 +248,9 @@ oc get backup kubevirt-dm-backup-1 -n openshift-adp -w
 ```
 
 While it's running, you can confirm the datamover path is active by watching for the CRs this
-controller creates:
+controller and its companion plugin create — the controller creates and reconciles the VMBT
+and VMB, while the `DataUpload` itself is created by the `kubevirt-datamover-plugin`
+(Velero's `BackupItemAction`) for this controller to act on:
 
 ```bash
 oc get virtualmachinebackuptrackers -A
@@ -266,7 +268,30 @@ Expected output: `Completed`.
 
 ### 7. Run a second backup to confirm incremental behavior
 
-Run another backup against the same VM (a new `Backup` CR pointing at the same namespace).
+Run another backup against the same VM (a new `Backup` CR, `kubevirt-dm-backup-2`, pointing
+at the same namespace):
+
+```yaml
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: kubevirt-dm-backup-2
+  namespace: openshift-adp
+spec:
+  includedNamespaces:
+  - cirros-test
+  defaultVolumesToFsBackup: false
+  snapshotMoveData: true
+  resourcePolicy:
+    kind: ConfigMap
+    name: kubevirt-volume-policy
+```
+
+```bash
+oc apply -f backup-cirros-2.yaml
+oc get backup kubevirt-dm-backup-2 -n openshift-adp -w
+```
+
 Check the checkpoint index in your bucket at
 `<bsl-prefix>-kubevirt-datamover/checkpoints/cirros-test/cirros-test/index.json` to confirm
 the second backup was recorded as `"type": "incremental"` with a `parent` pointing at the
@@ -276,8 +301,20 @@ working end to end.
 
 ### 8. Restore the VM
 
-Delete (or scale down) the original VM's namespace, or restore into a namespace mapping, then
-create a `Restore` pointing at the backup:
+Restoring from `kubevirt-dm-backup-2` exercises downloading, rebasing, and flattening the
+full incremental chain (the full checkpoint plus the incremental on top of it), rather than
+just the single full checkpoint from the first backup.
+
+Before restoring, either delete the original VM's namespace for an in-place restore, or
+configure a namespace mapping (`spec.namespaceMapping` on the `Restore`) to restore into a
+different namespace; a namespace cannot simply be "scaled down". This example deletes the
+original namespace:
+
+```bash
+oc delete namespace cirros-test
+```
+
+Then create a `Restore` pointing at the second backup, saving it as `restore-cirros.yaml`:
 
 ```yaml
 apiVersion: velero.io/v1
@@ -286,7 +323,7 @@ metadata:
   name: kubevirt-dm-restore-1
   namespace: openshift-adp
 spec:
-  backupName: kubevirt-dm-backup-1
+  backupName: kubevirt-dm-backup-2
 ```
 
 ```bash
@@ -300,16 +337,24 @@ Watch the download side the same way as the upload side:
 oc get datadownloads -n openshift-adp
 ```
 
-Once the restore completes, confirm the VM comes back up and its data is intact:
+Once the restore completes, confirm the VM comes back up:
 
 ```bash
 oc get vm cirros-test -n cirros-test -o jsonpath='{.status.printableStatus}'
 ```
 
+Checking that the VM is `Running` only confirms the disk was reattached, not that its data
+survived the restore intact. To actually verify data integrity, write a marker onto the disk
+before the first backup (for example, `virtctl console cirros-test` and `echo pre-backup >
+/tmp/marker.txt` from inside the guest, or a distinguishing change to the workload's data for
+an application VM), then after the restore completes, connect to the guest again and confirm
+the marker/data is still there.
+
 ### Cleanup
 
 ```bash
 oc delete restore kubevirt-dm-restore-1 -n openshift-adp
+oc delete backup kubevirt-dm-backup-2 -n openshift-adp
 oc delete backup kubevirt-dm-backup-1 -n openshift-adp
 oc delete configmap kubevirt-volume-policy -n openshift-adp
 oc delete namespace cirros-test
@@ -328,8 +373,11 @@ that directory for the exact file names and target namespaces.
 - The datamover and downloader pods are short-lived and get cleaned up automatically after a
   successful backup or restore, but you don't need to catch them mid-flight to see their
   output. The controller streams each pod's logs into its own log output (as
-  `"Datamover pod log"` entries with the source pod name) right before it removes the pod, so
-  the pod's own output is always available afterward from the controller manager's logs.
+  `"Datamover pod log"` entries with the source pod name) right before it removes the pod.
+  This forwarding is best-effort, not guaranteed: it only requests the pod's last 100 log
+  lines, and a failure to collect them is itself only logged rather than blocking pod cleanup.
+  If you need complete diagnostics, or the forwarded output looks incomplete, catch the pod
+  live (`oc get pods -n openshift-adp -w`) and read its logs directly before it's removed.
 - A stuck `DataUpload`/`DataDownload` will eventually fail once `spec.operationTimeout`
   elapses. If you want a phase to sit and let you inspect it (VMB status, PVC state, and so
   on), watch the phase transitions with `oc get dataupload <name> -n openshift-adp -w -o

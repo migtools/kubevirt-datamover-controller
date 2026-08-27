@@ -16,9 +16,11 @@ The controller implements the full backup and restore flow end to end:
   `spec.datamover == "kubevirt"`.
 - Phase-based reconciliation for both backup (`New -> Accepted -> Prepared -> InProgress ->
   Completed`) and restore, including cancellation support.
-- Extracts the source VM reference from `DataUpload`/`DataDownload` annotations, validates the
-  VM is running with CBT enabled, and creates/reuses `VirtualMachineBackupTracker` (VMBT) and
-  `VirtualMachineBackup` (VMB) CRs to drive KubeVirt's native CBT backup.
+- Extracts the source VM reference from `DataUpload`/`DataDownload` annotations. For backup, it
+  validates the VM is running with CBT enabled and creates/reuses `VirtualMachineBackupTracker`
+  (VMBT) and `VirtualMachineBackup` (VMB) CRs to drive KubeVirt's native CBT backup; restore does
+  not perform this validation or create VMB/VMBT objects, it resolves the checkpoint chain from
+  object storage instead.
 - Launches short-lived datamover pods that upload qcow2 files to the `BackupStorageLocation`
   (BSL) and maintain a per-VM checkpoint index for incremental backups, and downloader pods
   that reconstruct a VM disk from a checkpoint chain on restore.
