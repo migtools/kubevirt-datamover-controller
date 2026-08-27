@@ -5636,6 +5636,190 @@ func TestHandleAccepted_StaleCheckpointForcesFullBackup(t *testing.T) {
 	}
 }
 
+// TestHandleAccepted_ExpectedBackupTypePatchSurvivesConcurrentWrite reproduces
+// the same real-world report as the Update-based fix (a concurrent writer --
+// e.g. Velero's own built-in DataUpload controller, which this repo's README
+// documents also reconciles these objects -- causing
+// kubevirt-datamover.io/expected-backup-type to never get stamped), but
+// proves the merge-patch alternative resolves it structurally rather than by
+// retrying: a JSON merge patch carries no resourceVersion precondition, so it
+// cannot 409 on a concurrent change to any other field, and it merges rather
+// than overwrites, so the concurrent writer's own change survives alongside
+// it with no explicit refetch-and-preserve needed.
+//
+// The interceptor simulates the race directly: the moment handleAccepted's
+// Step 3c patch for the expected-backup-type annotation is about to be sent,
+// a separate "concurrent writer" bumps an unrelated label on the same object
+// via a real Update first (which would have invalidated any in-memory
+// resourceVersion an r.Update(ctx, du) call was relying on), then the
+// original patch is allowed through unmodified.
+func TestHandleAccepted_ExpectedBackupTypePatchSurvivesConcurrentWrite(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-patch"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-creds",
+			Namespace: vmNamespace,
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: new("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	// Do NOT pre-create the VMB: let ensureVMBackup create it fresh, exercising
+	// the same Step 2/3/3b/3c/4 sequence a first-ever reconcile takes.
+	baseClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl, credSecret, pvc, vmbt).
+		WithStatusSubresource(&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}).
+		Build()
+
+	mockStore := uploader.NewMockObjectStore("test-bucket", "velero-kubevirt-datamover")
+
+	concurrentWriteSimulated := false
+	interceptedClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if patchedDU, ok := obj.(*velerov2alpha1.DataUpload); ok {
+				raw, dataErr := patch.Data(obj)
+				if dataErr == nil && strings.Contains(string(raw), common.AnnotationExpectedBackupType) && !concurrentWriteSimulated {
+					concurrentWriteSimulated = true
+					concurrent := &velerov2alpha1.DataUpload{}
+					if getErr := c.Get(ctx, client.ObjectKeyFromObject(patchedDU), concurrent); getErr != nil {
+						return getErr
+					}
+					if concurrent.Labels == nil {
+						concurrent.Labels = map[string]string{}
+					}
+					concurrent.Labels["concurrent-writer"] = "true"
+					if updateErr := c.Update(ctx, concurrent); updateErr != nil {
+						return updateErr
+					}
+				}
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        interceptedClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
+			return mockStore, nil
+		},
+	}
+
+	if _, err := r.handleAccepted(context.Background(), logr.Discard(), du); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !concurrentWriteSimulated {
+		t.Fatal("test did not exercise the concurrent-write path -- fixture drifted from handleAccepted's actual Patch sequence")
+	}
+
+	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
+	if err := baseClient.List(context.Background(), vmbList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		t.Fatalf("failed to list created VMBs: %v", err)
+	}
+	if len(vmbList.Items) != 1 {
+		t.Fatalf("expected 1 VMB to be created despite the concurrent write, found %d", len(vmbList.Items))
+	}
+
+	var updatedDU velerov2alpha1.DataUpload
+	if err := baseClient.Get(context.Background(), types.NamespacedName{Name: duName, Namespace: vmNamespace}, &updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+	if updatedDU.Annotations[common.AnnotationExpectedBackupType] == "" {
+		t.Error("expected-backup-type annotation is empty after a concurrent write to an unrelated field -- " +
+			"a merge patch must survive this the same way it survives any other concurrent change, " +
+			"since it carries no resourceVersion precondition")
+	}
+	if updatedDU.Labels["concurrent-writer"] != "true" {
+		t.Error("concurrent writer's own label was lost -- the merge patch must not clobber concurrently-written fields")
+	}
+}
+
 func TestHandleAccepted_SkipsBSLValidationWhenAnnotated(t *testing.T) {
 	// This test verifies that BSL validation is skipped on subsequent reconciles
 	// when the DataUpload already has the BSL validated annotation.

@@ -493,15 +493,36 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		// This annotation lets handlePrepared() compare the actual VMB result
 		// against what the controller intended, and the datamover pod can
 		// reconcile the S3 index if they differ (e.g., VM lost checkpoint).
+		//
+		// A merge patch (single API call, no read-modify-write) rather than
+		// r.Update: Update requires du's in-memory resourceVersion to match the
+		// server's, so it 409s the instant any concurrent writer touches this
+		// object -- this repo's own README documents that Velero's built-in
+		// DataUpload controller also reconciles these objects. A JSON merge
+		// patch that names only this one annotation key carries no
+		// resourceVersion precondition at all, so it can't conflict on a
+		// concurrent change to any other field, and it merges rather than
+		// overwrites, so a concurrent writer's own change survives alongside
+		// it. That matters here specifically because Step 4 below creates the
+		// VMB in this same reconcile call; once it exists, "vmb == nil" is
+		// false on every future reconcile and this code never runs again, so
+		// there is no second chance to persist this annotation if this one
+		// write is lost.
 		if checkpointLookup != nil {
 			expectedType := uploader.BackupTypeFull
 			if !forceFullBackup && checkpointLookup.Found && checkpointLookup.IsChainValid {
 				expectedType = uploader.BackupTypeIncremental
 			}
-			du.Annotations[common.AnnotationExpectedBackupType] = expectedType
-			if err := r.Update(ctx, du); err != nil {
+			patch := client.RawPatch(types.MergePatchType, fmt.Appendf(nil,
+				`{"metadata":{"annotations":{%q:%q}}}`, common.AnnotationExpectedBackupType, expectedType))
+			if err := r.Patch(ctx, du, patch); err != nil {
 				logger.Info("Failed to set expected backup type annotation, will retry",
 					"reason", err.Error())
+			} else {
+				if du.Annotations == nil {
+					du.Annotations = make(map[string]string)
+				}
+				du.Annotations[common.AnnotationExpectedBackupType] = expectedType
 			}
 		}
 
