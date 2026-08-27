@@ -5810,10 +5810,10 @@ func TestHandleAccepted_ExpectedBackupTypePatchSurvivesConcurrentWrite(t *testin
 	if err := baseClient.Get(context.Background(), types.NamespacedName{Name: duName, Namespace: vmNamespace}, &updatedDU); err != nil {
 		t.Fatalf("failed to get updated DataUpload: %v", err)
 	}
-	if updatedDU.Annotations[common.AnnotationExpectedBackupType] == "" {
-		t.Error("expected-backup-type annotation is empty after a concurrent write to an unrelated field -- " +
-			"a merge patch must survive this the same way it survives any other concurrent change, " +
-			"since it carries no resourceVersion precondition")
+	if got := updatedDU.Annotations[common.AnnotationExpectedBackupType]; got != uploader.BackupTypeFull {
+		t.Errorf("expected-backup-type annotation is %q, want %q after a concurrent write to an unrelated field -- "+
+			"a merge patch must survive this the same way it survives any other concurrent change, "+
+			"since it carries no resourceVersion precondition", got, uploader.BackupTypeFull)
 	}
 	if updatedDU.Labels["concurrent-writer"] != "true" {
 		t.Error("concurrent writer's own label was lost -- the merge patch must not clobber concurrently-written fields")
