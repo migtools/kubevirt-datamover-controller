@@ -513,16 +513,14 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 			if !forceFullBackup && checkpointLookup.Found && checkpointLookup.IsChainValid {
 				expectedType = uploader.BackupTypeIncremental
 			}
-			patch := client.RawPatch(types.MergePatchType, fmt.Appendf(nil,
-				`{"metadata":{"annotations":{%q:%q}}}`, common.AnnotationExpectedBackupType, expectedType))
-			if err := r.Patch(ctx, du, patch); err != nil {
+			original := du.DeepCopy()
+			if du.Annotations == nil {
+				du.Annotations = make(map[string]string)
+			}
+			du.Annotations[common.AnnotationExpectedBackupType] = expectedType
+			if err := r.Patch(ctx, du, client.MergeFrom(original)); err != nil {
 				logger.Info("Failed to set expected backup type annotation, will retry",
 					"reason", err.Error())
-			} else {
-				if du.Annotations == nil {
-					du.Annotations = make(map[string]string)
-				}
-				du.Annotations[common.AnnotationExpectedBackupType] = expectedType
 			}
 		}
 
