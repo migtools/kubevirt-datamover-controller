@@ -557,6 +557,17 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	return r.evaluateVMBackupStatus(ctx, logger, du, vmb)
 }
 
+// conditionComplete is KubeVirt nightly (v1.20.0+) virt-controller's renamed
+// replacement for VirtualMachineBackup's "Done" condition type. Our vendored
+// kubevirt.io/api (v1.8.0-alpha.0) predates the rename and has no
+// ConditionComplete constant of its own, so it's declared here as the raw
+// string literal virt-controller actually emits. Without recognizing both
+// names, evaluateVMBackupStatus/isVMBTerminal never see doneCond populated
+// against a nightly cluster and loop "VirtualMachineBackup in progress,
+// requeuing" until Spec.OperationTimeout, even though
+// vmb.Status.Conditions already has Complete=True.
+const conditionComplete kubevirtbackupv1alpha1.ConditionType = "Complete"
+
 // evaluateVMBackupStatus checks conditions on a VirtualMachineBackup to determine
 // whether the backup succeeded, failed, or is still running.
 // KubeVirt condition combinations:
@@ -572,7 +583,7 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 	var doneCond, progressingCond, initializingCond *kubevirtbackupv1alpha1.Condition
 	for i := range vmb.Status.Conditions {
 		switch vmb.Status.Conditions[i].Type {
-		case kubevirtbackupv1alpha1.ConditionDone:
+		case kubevirtbackupv1alpha1.ConditionDone, conditionComplete:
 			doneCond = &vmb.Status.Conditions[i]
 		case kubevirtbackupv1alpha1.ConditionProgressing:
 			progressingCond = &vmb.Status.Conditions[i]
@@ -1808,7 +1819,7 @@ func isVMBTerminal(vmb *kubevirtbackupv1alpha1.VirtualMachineBackup) bool {
 	var doneCond, progressingCond *kubevirtbackupv1alpha1.Condition
 	for i := range vmb.Status.Conditions {
 		switch vmb.Status.Conditions[i].Type {
-		case kubevirtbackupv1alpha1.ConditionDone:
+		case kubevirtbackupv1alpha1.ConditionDone, conditionComplete:
 			doneCond = &vmb.Status.Conditions[i]
 		case kubevirtbackupv1alpha1.ConditionProgressing:
 			progressingCond = &vmb.Status.Conditions[i]

@@ -1341,6 +1341,28 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 			expectRequeue: true,
 		},
 		{
+			// KubeVirt nightly (v1.20.0+) virt-controller renamed VMB's "Done"
+			// condition type to "Complete". Without recognizing it,
+			// evaluateVMBackupStatus never sees doneCond populated and loops
+			// "VirtualMachineBackup in progress, requeuing" until
+			// Spec.OperationTimeout, even though the backup already completed.
+			name: "VMB Complete True (nightly KubeVirt condition rename) transitions to Prepared",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionFalse,
+					Reason: "CompletedWithWarning",
+				},
+				{
+					Type:   conditionComplete,
+					Status: corev1.ConditionTrue,
+					Reason: "CompletedWithWarning",
+				},
+			},
+			expectedPhase: velerov2alpha1.DataUploadPhasePrepared,
+			expectRequeue: true,
+		},
+		{
 			name: "VMB Done True with Failed reason transitions to Failed",
 			vmbConditions: []kubevirtbackupv1alpha1.Condition{
 				{
@@ -1776,6 +1798,20 @@ func TestIsVMBTerminal(t *testing.T) {
 				},
 			},
 			expected: false,
+		},
+		{
+			// KubeVirt nightly (v1.20.0+) virt-controller renamed the "Done"
+			// condition type to "Complete"; isVMBTerminal must recognize both.
+			name: "Complete=True is terminal (success, nightly KubeVirt condition rename)",
+			vmb: &kubevirtbackupv1alpha1.VirtualMachineBackup{
+				Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+					Conditions: []kubevirtbackupv1alpha1.Condition{
+						{Type: conditionComplete, Status: corev1.ConditionTrue, Reason: "CompletedWithWarning"},
+						{Type: kubevirtbackupv1alpha1.ConditionProgressing, Status: corev1.ConditionFalse},
+					},
+				},
+			},
+			expected: true,
 		},
 	}
 
