@@ -9,7 +9,14 @@ COPY go.mod go.mod
 COPY go.sum go.sum
 # cache deps before building and copying source so that we don't need to re-download as much
 # and so that source changes don't invalidate our downloaded layer
-RUN go mod download
+#
+# retry: confirmed live in CI -- proxy.golang.org intermittently drops the
+# module fetch mid-transfer ("stream error: stream ID NNNN; INTERNAL_ERROR;
+# received from peer"), failing the whole image build over a transient proxy
+# hiccup unrelated to any code change. `go mod download` has no built-in
+# retry flag, so wrap it in a short shell retry loop.
+RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "retrying ($i/5): $*" >&2; sleep 5; done; return 1; }; \
+    retry go mod download
 
 # Copy the go source
 COPY cmd/main.go cmd/main.go
