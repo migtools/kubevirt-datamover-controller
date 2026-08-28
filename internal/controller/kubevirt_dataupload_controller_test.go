@@ -1190,12 +1190,22 @@ func TestHandleAccepted(t *testing.T) {
 	_ = result // result.RequeueAfter may be > 0 depending on VMB state
 }
 
-// TestHandleAccepted_VMBTAnnotationSetButVMBNotVisible tests the race condition where
-// a rapid re-reconcile runs before the cached client sees the VMB that was just created.
-// The VMBT annotation is already set (from the first reconcile), so the controller must
-// NOT re-enter prepareVMBackupTracker (which would delete the VMBT the VMB references).
-// Instead it should requeue to let the cache catch up.
-func TestHandleAccepted_VMBTAnnotationSetButVMBNotVisible(t *testing.T) {
+// TestHandleAccepted_RetriesVMBCreationAfterAnnotationPersisted pins the fix for
+// a real livelock: a previous version of handleAccepted short-circuited whenever
+// du.Annotations[AnnotationVMBTName] was already set but findVMBForDataUpload came
+// back nil, requeuing indefinitely on the theory that a VMB from a prior reconcile
+// just hadn't reached the informer cache yet. That's wrong when Step 4 (VMB
+// creation) was instead *deferred* -- e.g. KubeVirt's one-active-VMB-per-VM
+// admission webhook, "in progress for source", handled a few lines below --
+// after Step 2 already persisted AnnotationVMBTName: no VMB was ever created that
+// reconcile, so every later reconcile hit the same short-circuit and never
+// reached Step 4 again, looping "VMBT already prepared but VMB not yet visible in
+// cache, requeuing" until Spec.OperationTimeout even though no VMB would ever
+// appear on its own (reproduced live).
+//
+// Also verifies the on-cluster VMBT (which prepareVMBackupTracker now finds and
+// reuses by VM-name-hash label, never deletes) survives both reconciles.
+func TestHandleAccepted_RetriesVMBCreationAfterAnnotationPersisted(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
 	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
@@ -1204,66 +1214,46 @@ func TestHandleAccepted_VMBTAnnotationSetButVMBNotVisible(t *testing.T) {
 
 	vmName := "test-vm"
 	vmNamespace := "vm-ns"
-	duName := "test-du-race"
+	duName := "test-du-retry"
 
 	du := &velerov2alpha1.DataUpload{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      duName,
-			Namespace: "openshift-adp",
-			UID:       types.UID("du-uid-race"),
+			Namespace: vmNamespace,
+			UID:       types.UID("du-uid-retry"),
 			Annotations: map[string]string{
 				common.AnnotationVMName:      vmName,
 				common.AnnotationVMNamespace: vmNamespace,
-				// VMBT annotation already set by a previous reconcile
-				AnnotationVMBTName: "vmbt-test-vm-prev",
+				// Both already set by a previous reconcile whose Step 4 got
+				// deferred by the admission-webhook conflict below.
+				AnnotationVMBTName:            "vmbt-test-vm-prev",
+				common.AnnotationBSLValidated: "true",
 			},
 		},
 		Spec: velerov2alpha1.DataUploadSpec{
-			DataMover:             common.DataMoverKubeVirt,
-			BackupStorageLocation: "default",
-			SourceNamespace:       vmNamespace,
+			DataMover:       common.DataMoverKubeVirt,
+			SourceNamespace: vmNamespace,
+			// BackupStorageLocation deliberately empty: skips handleAccepted's
+			// Step 0 BSL-availability check, keeping this fixture focused on
+			// the VMBT/VMB retry behavior under test.
 		},
 		Status: velerov2alpha1.DataUploadStatus{
 			Phase: velerov2alpha1.DataUploadPhaseAccepted,
 		},
 	}
 
-	bsl := &velerov1.BackupStorageLocation{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "default",
-			Namespace: "openshift-adp",
-		},
-		Spec: velerov1.BackupStorageLocationSpec{
-			Provider: "aws",
-			StorageType: velerov1.StorageType{
-				ObjectStorage: &velerov1.ObjectStorageLocation{
-					Bucket: "test-bucket",
-					Prefix: "velero",
-				},
-			},
-			Config: map[string]string{"region": "us-east-1"},
-			Credential: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
-				Key:                  "cloud",
-			},
-		},
-		Status: velerov1.BackupStorageLocationStatus{
-			Phase: velerov1.BackupStorageLocationPhaseAvailable,
-		},
-	}
-
-	// Temp PVC that was already created by a previous reconcile
 	tempPVC := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "kubevirt-backup-" + duName + "-abc12",
 			Namespace: vmNamespace,
 			Labels: map[string]string{
-				common.LabelDataUploadUID: "du-uid-race",
+				common.LabelDataUploadUID: "du-uid-retry",
 			},
 		},
 	}
 
-	// The VMBT that the (not-yet-visible) VMB references — must NOT be deleted
+	// The VMBT a previous reconcile already prepared -- must survive both
+	// reconciles below (prepareVMBackupTracker reuses by label, never deletes).
 	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "vmbt-test-vm-prev",
@@ -1275,34 +1265,77 @@ func TestHandleAccepted_VMBTAnnotationSetButVMBNotVisible(t *testing.T) {
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{},
 	}
 
-	// No VMB in the fake client — simulates cache lag where VMB isn't visible yet
-	fakeClient := fake.NewClientBuilder().
+	baseClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(du, bsl, tempPVC, vmbt).
+		WithObjects(du, tempPVC, vmbt).
 		Build()
 
+	// Simulates KubeVirt's admission webhook rejecting a second active VMB for
+	// the same VM -- exactly the error handleAccepted's Step 4 already detects
+	// via strings.Contains(err.Error(), "in progress for source") and defers on.
+	conflictActive := true
+	interceptedClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*kubevirtbackupv1alpha1.VirtualMachineBackup); ok && conflictActive {
+				return fmt.Errorf(`admission webhook "virtualmachinebackup-validator.backup.kubevirt.io" denied the request: VirtualMachineBackup "vmb-other-du" in progress for source`)
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+
 	r := &KubeVirtDataUploadReconciler{
-		Client:         fakeClient,
-		Scheme:         scheme,
-		Log:            logr.Discard(),
-		OADPNamespace:  "openshift-adp",
-		DatamoverImage: "quay.io/test/datamover:v1",
+		Client:        interceptedClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
 	}
 
-	result, err := r.handleAccepted(context.Background(), logr.Discard(), du)
-
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	// First reconcile: Step 4's Create is rejected by the simulated conflict.
+	result1, err1 := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err1 != nil {
+		t.Fatalf("unexpected error on first reconcile: %v", err1)
+	}
+	if result1.RequeueAfter != RequeueAfterLong {
+		t.Errorf("first reconcile RequeueAfter = %v, want %v (the in-progress-conflict defer)", result1.RequeueAfter, RequeueAfterLong)
 	}
 
-	// Should requeue (not fail, not enter VMBT preparation)
-	if result.RequeueAfter == 0 {
-		t.Error("expected requeue but got none — controller should wait for cache to catch up")
+	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
+	if err := baseClient.List(context.Background(), vmbList, client.InNamespace(vmNamespace)); err != nil {
+		t.Fatalf("failed to list VMBs: %v", err)
+	}
+	if len(vmbList.Items) != 0 {
+		t.Fatalf("expected no VMB to exist after the deferred first attempt, found %d", len(vmbList.Items))
 	}
 
-	// Verify the VMBT was NOT deleted
 	existingVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
-	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+	if err := baseClient.Get(context.Background(), types.NamespacedName{
+		Name: "vmbt-test-vm-prev", Namespace: vmNamespace,
+	}, existingVMBT); err != nil {
+		t.Errorf("VMBT was deleted when it should have been preserved: %v", err)
+	}
+
+	// The conflict clears (the other VM's VMB completed) -- the fix under test
+	// is that a SECOND reconcile, with AnnotationVMBTName already persisted from
+	// before, still retries Step 4 instead of looping on the old cache-wait
+	// guard forever.
+	conflictActive = false
+
+	result2, err2 := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err2 != nil {
+		t.Fatalf("unexpected error on second reconcile: %v", err2)
+	}
+	if result2.RequeueAfter != RequeueAfterShort {
+		t.Errorf("second reconcile RequeueAfter = %v, want %v (freshly-created VMB)", result2.RequeueAfter, RequeueAfterShort)
+	}
+
+	if err := baseClient.List(context.Background(), vmbList, client.InNamespace(vmNamespace)); err != nil {
+		t.Fatalf("failed to list VMBs: %v", err)
+	}
+	if len(vmbList.Items) != 1 {
+		t.Fatalf("expected exactly 1 VMB to exist once the conflict cleared, found %d", len(vmbList.Items))
+	}
+
+	if err := baseClient.Get(context.Background(), types.NamespacedName{
 		Name: "vmbt-test-vm-prev", Namespace: vmNamespace,
 	}, existingVMBT); err != nil {
 		t.Errorf("VMBT was deleted when it should have been preserved: %v", err)

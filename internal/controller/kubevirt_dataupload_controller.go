@@ -440,17 +440,37 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		return ctrl.Result{}, fmt.Errorf("failed to check for existing VMB: %w", err)
 	}
 
-	if vmb == nil && du.Annotations != nil && du.Annotations[AnnotationVMBTName] != "" {
-		// The VMBT annotation is set but the VMB isn't visible yet in the cached client.
-		// This happens when a rapid re-reconcile (triggered by the annotation update) runs
-		// before the informer cache has the VMB. Requeue to let the cache catch up.
-		// Without this guard, prepareVMBackupTracker would delete the VMBT that the
-		// (not-yet-visible) VMB references, leaving the VMB permanently stuck.
-		logger.Info("VMBT already prepared but VMB not yet visible in cache, requeuing",
-			"vmbtName", du.Annotations[AnnotationVMBTName])
-		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
-	}
-
+	// NOTE: an earlier version of this function short-circuited here (before Step
+	// 2 below) whenever du.Annotations[AnnotationVMBTName] was already set but
+	// findVMBForDataUpload came back nil, on the theory that a VMB created by a
+	// prior reconcile just hadn't reached the informer cache yet -- requeuing
+	// briefly to "let the cache catch up" rather than re-running Step 2.
+	//
+	// That's no longer the right call, for two reasons:
+	//   1. findVMBForDataUpload itself already falls back to an uncached
+	//      APIReader read when the cached client finds nothing (see its own
+	//      doc comment) -- a genuine cache-lag false negative is resolved
+	//      inside that call, before this point. Reaching here with vmb == nil
+	//      means no VMB exists even by a live read, not merely an invisible one.
+	//   2. prepareVMBackupTracker (Step 2) no longer deletes an existing VMBT --
+	//      it lists by VM-name-hash label and reuses one if found (see its own
+	//      comment), only creating fresh when none exists at all. The original
+	//      guard's rationale ("prepareVMBackupTracker would delete the VMBT
+	//      that the (not-yet-visible) VMB references") describes behavior this
+	//      function no longer has.
+	//
+	// The real, reproduced-live failure mode this used to cause: Step 4 below
+	// can defer VMB creation (KubeVirt's one-active-VMB-per-VM admission
+	// webhook, "in progress for source", handled a few lines down) *after*
+	// Step 2 has already persisted AnnotationVMBTName -- no VMB gets created
+	// that reconcile. Every following reconcile then hit this guard (VMBTName
+	// set, vmb still nil) and took the short-requeue-and-wait path forever,
+	// since Step 4 -- the only code path that can ever create the VMB -- was
+	// never reached again. The DataUpload logged "VMBT already prepared but
+	// VMB not yet visible in cache, requeuing" every 5s indefinitely (bounded
+	// only by Spec.OperationTimeout, e.g. 4h) even though no VMB would ever
+	// appear on its own. Falling through to Step 2 instead retries Step 4 on
+	// every reconcile until the conflicting VMB clears.
 	if vmb == nil {
 		// Step 2: Prepare VirtualMachineBackupTracker (recreate from S3 state)
 		vmbt, err := r.prepareVMBackupTracker(ctx, logger, du, vmRef.Name, vmRef.Namespace)
