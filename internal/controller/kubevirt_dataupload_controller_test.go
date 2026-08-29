@@ -1342,6 +1342,142 @@ func TestHandleAccepted_RetriesVMBCreationAfterAnnotationPersisted(t *testing.T)
 	}
 }
 
+// TestHandleAccepted_RefreshesVMBStatusFromLiveRead pins a second, independent
+// livelock reported live from a nightly-KubeVirt e2e run: virt-controller had
+// already written status.conditions[type=Done,status=True] to the API server
+// (backup genuinely finished), but this controller's cached copy of the same
+// VMB never reflected it -- the reconciler found the VMB fine (logged
+// "already exists, skipping VMBT preparation"), just with a stale Status,
+// and looped "VirtualMachineBackup in progress, requeuing" until
+// Spec.OperationTimeout. Confirmed intermittent (an informer watch/resync
+// timing issue, not a deterministic logic bug), distinct from #211/#212
+// (which is about the VMB not existing in the cache at all).
+//
+// Simulates the staleness directly: r.Client (the cached client) and
+// r.APIReader (the live/uncached reader) are two separate fake clients
+// seeded with different Status for the same VMB object, so handleAccepted
+// must actually use the live one to reach Prepared.
+func TestHandleAccepted_RefreshesVMBStatusFromLiveRead(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "vm-ns"
+	duName := "test-du-stale-cache"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("du-uid-stale-cache"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:       common.DataMoverKubeVirt,
+			SourceNamespace: vmNamespace,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	tempPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName + "-abc12",
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadUID: "du-uid-stale-cache",
+			},
+		},
+	}
+
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelVMNameHash: common.HashForLabel(vmName),
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{},
+	}
+
+	checkpointName := "vmb-" + duName + "-checkpoint"
+	staleVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmb-" + duName,
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadUID: "du-uid-stale-cache",
+			},
+			Annotations: map[string]string{
+				common.AnnotationDataUploadName: duName,
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: new("backup.kubevirt.io"),
+				Kind:     "VirtualMachineBackupTracker",
+				Name:     vmbt.Name,
+			},
+			PvcName: new(tempPVC.Name),
+		},
+		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+			// Stale cached view: still Progressing, no Done condition at all --
+			// exactly what a missed/delayed watch event on this object looks like.
+			Conditions: []kubevirtbackupv1alpha1.Condition{
+				{Type: kubevirtbackupv1alpha1.ConditionProgressing, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+
+	liveVMB := staleVMB.DeepCopy()
+	liveVMB.Status = &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+		Type:           kubevirtbackupv1alpha1.Full,
+		CheckpointName: &checkpointName,
+		Conditions: []kubevirtbackupv1alpha1.Condition{
+			{Type: kubevirtbackupv1alpha1.ConditionProgressing, Status: corev1.ConditionFalse, Reason: "Completed VirtualMachineBackup"},
+			{Type: kubevirtbackupv1alpha1.ConditionDone, Status: corev1.ConditionTrue, Reason: "Completed VirtualMachineBackup"},
+		},
+	}
+
+	cachedClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du, tempPVC, vmbt, staleVMB).Build()
+	liveClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du, tempPVC, vmbt, liveVMB).Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        cachedClient,
+		APIReader:     liveClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	result, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var updatedDU velerov2alpha1.DataUpload
+	if err := cachedClient.Get(context.Background(), types.NamespacedName{
+		Name: duName, Namespace: vmNamespace,
+	}, &updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhasePrepared {
+		t.Errorf("phase = %q, want %q -- handleAccepted must use the live VMB status (Done=True), not the stale cached one (still Progressing)",
+			updatedDU.Status.Phase, velerov2alpha1.DataUploadPhasePrepared)
+	}
+	if result.RequeueAfter == 0 {
+		t.Error("expected requeue after transitioning to Prepared")
+	}
+}
+
 func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)

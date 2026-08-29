@@ -551,6 +551,30 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		logger.V(1).Info("VirtualMachineBackup already exists, skipping VMBT preparation", "vmb", vmb.Name)
 	}
 
+	// Refresh vmb's status via an uncached read before deciding anything below.
+	// The informer cache's own watch can intermittently miss or delay a
+	// status-only update event for an object it already knows about --
+	// confirmed live: virt-controller had already written
+	// status.conditions[type=Done,status=True] to the API server, but this
+	// controller's cached copy of the same VMB never reflected it, looping
+	// "VirtualMachineBackup in progress, requeuing" until Spec.OperationTimeout
+	// even though the backup had long since finished. Distinct from #211/#212's
+	// fix (the VMB not existing in the cache at all): here the object is found
+	// fine, just with a stale Status. A single-object Get is cheap enough to do
+	// on every reconcile of this phase. Best-effort: if the read fails (or
+	// r.APIReader isn't configured, as in some test fixtures), fall back to the
+	// cached copy already in hand rather than failing the reconcile over a
+	// freshness check.
+	if r.APIReader != nil {
+		liveVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+		if err := r.APIReader.Get(ctx, types.NamespacedName{Name: vmb.Name, Namespace: vmb.Namespace}, liveVMB); err == nil {
+			vmb.Status = liveVMB.Status
+		} else if !errors.IsNotFound(err) {
+			logger.V(1).Info("Failed to refresh VirtualMachineBackup status via uncached read, using cached copy",
+				"vmb", vmb.Name, "reason", err.Error())
+		}
+	}
+
 	// Step 5: Check VMB status
 	if vmb.Status == nil {
 		// Before blindly requeuing, check if the VMB's BackupTracker still exists.
