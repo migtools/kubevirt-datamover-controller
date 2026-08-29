@@ -568,9 +568,18 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	if r.APIReader != nil {
 		liveVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
 		if err := r.APIReader.Get(ctx, types.NamespacedName{Name: vmb.Name, Namespace: vmb.Namespace}, liveVMB); err == nil {
+			var liveConditions []kubevirtbackupv1alpha1.Condition
+			if liveVMB.Status != nil {
+				liveConditions = liveVMB.Status.Conditions
+			}
+			logger.Info("Refreshed VirtualMachineBackup status via uncached read",
+				"vmb", vmb.Name, "conditions", liveConditions)
 			vmb.Status = liveVMB.Status
-		} else if !errors.IsNotFound(err) {
-			logger.V(1).Info("Failed to refresh VirtualMachineBackup status via uncached read, using cached copy",
+		} else if errors.IsNotFound(err) {
+			logger.Info("VirtualMachineBackup not found via uncached read, using cached copy",
+				"vmb", vmb.Name)
+		} else {
+			logger.Info("Failed to refresh VirtualMachineBackup status via uncached read, using cached copy",
 				"vmb", vmb.Name, "reason", err.Error())
 		}
 	}
