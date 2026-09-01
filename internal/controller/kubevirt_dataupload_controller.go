@@ -140,6 +140,7 @@ type KubeVirtDataUploadReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances,verbs=get;list;watch
 
 // Reconcile handles DataUpload resources where Spec.DataMover is "kubevirt"
 func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -544,9 +545,15 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 			}
 		}
 
+		// Step 3d: Determine whether the backup should be quiesced
+		// (application-consistent) or skip quiesce (crash-consistent).
+		// See determineSkipQuiesce for the precedence between the explicit
+		// user override annotation and automatic guest-agent detection.
+		skipQuiesce := r.determineSkipQuiesce(ctx, logger, du, vmRef)
+
 		// Step 4: Create VirtualMachineBackup
 		var created bool
-		vmb, created, err = r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmRef.Namespace, forceFullBackup)
+		vmb, created, err = r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmRef.Namespace, forceFullBackup, skipQuiesce)
 		if err != nil {
 			// Check if the error is due to another VMB being in progress for the same VM.
 			// KubeVirt's admission webhook only allows one active (non-terminal) VMB per VM.
@@ -841,6 +848,51 @@ func (r *KubeVirtDataUploadReconciler) resolveBackupMode(ctx context.Context, lo
 	}
 
 	return forceFullBackup, checkpointLookup
+}
+
+// determineSkipQuiesce decides whether the VirtualMachineBackup created for
+// this DataUpload should skip quiesce (crash-consistent, SkipQuiesce=true)
+// or attempt to quiesce the guest filesystem first (application-consistent,
+// SkipQuiesce=false).
+//
+// Precedence (highest first):
+//  1. Explicit user override via the AnnotationQuiesce annotation on the
+//     DataUpload: "true" forces quiesce, "false" forces skip-quiesce,
+//     regardless of guest-agent state.
+//  2. Automatic detection: quiesce only when the VM's
+//     VirtualMachineInstance reports its guest agent as connected (see
+//     common.IsGuestAgentConnected). This avoids the noisy "Failed
+//     freezing guest filesystem" warnings KubeVirt reports when backing
+//     up VMs without a guest agent, e.g. Cirros test VMs, without
+//     requiring a workload-specific annotation for every such VM.
+//
+// If the VMI can't be fetched (not found, transient error, etc.), quiesce
+// is skipped -- the safe, crash-consistent default -- rather than risking a
+// backup failure from attempting to quiesce a VM whose agent state is
+// unknown.
+func (r *KubeVirtDataUploadReconciler) determineSkipQuiesce(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmRef *common.VMReference) bool {
+	if raw, ok := du.Annotations[common.AnnotationQuiesce]; ok {
+		if override, err := strconv.ParseBool(raw); err == nil {
+			logger.Info("Quiesce explicitly overridden via annotation", "quiesce", override)
+			return !override
+		}
+		logger.Info("Ignoring unparseable quiesce annotation value, falling back to guest-agent auto-detection",
+			"annotation", common.AnnotationQuiesce, "value", raw)
+	}
+
+	vmi := &kubevirtcorev1.VirtualMachineInstance{}
+	if err := r.Get(ctx, types.NamespacedName{Name: vmRef.Name, Namespace: vmRef.Namespace}, vmi); err != nil {
+		logger.V(1).Info("Could not fetch VirtualMachineInstance, defaulting to skip quiesce",
+			"vmi", vmRef.Name, "reason", err.Error())
+		return true
+	}
+
+	if common.IsGuestAgentConnected(vmi) {
+		logger.Info("Guest agent connected, quiescing before backup", "vmi", vmi.Name)
+		return false
+	}
+	logger.Info("Guest agent not connected, skipping quiesce", "vmi", vmi.Name)
+	return true
 }
 
 // getEffectiveMaxIncrementalBackups returns the max incremental backups limit
@@ -1796,10 +1848,12 @@ func (r *KubeVirtDataUploadReconciler) lookupLatestVMBTFromBSL(ctx context.Conte
 // Returns the VMB, whether it was created (vs already existed), and any error.
 // When forceFullBackup is true, the VMB is created with ForceFullBackup=true in its spec,
 // which tells KubeVirt to perform a full backup regardless of any existing checkpoint.
+// skipQuiesce is set verbatim as VMB.Spec.SkipQuiesce -- see determineSkipQuiesce for
+// how the controller derives it (guest-agent auto-detection, overridable via annotation).
 // Note: We don't set an owner reference because VMB is in VM namespace
 // while DataUpload is in OADP namespace (cross-namespace owner refs not allowed).
 // VMB and VMBT are archived to S3 and deleted by the datamover pod after upload.
-func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmbt *kubevirtbackupv1alpha1.VirtualMachineBackupTracker, pvcName, namespace string, forceFullBackup bool) (*kubevirtbackupv1alpha1.VirtualMachineBackup, bool, error) {
+func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmbt *kubevirtbackupv1alpha1.VirtualMachineBackupTracker, pvcName, namespace string, forceFullBackup, skipQuiesce bool) (*kubevirtbackupv1alpha1.VirtualMachineBackup, bool, error) {
 	// Find existing VMB for this DataUpload
 	existingVMB, err := r.findVMBForDataUpload(ctx, du, namespace)
 	if err != nil {
@@ -1830,6 +1884,7 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logge
 				Name:     vmbt.Name,
 			},
 			PvcName:         &pvcName,
+			SkipQuiesce:     skipQuiesce,
 			ForceFullBackup: forceFullBackup,
 		},
 	}
@@ -1839,6 +1894,11 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logge
 	}
 	if forceFullBackup {
 		logger.Info("Creating VirtualMachineBackup with ForceFullBackup=true", "vmb", vmb.Name)
+	}
+	if skipQuiesce {
+		logger.V(1).Info("Creating VirtualMachineBackup with SkipQuiesce=true (crash-consistent)", "vmb", vmb.Name)
+	} else {
+		logger.Info("Creating VirtualMachineBackup with SkipQuiesce=false (quiesced, application-consistent)", "vmb", vmb.Name)
 	}
 
 	logger.Info("Created VirtualMachineBackup", "generateName", vmb.GenerateName, "namespace", namespace, "tracker", vmbt.Name)

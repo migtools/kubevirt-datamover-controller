@@ -1141,3 +1141,109 @@ func TestGetVolumesForVm(t *testing.T) {
 		})
 	}
 }
+
+func TestIsGuestAgentConnected(t *testing.T) {
+	tests := []struct {
+		name     string
+		vmi      *kubevirtcorev1.VirtualMachineInstance
+		expected bool
+	}{
+		{
+			name:     "nil VMI",
+			vmi:      nil,
+			expected: false,
+		},
+		{
+			name: "no conditions",
+			vmi: &kubevirtcorev1.VirtualMachineInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-vmi", Namespace: "default"},
+			},
+			expected: false,
+		},
+		{
+			name: "AgentConnected condition True",
+			vmi: &kubevirtcorev1.VirtualMachineInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-vmi", Namespace: "default"},
+				Status: kubevirtcorev1.VirtualMachineInstanceStatus{
+					Conditions: []kubevirtcorev1.VirtualMachineInstanceCondition{
+						{
+							Type:   kubevirtcorev1.VirtualMachineInstanceAgentConnected,
+							Status: corev1.ConditionTrue,
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "AgentConnected condition False",
+			vmi: &kubevirtcorev1.VirtualMachineInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-vmi", Namespace: "default"},
+				Status: kubevirtcorev1.VirtualMachineInstanceStatus{
+					Conditions: []kubevirtcorev1.VirtualMachineInstanceCondition{
+						{
+							Type:   kubevirtcorev1.VirtualMachineInstanceAgentConnected,
+							Status: corev1.ConditionFalse,
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "AgentConnected condition Unknown",
+			vmi: &kubevirtcorev1.VirtualMachineInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-vmi", Namespace: "default"},
+				Status: kubevirtcorev1.VirtualMachineInstanceStatus{
+					Conditions: []kubevirtcorev1.VirtualMachineInstanceCondition{
+						{
+							Type:   kubevirtcorev1.VirtualMachineInstanceAgentConnected,
+							Status: corev1.ConditionUnknown,
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "other conditions present but no AgentConnected",
+			vmi: &kubevirtcorev1.VirtualMachineInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-vmi", Namespace: "default"},
+				Status: kubevirtcorev1.VirtualMachineInstanceStatus{
+					Conditions: []kubevirtcorev1.VirtualMachineInstanceCondition{
+						{
+							Type:   kubevirtcorev1.VirtualMachineInstanceReady,
+							Status: corev1.ConditionTrue,
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "AgentConnected True among other conditions",
+			vmi: &kubevirtcorev1.VirtualMachineInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-vmi", Namespace: "default"},
+				Status: kubevirtcorev1.VirtualMachineInstanceStatus{
+					Conditions: []kubevirtcorev1.VirtualMachineInstanceCondition{
+						{
+							Type:   kubevirtcorev1.VirtualMachineInstanceReady,
+							Status: corev1.ConditionTrue,
+						},
+						{
+							Type:   kubevirtcorev1.VirtualMachineInstanceAgentConnected,
+							Status: corev1.ConditionTrue,
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, IsGuestAgentConnected(tt.vmi))
+		})
+	}
+}

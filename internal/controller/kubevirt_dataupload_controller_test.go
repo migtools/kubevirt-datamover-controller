@@ -7344,6 +7344,181 @@ func TestHandleAccepted_NoForceFullBackupByDefault(t *testing.T) {
 	}
 }
 
+// TestHandleAccepted_QuiesceDecision covers the guest-agent-based quiesce
+// auto-detection and its explicit user override (issue #217):
+//   - A VMI with AgentConnected==True quiesces (SkipQuiesce=false) by default.
+//   - A VMI without AgentConnected==True (false, absent, or no VMI at all)
+//     skips quiesce (SkipQuiesce=true) by default.
+//   - The AnnotationQuiesce override on the DataUpload takes precedence over
+//     automatic detection in both directions.
+func TestHandleAccepted_QuiesceDecision(t *testing.T) {
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+
+	agentConnectedVMI := &kubevirtcorev1.VirtualMachineInstance{
+		ObjectMeta: metav1.ObjectMeta{Name: vmName, Namespace: vmNamespace},
+		Status: kubevirtcorev1.VirtualMachineInstanceStatus{
+			Conditions: []kubevirtcorev1.VirtualMachineInstanceCondition{
+				{
+					Type:   kubevirtcorev1.VirtualMachineInstanceAgentConnected,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+	agentDisconnectedVMI := &kubevirtcorev1.VirtualMachineInstance{
+		ObjectMeta: metav1.ObjectMeta{Name: vmName, Namespace: vmNamespace},
+		Status: kubevirtcorev1.VirtualMachineInstanceStatus{
+			Conditions: []kubevirtcorev1.VirtualMachineInstanceCondition{
+				{
+					Type:   kubevirtcorev1.VirtualMachineInstanceAgentConnected,
+					Status: corev1.ConditionFalse,
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name              string
+		vmi               *kubevirtcorev1.VirtualMachineInstance
+		quiesceAnnotation string // "" means annotation unset
+		wantSkipQuiesce   bool
+	}{
+		{
+			name:            "no VMI, no override: skips quiesce by default",
+			vmi:             nil,
+			wantSkipQuiesce: true,
+		},
+		{
+			name:            "agent connected, no override: quiesces by default",
+			vmi:             agentConnectedVMI,
+			wantSkipQuiesce: false,
+		},
+		{
+			name:            "agent not connected, no override: skips quiesce by default",
+			vmi:             agentDisconnectedVMI,
+			wantSkipQuiesce: true,
+		},
+		{
+			name:              "agent connected, override=false: skips quiesce",
+			vmi:               agentConnectedVMI,
+			quiesceAnnotation: "false",
+			wantSkipQuiesce:   true,
+		},
+		{
+			name:              "agent not connected, override=true: quiesces",
+			vmi:               agentDisconnectedVMI,
+			quiesceAnnotation: "true",
+			wantSkipQuiesce:   false,
+		},
+		{
+			name:              "no VMI, override=true: quiesces",
+			vmi:               nil,
+			quiesceAnnotation: "true",
+			wantSkipQuiesce:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = velerov2alpha1.AddToScheme(scheme)
+			_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+			_ = kubevirtcorev1.AddToScheme(scheme)
+			_ = corev1.AddToScheme(scheme)
+
+			duName := "test-du-quiesce"
+			annotations := map[string]string{
+				common.AnnotationVMName:       vmName,
+				common.AnnotationVMNamespace:  vmNamespace,
+				common.AnnotationBSLValidated: "true", // Skip BSL validation
+			}
+			if tt.quiesceAnnotation != "" {
+				annotations[common.AnnotationQuiesce] = tt.quiesceAnnotation
+			}
+
+			du := &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        duName,
+					Namespace:   vmNamespace,
+					UID:         types.UID("test-uid"),
+					Annotations: annotations,
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					DataMover:       common.DataMoverKubeVirt,
+					SourceNamespace: vmNamespace,
+				},
+				Status: velerov2alpha1.DataUploadStatus{
+					Phase: velerov2alpha1.DataUploadPhaseAccepted,
+				},
+			}
+
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "kubevirt-backup-" + duName,
+					Namespace: vmNamespace,
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("1Gi"),
+						},
+					},
+				},
+			}
+
+			vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "vmbt-" + vmName,
+					Namespace: vmNamespace,
+				},
+				Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+					Source: corev1.TypedLocalObjectReference{
+						APIGroup: new("kubevirt.io"),
+						Kind:     "VirtualMachine",
+						Name:     vmName,
+					},
+				},
+			}
+
+			objs := []client.Object{du, pvc, vmbt}
+			if tt.vmi != nil {
+				objs = append(objs, tt.vmi)
+			}
+
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objs...).
+				Build()
+
+			r := &KubeVirtDataUploadReconciler{
+				Client:        fakeClient,
+				Scheme:        scheme,
+				Log:           logr.Discard(),
+				OADPNamespace: vmNamespace,
+			}
+
+			if _, err := r.handleAccepted(context.Background(), logr.Discard(), du); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
+			if err := fakeClient.List(context.Background(), vmbList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+				t.Fatalf("failed to list created VMBs: %v", err)
+			}
+			if len(vmbList.Items) != 1 {
+				t.Fatalf("expected 1 VMB to be created, but found %d", len(vmbList.Items))
+			}
+			createdVMB := vmbList.Items[0]
+
+			if createdVMB.Spec.SkipQuiesce != tt.wantSkipQuiesce {
+				t.Errorf("expected VMB.Spec.SkipQuiesce=%v, got %v", tt.wantSkipQuiesce, createdVMB.Spec.SkipQuiesce)
+			}
+		})
+	}
+}
+
 func TestHandleAccepted_StaleCheckpointSetsForceFullOnVMB(t *testing.T) {
 	// When BSL validation finds no valid checkpoint chain but VMBT has a stale
 	// checkpoint, the controller should set ForceFullBackup=true on the VMB
