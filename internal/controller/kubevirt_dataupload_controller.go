@@ -1896,7 +1896,7 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logge
 		logger.Info("Creating VirtualMachineBackup with ForceFullBackup=true", "vmb", vmb.Name)
 	}
 	if skipQuiesce {
-		logger.V(1).Info("Creating VirtualMachineBackup with SkipQuiesce=true (crash-consistent)", "vmb", vmb.Name)
+		logger.Info("Creating VirtualMachineBackup with SkipQuiesce=true (crash-consistent)", "vmb", vmb.Name)
 	} else {
 		logger.Info("Creating VirtualMachineBackup with SkipQuiesce=false (quiesced, application-consistent)", "vmb", vmb.Name)
 	}
