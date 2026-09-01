@@ -66,6 +66,18 @@ const (
 	// type in VMB.Status.Type (e.g., VM lost its libvirt checkpoint).
 	AnnotationExpectedBackupType = "kubevirt-datamover.io/expected-backup-type"
 
+	// AnnotationQuiesce, when set on a DataUpload, explicitly overrides the
+	// controller's automatic guest-agent-based quiesce detection (see
+	// IsGuestAgentConnected). Set to "true" to force a quiesced,
+	// application-consistent backup even when the guest agent isn't
+	// detected as connected; set to "false" to force a crash-consistent
+	// backup (skip quiesce) even when it is. Any other value, or the
+	// annotation being unset, falls back to automatic detection: the
+	// controller quiesces only when the VM's VirtualMachineInstance
+	// reports status.conditions[type=AgentConnected].status == "True".
+	// This override always takes precedence over automatic detection.
+	AnnotationQuiesce = "kubevirt-datamover.io/quiesce"
+
 	// AnnotationDataUploadName is the annotation key for the DataUpload name.
 	// Used on VMB, VMBT, and PVC resources to track ownership.
 	AnnotationDataUploadName = "velero.io/dataupload-name"
