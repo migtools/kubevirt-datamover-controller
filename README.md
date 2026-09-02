@@ -168,12 +168,12 @@ for a crash-consistent backup:
   status and quiesces only when `status.conditions[type=AgentConnected].status == "True"`. VMs
   without a connected QEMU guest agent (e.g. Cirros test VMs) skip quiesce automatically, instead
   of failing/warning on every backup.
-- **Explicit override**: set the `kubevirt-datamover.io/quiesce` annotation on the `DataUpload` to
-  override the automatic decision:
-  - `"true"` forces a quiesced (application-consistent) backup, even if the guest agent isn't
+- **Explicit override**: set the `kubevirt-datamover.io/skipQuiesce` annotation on the
+  `DataUpload` to override the automatic decision:
+  - `"true"` forces a crash-consistent backup (skip quiesce), even if the guest agent is
     detected as connected.
-  - `"false"` forces a crash-consistent backup (skip quiesce), even if the guest agent is
-    connected.
+  - `"false"` forces a quiesced (application-consistent) backup, even if the guest agent
+    isn't connected.
   - Any other value, or leaving the annotation unset, falls back to automatic detection.
 
 The override annotation always takes precedence over automatic detection.

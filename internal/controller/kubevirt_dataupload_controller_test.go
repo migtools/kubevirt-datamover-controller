@@ -7349,8 +7349,10 @@ func TestHandleAccepted_NoForceFullBackupByDefault(t *testing.T) {
 //   - A VMI with AgentConnected==True quiesces (SkipQuiesce=false) by default.
 //   - A VMI without AgentConnected==True (false, absent, or no VMI at all)
 //     skips quiesce (SkipQuiesce=true) by default.
-//   - The AnnotationQuiesce override on the DataUpload takes precedence over
-//     automatic detection in both directions.
+//   - The AnnotationSkipQuiesce override on the DataUpload takes precedence
+//     over automatic detection in both directions, including when the
+//     annotation is invalid/"auto" (falls back to auto-detection) or
+//     explicitly forces quiesce ("false") when no VMI can be found.
 func TestHandleAccepted_QuiesceDecision(t *testing.T) {
 	vmName := "test-vm"
 	vmNamespace := "test-ns"
@@ -7379,10 +7381,10 @@ func TestHandleAccepted_QuiesceDecision(t *testing.T) {
 	}
 
 	tests := []struct {
-		name              string
-		vmi               *kubevirtcorev1.VirtualMachineInstance
-		quiesceAnnotation string // "" means annotation unset
-		wantSkipQuiesce   bool
+		name                  string
+		vmi                   *kubevirtcorev1.VirtualMachineInstance
+		skipQuiesceAnnotation string // "" means annotation unset
+		wantSkipQuiesce       bool
 	}{
 		{
 			name:            "no VMI, no override: skips quiesce by default",
@@ -7400,22 +7402,34 @@ func TestHandleAccepted_QuiesceDecision(t *testing.T) {
 			wantSkipQuiesce: true,
 		},
 		{
-			name:              "agent connected, override=false: skips quiesce",
-			vmi:               agentConnectedVMI,
-			quiesceAnnotation: "false",
-			wantSkipQuiesce:   true,
+			name:                  "agent connected, override=true (skip quiesce): skips quiesce",
+			vmi:                   agentConnectedVMI,
+			skipQuiesceAnnotation: "true",
+			wantSkipQuiesce:       true,
 		},
 		{
-			name:              "agent not connected, override=true: quiesces",
-			vmi:               agentDisconnectedVMI,
-			quiesceAnnotation: "true",
-			wantSkipQuiesce:   false,
+			name:                  "agent not connected, override=false (force quiesce): quiesces",
+			vmi:                   agentDisconnectedVMI,
+			skipQuiesceAnnotation: "false",
+			wantSkipQuiesce:       false,
 		},
 		{
-			name:              "no VMI, override=true: quiesces",
-			vmi:               nil,
-			quiesceAnnotation: "true",
-			wantSkipQuiesce:   false,
+			name:                  "no VMI, override=false (force quiesce): quiesces despite no VMI",
+			vmi:                   nil,
+			skipQuiesceAnnotation: "false",
+			wantSkipQuiesce:       false,
+		},
+		{
+			name:                  "agent connected, invalid override value: falls back to auto-detection",
+			vmi:                   agentConnectedVMI,
+			skipQuiesceAnnotation: "not-a-bool",
+			wantSkipQuiesce:       false,
+		},
+		{
+			name:                  `agent not connected, override="auto": falls back to auto-detection`,
+			vmi:                   agentDisconnectedVMI,
+			skipQuiesceAnnotation: "auto",
+			wantSkipQuiesce:       true,
 		},
 	}
 
@@ -7433,8 +7447,8 @@ func TestHandleAccepted_QuiesceDecision(t *testing.T) {
 				common.AnnotationVMNamespace:  vmNamespace,
 				common.AnnotationBSLValidated: "true", // Skip BSL validation
 			}
-			if tt.quiesceAnnotation != "" {
-				annotations[common.AnnotationQuiesce] = tt.quiesceAnnotation
+			if tt.skipQuiesceAnnotation != "" {
+				annotations[common.AnnotationSkipQuiesce] = tt.skipQuiesceAnnotation
 			}
 
 			du := &velerov2alpha1.DataUpload{
