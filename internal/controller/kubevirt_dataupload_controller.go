@@ -856,8 +856,8 @@ func (r *KubeVirtDataUploadReconciler) resolveBackupMode(ctx context.Context, lo
 // SkipQuiesce=false).
 //
 // Precedence (highest first):
-//  1. Explicit user override via the AnnotationQuiesce annotation on the
-//     DataUpload: "true" forces quiesce, "false" forces skip-quiesce,
+//  1. Explicit user override via the AnnotationSkipQuiesce annotation on
+//     the DataUpload: "true" forces skip-quiesce, "false" forces quiesce,
 //     regardless of guest-agent state.
 //  2. Automatic detection: quiesce only when the VM's
 //     VirtualMachineInstance reports its guest agent as connected (see
@@ -871,17 +871,23 @@ func (r *KubeVirtDataUploadReconciler) resolveBackupMode(ctx context.Context, lo
 // backup failure from attempting to quiesce a VM whose agent state is
 // unknown.
 func (r *KubeVirtDataUploadReconciler) determineSkipQuiesce(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmRef *common.VMReference) bool {
-	if raw, ok := du.Annotations[common.AnnotationQuiesce]; ok {
+	if raw, ok := du.Annotations[common.AnnotationSkipQuiesce]; ok {
 		if override, err := strconv.ParseBool(raw); err == nil {
-			logger.Info("Quiesce explicitly overridden via annotation", "quiesce", override)
-			return !override
+			logger.Info("SkipQuiesce explicitly overridden via annotation", "skipQuiesce", override)
+			return override
 		}
-		logger.Info("Ignoring unparseable quiesce annotation value, falling back to guest-agent auto-detection",
-			"annotation", common.AnnotationQuiesce, "value", raw)
+		logger.Info("Ignoring unparseable skip-quiesce annotation value, falling back to guest-agent auto-detection",
+			"annotation", common.AnnotationSkipQuiesce, "value", raw)
 	}
 
 	vmi := &kubevirtcorev1.VirtualMachineInstance{}
-	if err := r.Get(ctx, types.NamespacedName{Name: vmRef.Name, Namespace: vmRef.Namespace}, vmi); err != nil {
+	var err error
+	if r.APIReader != nil {
+		err = r.APIReader.Get(ctx, types.NamespacedName{Name: vmRef.Name, Namespace: vmRef.Namespace}, vmi)
+	} else {
+		err = r.Get(ctx, types.NamespacedName{Name: vmRef.Name, Namespace: vmRef.Namespace}, vmi)
+	}
+	if err != nil {
 		logger.V(1).Info("Could not fetch VirtualMachineInstance, defaulting to skip quiesce",
 			"vmi", vmRef.Name, "reason", err.Error())
 		return true
