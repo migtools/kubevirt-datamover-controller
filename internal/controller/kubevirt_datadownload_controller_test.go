@@ -4703,4 +4703,99 @@ func TestRestoreVMRunStateIfAllSiblingsCompleted(t *testing.T) {
 			t.Errorf("RunStrategy = %v, want %q", updated.Spec.RunStrategy, kubevirtcorev1.RunStrategyAlways)
 		}
 	})
+
+	t.Run("uses TargetVolume.Namespace when set (namespace mapping)", func(t *testing.T) {
+		const targetNS = "mapped-target-ns"
+		scheme := ddSchemeWithKubeVirt()
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "dd-mapped",
+				Namespace: oadpNS,
+				Annotations: map[string]string{
+					common.AnnotationVMName:      vmName,
+					common.AnnotationVMNamespace: vmNamespace,
+				},
+			},
+			Spec: velerov2alpha1.DataDownloadSpec{
+				DataMover: common.DataMoverKubeVirt,
+				TargetVolume: velerov2alpha1.TargetVolumeSpec{
+					PVC:       "restored-pvc",
+					Namespace: targetNS,
+				},
+			},
+			Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCompleted},
+		}
+		vm := &kubevirtcorev1.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      vmName,
+				Namespace: targetNS,
+				Annotations: map[string]string{
+					common.AnnotationOriginalRunStrategy:       string(kubevirtcorev1.RunStrategyManual),
+					common.AnnotationOriginalRunStrategySource: common.RunStrategySourceRunStrategy,
+				},
+			},
+			Spec: kubevirtcorev1.VirtualMachineSpec{RunStrategy: func() *kubevirtcorev1.VirtualMachineRunStrategy { s := kubevirtcorev1.RunStrategyHalted; return &s }()},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, vm).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+		if err := r.restoreVMRunStateIfAllSiblingsCompleted(context.Background(), logr.Discard(), dd); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated kubevirtcorev1.VirtualMachine
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: vmName, Namespace: targetNS}, &updated); err != nil {
+			t.Fatalf("failed to get VM in target namespace: %v", err)
+		}
+		if updated.Spec.RunStrategy == nil || *updated.Spec.RunStrategy != kubevirtcorev1.RunStrategyManual {
+			t.Errorf("RunStrategy = %v, want %q", updated.Spec.RunStrategy, kubevirtcorev1.RunStrategyManual)
+		}
+	})
+
+	t.Run("falls back to vmRef.Namespace when TargetVolume.Namespace is empty", func(t *testing.T) {
+		scheme := ddSchemeWithKubeVirt()
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "dd-fallback",
+				Namespace: oadpNS,
+				Annotations: map[string]string{
+					common.AnnotationVMName:      vmName,
+					common.AnnotationVMNamespace: vmNamespace,
+				},
+			},
+			Spec: velerov2alpha1.DataDownloadSpec{
+				DataMover: common.DataMoverKubeVirt,
+				TargetVolume: velerov2alpha1.TargetVolumeSpec{
+					PVC:       "restored-pvc",
+					Namespace: "",
+				},
+			},
+			Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCompleted},
+		}
+		vm := &kubevirtcorev1.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      vmName,
+				Namespace: vmNamespace,
+				Annotations: map[string]string{
+					common.AnnotationOriginalRunStrategy:       string(kubevirtcorev1.RunStrategyManual),
+					common.AnnotationOriginalRunStrategySource: common.RunStrategySourceRunStrategy,
+				},
+			},
+			Spec: kubevirtcorev1.VirtualMachineSpec{RunStrategy: func() *kubevirtcorev1.VirtualMachineRunStrategy { s := kubevirtcorev1.RunStrategyHalted; return &s }()},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, vm).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+
+		if err := r.restoreVMRunStateIfAllSiblingsCompleted(context.Background(), logr.Discard(), dd); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var updated kubevirtcorev1.VirtualMachine
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: vmName, Namespace: vmNamespace}, &updated); err != nil {
+			t.Fatalf("failed to get VM in fallback namespace: %v", err)
+		}
+		if updated.Spec.RunStrategy == nil || *updated.Spec.RunStrategy != kubevirtcorev1.RunStrategyManual {
+			t.Errorf("RunStrategy = %v, want %q", updated.Spec.RunStrategy, kubevirtcorev1.RunStrategyManual)
+		}
+	})
 }
