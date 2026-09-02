@@ -12,14 +12,16 @@ ENV GOEXPERIMENT strictfipsruntime
 RUN CGO_ENABLED=1 GOOS=linux go build -tags "$BUILDTAGS" -mod=mod -a -o manager cmd/main.go
 
 FROM registry.redhat.io/ubi9/ubi:latest
+RUN microdnf install -y qemu-img && microdnf clean all
+
 COPY --from=builder $APP_ROOT/app/manager /manager
 
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]
 
-LABEL description="KubeVirt data mover controller"
-LABEL io.k8s.description="KubeVirt data mover controller"
-LABEL io.k8s.display-name="kubevirt-datamover-controller"
+LABEL description="OpenShift API for Data Protection - KubeVirt data mover controller image"
+LABEL io.k8s.description="OpenShift API for Data Protection - KubeVirt data mover controller image"
+LABEL io.k8s.display-name="OpenShift API for Data Protection - KDM"
 LABEL io.openshift.tags="migration"
-LABEL summary="KubeVirt data mover controller"
+LABEL summary="OpenShift API for Data Protection - KDM"
