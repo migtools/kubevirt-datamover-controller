@@ -2,35 +2,32 @@
 
 This project provides a Kubernetes controller for handling incremental qcow2-based VM backups using KubeVirt/libvirt Changed Block Tracking (CBT) instead of CSI snapshots.
 
+> **Looking for more detail?** See [`docs/architecture.md`](docs/architecture.md) for a full
+> walkthrough of the reconciliation phases, the checkpoint chain, and the object storage
+> layout, and [`docs/testing.md`](docs/testing.md) for how to run this repo's tests and set up
+> an end-to-end backup/restore environment. For end-user configuration and workflows, see the
+> [OADP operator's KubeVirt datamover documentation](https://github.com/openshift/oadp-operator/tree/oadp-dev/docs/kubevirt-datamover).
+
 ## Current Implementation Status
 
-**Phase 1: Controller Scaffolding**
-- [x] Controller watching DataUpload CRs
-- [x] Filter for `Spec.DataMover == "kubevirt"`
-- [x] Phase-based reconciliation logic (New, Accepted, Prepared, InProgress, Canceling)
-- [x] MaxConcurrentReconciles configuration via CLI flag
-- [x] RBAC manifests generated
+The controller implements the full backup and restore flow end to end:
 
-**Phase 2: VMBT/VMB Creation (In Development)**
-- [ ] Extract VirtualMachine reference from DataUpload annotation
-- [ ] Create temporary PVC for backup output
-- [ ] Create/update VirtualMachineBackupTracker (VMBT)
-- [ ] Create VirtualMachineBackup (VMB) CR
-- [ ] Monitor VMB status until completion
+- Watches Velero `DataUpload`/`DataDownload` CRs and only acts on ones where
+  `spec.datamover == "kubevirt"`.
+- Phase-based reconciliation for both backup (`New -> Accepted -> Prepared -> InProgress ->
+  Completed`) and restore, including cancellation support.
+- Extracts the source VM reference from `DataUpload`/`DataDownload` annotations. For backup, it
+  validates the VM is running with CBT enabled and creates/reuses `VirtualMachineBackupTracker`
+  (VMBT) and `VirtualMachineBackup` (VMB) CRs to drive KubeVirt's native CBT backup; restore does
+  not perform this validation or create VMB/VMBT objects, it resolves the checkpoint chain from
+  object storage instead.
+- Launches short-lived datamover pods that upload qcow2 files to the `BackupStorageLocation`
+  (BSL) and maintain a per-VM checkpoint index for incremental backups, and downloader pods
+  that reconstruct a VM disk from a checkpoint chain on restore.
+- Supports AWS S3/S3-compatible, Azure Blob, and GCP Cloud Storage BSLs, including STS and
+  workload-identity based credentials.
 
-**Phase 3: Write to BSL (Pending)**
-- [ ] Launch datamover pod with temp PVC mount and BSL credentials
-- [ ] Upload qcow2 files to object storage
-- [ ] Create/update checkpoint index.json
-
-**Phase 4: Read from BSL (Pending)**
-- [ ] Query checkpoint index before backup
-- [ ] Validate checkpoint chain
-- [ ] Handle missing/invalid checkpoints
-
-**Phase 5: Cleanup & Completion (Pending)**
-- [ ] Delete temporary PVC
-- [ ] Update DataUpload status to Completed
+See [`docs/architecture.md`](docs/architecture.md) for the full design.
 
 ## Design Overview
 
@@ -88,7 +85,7 @@ make docker-build docker-push IMG=<your-registry>/kubevirt-datamover-controller:
 make deploy IMG=<your-registry>/kubevirt-datamover-controller:latest
 
 # Check deployment status
-oc get pods -n kubevirt-datamover-system
+oc get pods -n openshift-adp
 ```
 
 #### Option C: Deploy to ttl.sh (Temporary Testing)
@@ -101,49 +98,31 @@ docker push ttl.sh/kubevirt-datamover-controller:1h
 make deploy IMG=ttl.sh/kubevirt-datamover-controller:1h
 
 # Check deployment
-oc get pods -n kubevirt-datamover-system
+oc get pods -n openshift-adp
 ```
 
 ### 3. Testing with DataUpload Resources
 
-The controller watches Velero DataUpload resources where `spec.datamover: kubevirt`.
-
-**Note**: Currently, Velero's built-in DataUpload controller also processes these resources. Upstream changes are required for Velero to skip reconciling when `spec.datamover` is set to an external value.
-
-#### Create a Test DataUpload
-
-```yaml
-apiVersion: velero.io/v2alpha1
-kind: DataUpload
-metadata:
-  name: test-kubevirt-du
-  namespace: openshift-adp
-spec:
-  datamover: kubevirt
-  snapshotType: kubevirt
-  sourceNamespace: my-vm-namespace
-  operationTimeout: 4h0m0s
-  csiSnapshot:
-    volumeSnapshot: ""
-    storageClass: ""
-    snapshotClass: ""
-  backupStorageLocation: default
-  sourceTargetPVC:
-    namespace: my-vm-namespace
-    name: my-vm-pvc
-```
+The controller watches Velero `DataUpload`/`DataDownload` resources where
+`spec.datamover: kubevirt`. In normal operation these are created by the
+`kubevirt-datamover-plugin` when Velero processes a VM backup with a matching `VolumePolicy`
+(see [`docs/architecture.md`](docs/architecture.md) for how that path works end to end and
+[`docs/testing.md`](docs/testing.md) for a full manual backup/restore walkthrough). A
+`DataUpload` also needs the `kubevirt-datamover.io/vm-name` (and optionally
+`kubevirt-datamover.io/vm-namespace`) annotation set so the controller knows which VM to back
+up; the plugin sets these automatically.
 
 #### Monitor Controller Activity
 
 ```bash
 # Watch controller logs
-oc logs -f -n kubevirt-datamover-system deployment/kubevirt-datamover-controller-manager
+oc logs -f -n openshift-adp deployment/kubevirt-datamover-controller-manager
 
 # Watch DataUpload status
 oc get datauploads -n openshift-adp -w
 
 # Check DataUpload details
-oc get dataupload test-kubevirt-du -n openshift-adp -o yaml
+oc get dataupload <name> -n openshift-adp -o yaml
 ```
 
 ### 4. Configuration Options
@@ -152,21 +131,27 @@ The controller supports the following CLI flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--metrics-bind-address` | `0` | Address for metrics endpoint (`:8443` for HTTPS, `:8080` for HTTP) |
+| `--metrics-bind-address` | `0` | Address for metrics endpoint (`:8443` for HTTPS, `:8080` for HTTP, or `0` to disable) |
 | `--health-probe-bind-address` | `:8081` | Address for health probe endpoint |
 | `--leader-elect` | `false` | Enable leader election for HA |
-| `--max-concurrent-reconciles` | `3` | Maximum concurrent DataUpload reconciliations |
 | `--metrics-secure` | `true` | Serve metrics via HTTPS |
+| `--max-concurrent-reconciles` | `3` | Maximum concurrent reconciles for the DataUpload and DataDownload controllers |
+| `--max-concurrent-data-movers` | `0` (unlimited) | Maximum number of active DataUploads or DataDownloads (per controller) allowed concurrently |
+| `--max-incremental-backups` | `0` (unlimited) | Maximum number of incremental backups per VM before forcing a full backup |
+| `--stale-dataupload-threshold` | `2h` | Duration after which a stale DataUpload stops blocking younger ones for the same VM |
+| `--datamover-image` | `quay.io/konveyor/kubevirt-datamover-controller:latest` | Image used for datamover pods |
+| `--datamover-image-pull-policy` | `Always` | Image pull policy for datamover pods |
+| `--oadp-namespace` | `openshift-adp` | Namespace where OADP/Velero resources are located |
 
 ### 5. Troubleshooting
 
 #### Controller Pod Not Starting
 ```bash
 # Check pod status
-oc describe pod -n kubevirt-datamover-system -l control-plane=controller-manager
+oc describe pod -n openshift-adp -l control-plane=controller-manager
 
 # Check events
-oc get events -n kubevirt-datamover-system --sort-by='.lastTimestamp'
+oc get events -n openshift-adp --sort-by='.lastTimestamp'
 ```
 
 #### DataUpload Not Being Processed
@@ -175,7 +160,7 @@ oc get events -n kubevirt-datamover-system --sort-by='.lastTimestamp'
 oc get dataupload <name> -n openshift-adp -o jsonpath='{.spec.datamover}'
 
 # Check controller is watching
-oc logs -n kubevirt-datamover-system deployment/kubevirt-datamover-controller-manager | grep -i kubevirt
+oc logs -n openshift-adp deployment/kubevirt-datamover-controller-manager | grep -i kubevirt
 ```
 
 #### Architecture Mismatch (Exec Format Error)
@@ -210,7 +195,7 @@ make run
 
 ## Kubebuilder
 
-The project was generated using kubebuilder version `v4.6.0`, running the following commands:
+The project was generated using kubebuilder version `v4.11.0`, running the following commands:
 ```sh
 kubebuilder init \
     --plugins go.kubebuilder.io/v4 \
@@ -221,6 +206,20 @@ kubebuilder init \
 
 # Note: This controller watches Velero's DataUpload CRD rather than defining its own
 ```
+
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md): a developer-focused walkthrough of the
+  reconciliation phases, the checkpoint chain design, and object storage layout.
+- [`docs/testing.md`](docs/testing.md): running this repo's automated tests and setting up an
+  end-to-end backup/restore environment.
+- [kubevirt-datamover-plugin](https://github.com/migtools/kubevirt-datamover-plugin): the
+  companion Velero plugin that creates the `DataUpload`/`DataDownload` CRs this controller
+  reconciles.
+- [OADP operator KubeVirt datamover docs](https://github.com/openshift/oadp-operator/tree/oadp-dev/docs/kubevirt-datamover):
+  end-user configuration, backup/restore workflows, and troubleshooting.
+- [OADP KubeVirt Datamover design document](https://github.com/openshift/oadp-operator/blob/oadp-dev/docs/design/kubevirt-datamover.md):
+  the original design proposal.
 
 ## Related Resources
 
