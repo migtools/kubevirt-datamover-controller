@@ -1938,21 +1938,28 @@ func (r *KubeVirtDataDownloadReconciler) restoreVMRunStateIfAllSiblingsCompleted
 		return nil
 	}
 
+	// vmRef.Namespace is the original/source namespace.
+	// TargetVolume.Namespace is the namespace after restore mapping.
+	targetVMNamespace := dd.Spec.TargetVolume.Namespace
+	if targetVMNamespace == "" {
+		targetVMNamespace = vmRef.Namespace
+	}
+
 	vm := &kubevirtcorev1.VirtualMachine{}
-	if err := r.Get(ctx, types.NamespacedName{Name: vmRef.Name, Namespace: vmRef.Namespace}, vm); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: vmRef.Name, Namespace: targetVMNamespace}, vm); err != nil {
 		if errors.IsNotFound(err) {
 			logger.V(1).Info("VirtualMachine not found, skipping run-state restore",
-				"vm", vmRef.Name, "namespace", vmRef.Namespace)
+				"vm", vmRef.Name, "namespace", targetVMNamespace)
 			return nil
 		}
-		return fmt.Errorf("failed to get VirtualMachine %s/%s for run-state restore: %w", vmRef.Namespace, vmRef.Name, err)
+		return fmt.Errorf("failed to get VirtualMachine %s/%s for run-state restore: %w", targetVMNamespace, vmRef.Name, err)
 	}
 
 	value, hasValue := vm.Annotations[common.AnnotationOriginalRunStrategy]
 	source, hasSource := vm.Annotations[common.AnnotationOriginalRunStrategySource]
 	if !hasValue || !hasSource {
 		logger.V(1).Info("VirtualMachine has no stashed run state, skipping restore",
-			"vm", vmRef.Name, "namespace", vmRef.Namespace)
+			"vm", vmRef.Name, "namespace", targetVMNamespace)
 		return nil
 	}
 
@@ -1967,17 +1974,17 @@ func (r *KubeVirtDataDownloadReconciler) restoreVMRunStateIfAllSiblingsCompleted
 		vm.Spec.Running = nil
 	default:
 		return fmt.Errorf("VirtualMachine %s/%s has unrecognized %s value %q",
-			vm.Namespace, vm.Name, common.AnnotationOriginalRunStrategySource, source)
+			targetVMNamespace, vm.Name, common.AnnotationOriginalRunStrategySource, source)
 	}
 
 	delete(vm.Annotations, common.AnnotationOriginalRunStrategy)
 	delete(vm.Annotations, common.AnnotationOriginalRunStrategySource)
 
 	if err := r.Update(ctx, vm); err != nil {
-		return fmt.Errorf("failed to restore VirtualMachine %s/%s run state: %w", vm.Namespace, vm.Name, err)
+		return fmt.Errorf("failed to restore VirtualMachine %s/%s run state: %w", targetVMNamespace, vm.Name, err)
 	}
 	logger.Info("Restored VirtualMachine run state after all DataDownloads completed",
-		"vm", vmRef.Name, "namespace", vmRef.Namespace, "source", source, "value", value)
+		"vm", vmRef.Name, "namespace", targetVMNamespace, "source", source, "value", value)
 	return nil
 }
 
