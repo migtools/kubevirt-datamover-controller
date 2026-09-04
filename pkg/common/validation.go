@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	velerov2alpha1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
+	corev1 "k8s.io/api/core/v1"
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
 )
 
@@ -146,6 +147,25 @@ func ValidateVMForBackup(vm *kubevirtcorev1.VirtualMachine) error {
 	}
 
 	return nil
+}
+
+// IsGuestAgentConnected reports whether a VirtualMachineInstance's QEMU
+// guest agent is currently connected, based on its AgentConnected status
+// condition. Returns false if vmi is nil or the condition is absent or not
+// True. Callers use this to decide whether quiescing (freezing the guest
+// filesystem) before a backup is safe to attempt -- VMs without a running
+// guest agent (e.g. Cirros test VMs) should skip quiesce by default rather
+// than fail/warn on every backup attempt.
+func IsGuestAgentConnected(vmi *kubevirtcorev1.VirtualMachineInstance) bool {
+	if vmi == nil {
+		return false
+	}
+	for _, cond := range vmi.Status.Conditions {
+		if cond.Type == kubevirtcorev1.VirtualMachineInstanceAgentConnected {
+			return cond.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 func getPvcNameFromVolume(volume kubevirtcorev1.Volume) string {
