@@ -77,7 +77,7 @@ const (
 	// VirtualMachineInstance reports
 	// status.conditions[type=AgentConnected].status == "True".
 	// This override always takes precedence over automatic detection.
-	AnnotationSkipQuiesce = "kubevirt-datamover.io/skipQuiesce"
+	AnnotationSkipQuiesce = "kubevirt-datamover.io/skip-quiesce"
 
 	// AnnotationDataUploadName is the annotation key for the DataUpload name.
 	// Used on VMB, VMBT, and PVC resources to track ownership.
