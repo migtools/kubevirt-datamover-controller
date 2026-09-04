@@ -143,6 +143,26 @@ The controller supports the following CLI flags:
 | `--datamover-image-pull-policy` | `Always` | Image pull policy for datamover pods |
 | `--oadp-namespace` | `openshift-adp` | Namespace where OADP/Velero resources are located |
 
+#### Quiesce Behavior
+
+Before creating the `VirtualMachineBackup`, the controller decides whether KubeVirt should
+quiesce (freeze) the guest filesystem for an application-consistent backup, or skip quiescing
+for a crash-consistent backup:
+
+- **Default (automatic detection)**: the controller inspects the VM's `VirtualMachineInstance`
+  status and quiesces only when `status.conditions[type=AgentConnected].status == "True"`. VMs
+  without a connected QEMU guest agent (e.g. Cirros test VMs) skip quiesce automatically, instead
+  of failing/warning on every backup.
+- **Explicit override**: set the `kubevirt-datamover.io/skipQuiesce` annotation on the
+  `DataUpload` to override the automatic decision:
+  - `"true"` forces a crash-consistent backup (skip quiesce), even if the guest agent is
+    detected as connected.
+  - `"false"` forces a quiesced (application-consistent) backup, even if the guest agent
+    isn't connected.
+  - Any other value, or leaving the annotation unset, falls back to automatic detection.
+
+The override annotation always takes precedence over automatic detection.
+
 ### 5. Troubleshooting
 
 #### Controller Pod Not Starting
