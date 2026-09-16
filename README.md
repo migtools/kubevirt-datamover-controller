@@ -136,7 +136,7 @@ The controller supports the following CLI flags:
 | `--leader-elect` | `false` | Enable leader election for HA |
 | `--metrics-secure` | `true` | Serve metrics via HTTPS |
 | `--max-concurrent-reconciles` | `3` | Maximum concurrent reconciles for the DataUpload and DataDownload controllers |
-| `--max-concurrent-data-movers` | `0` (unlimited) | Maximum number of active DataUploads or DataDownloads (per controller) allowed concurrently |
+| `--max-concurrent-data-movers` | `3` | Maximum number of active DataUploads or DataDownloads (per controller) allowed concurrently. Set `0` for unlimited concurrency. |
 | `--max-incremental-backups` | `0` (unlimited) | Maximum number of incremental backups per VM before forcing a full backup |
 | `--stale-dataupload-threshold` | `2h` | Duration after which a stale DataUpload stops blocking younger ones for the same VM |
 | `--datamover-image` | `quay.io/konveyor/kubevirt-datamover-controller:latest` | Image used for datamover pods |
