@@ -241,9 +241,9 @@ const (
 	DefaultStaleDataUploadThreshold = 2 * time.Hour
 
 	// DefaultMaxConcurrentDataMovers is the default value for
-	// --max-concurrent-data-movers (0 = unlimited, preserving current
-	// behavior until an operator opts in).
-	DefaultMaxConcurrentDataMovers = 0
+	// --max-concurrent-data-movers. A value of 0 explicitly disables the
+	// concurrency limit.
+	DefaultMaxConcurrentDataMovers = 3
 )
 
 // SnapshotType constants for DataUpload
