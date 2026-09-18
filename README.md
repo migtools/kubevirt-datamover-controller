@@ -157,6 +157,7 @@ The controller supports the following CLI flags:
 | `--leader-elect` | `false` | Enable leader election for HA |
 | `--max-concurrent-reconciles` | `3` | Maximum concurrent DataUpload reconciliations |
 | `--metrics-secure` | `true` | Serve metrics via HTTPS |
+| `--max-concurrent-data-movers` | `3` | Maximum number of active DataUploads or DataDownloads (per controller) allowed concurrently. Set `0` for unlimited concurrency. |
 
 #### Quiesce Behavior
 
