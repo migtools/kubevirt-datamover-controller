@@ -15,7 +15,7 @@ require (
 	github.com/onsi/gomega v1.40.0
 	github.com/sirupsen/logrus v1.9.4
 	github.com/stretchr/testify v1.11.1
-	github.com/vmware-tanzu/velero v1.18.3-rc.1
+	github.com/vmware-tanzu/velero v1.18.3
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sync v0.22.0
 	google.golang.org/api v0.283.0
@@ -26,7 +26,7 @@ require (
 	sigs.k8s.io/controller-runtime v0.24.0
 )
 
-replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.20260901204729-2561b5f76121
+replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.20260904060022-e81ee90062e6
 
 require (
 	cel.dev/expr v0.25.1 // indirect
