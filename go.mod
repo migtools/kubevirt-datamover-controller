@@ -26,7 +26,7 @@ require (
 	sigs.k8s.io/controller-runtime v0.24.0
 )
 
-replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.20260929214925-8752b8364664
+replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.20261001175236-0e0b11d9e114
 
 require (
 	cel.dev/expr v0.25.3 // indirect
