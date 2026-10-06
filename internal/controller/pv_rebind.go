@@ -869,70 +869,105 @@ func findPVByUIDLabel(ctx context.Context, k8sClient client.Client, uidLabelKey,
 // cleanupReboundPVCAndPV deletes the rebound PVC and PV after a datamover operation completes.
 // The resourceUID is used to find the PV by label if the PVC is already gone,
 // preventing storage leakage.
+// Fix for leftover Ceph csi-vol after kubevirt CBT datamover backup.
+// Runtime evidence (baseline 2026-08-23):
+// 1. Rebound PVC was deleted while PV reclaim=Retain -> phase Released.
+//    CSI provisioner finalizer was already gone, so Ceph was not asked to delete.
+// 2. Controller then patched reclaim=Delete and immediately deleted the PV object.
+//    CSI logs had no DeleteVolume. Image csi-vol-3f42f542-... remained in Ceph.
+//
+// Correct order (same as Velero intermediate-PV cleanup):
+//   patch PV reclaim -> Delete FIRST
+//   then delete PVC
+//   then WAIT for the PV object to disappear (PV controller + CSI DeleteVolume)
+//   do NOT client.Delete(pv) while the provisioner finalizer is missing
+
 func cleanupReboundPVCAndPV(
-	ctx context.Context,
-	k8sClient client.Client,
-	logger logr.Logger,
-	pvcName string,
-	pvcNamespace string,
-	resourceUID string,
-	uidLabelKey string,
+        ctx context.Context,
+        k8sClient client.Client,
+        logger logr.Logger,
+        pvcName string,
+        pvcNamespace string,
+        resourceUID string,
+        uidLabelKey string,
 ) error {
-	var pvName string
+        var pvName string
+        pvcExists := false
 
-	pvc := &corev1.PersistentVolumeClaim{}
-	err := k8sClient.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: pvcNamespace}, pvc)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			logger.V(1).Info("Rebound PVC already deleted, will find PV by label", "pvc", pvcName)
-		} else {
-			return fmt.Errorf("failed to get rebound PVC %s/%s: %w", pvcNamespace, pvcName, err)
-		}
-	} else {
-		pvName = pvc.Spec.VolumeName
+        pvc := &corev1.PersistentVolumeClaim{}
+        err := k8sClient.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: pvcNamespace}, pvc)
+        if err != nil {
+                if errors.IsNotFound(err) {
+                        logger.V(1).Info("Rebound PVC already deleted, will find PV by label", "pvc", pvcName)
+                } else {
+                        return fmt.Errorf("failed to get rebound PVC %s/%s: %w", pvcNamespace, pvcName, err)
+                }
+        } else {
+                pvName = pvc.Spec.VolumeName
+                pvcExists = true
+        }
 
-		if err := k8sClient.Delete(ctx, pvc); err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete rebound PVC %s/%s: %w", pvcNamespace, pvcName, err)
-		}
-		logger.Info("Deleted rebound PVC", "pvc", pvcName, "namespace", pvcNamespace)
+        pv := &corev1.PersistentVolume{}
+        if pvName != "" {
+                if err := k8sClient.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
+                        if errors.IsNotFound(err) {
+                                logger.V(1).Info("PV already deleted", "pv", pvName)
+                                return nil
+                        }
+                        return fmt.Errorf("failed to get PV %s: %w", pvName, err)
+                }
+        } else {
+                found, err := findPVByUIDLabel(ctx, k8sClient, uidLabelKey, resourceUID)
+                if err != nil {
+                        return fmt.Errorf("failed to list PVs by label: %w", err)
+                }
+                if found == nil {
+                        logger.V(1).Info("No PV found with label, already cleaned up", "label", uidLabelKey, "value", resourceUID)
+                        return nil
+                }
+                pv = found
+                pvName = pv.Name
+                logger.Info("Found PV by label", "pv", pvName, "label", uidLabelKey)
+        }
 
-		if err := waitForPVCDeletion(ctx, k8sClient, pvcName, pvcNamespace); err != nil {
-			logger.Error(err, "Timeout waiting for PVC deletion", "pvc", pvcName)
-		}
-	}
+        // CRITICAL: set Delete before removing the PVC, while CSI can still honor reclaim.
+        if err := patchPVReclaimPolicy(ctx, k8sClient, pv, corev1.PersistentVolumeReclaimDelete); err != nil {
+                return fmt.Errorf("cannot cleanup PV %s: failed to set reclaim policy to Delete: %w", pvName, err)
+        }
+        logger.Info("Set PV reclaim policy to Delete before PVC/PV removal", "pv", pvName)
 
-	pv := &corev1.PersistentVolume{}
-	if pvName != "" {
-		if err := k8sClient.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
-			if errors.IsNotFound(err) {
-				logger.V(1).Info("PV already deleted", "pv", pvName)
-				return nil
-			}
-			return fmt.Errorf("failed to get PV %s: %w", pvName, err)
-		}
-	} else {
-		found, err := findPVByUIDLabel(ctx, k8sClient, uidLabelKey, resourceUID)
-		if err != nil {
-			return fmt.Errorf("failed to list PVs by label: %w", err)
-		}
-		if found == nil {
-			logger.V(1).Info("No PV found with label, already cleaned up", "label", uidLabelKey, "value", resourceUID)
-			return nil
-		}
-		pv = found
-		pvName = pv.Name
-		logger.Info("Found PV by label", "pv", pvName, "label", uidLabelKey)
-	}
+        if pvcExists {
+                if delErr := k8sClient.Delete(ctx, pvc); delErr != nil && !errors.IsNotFound(delErr) {
+                        return fmt.Errorf("failed to delete rebound PVC %s/%s: %w", pvcNamespace, pvcName, delErr)
+                }
+                logger.Info("Deleted rebound PVC", "pvc", pvcName, "namespace", pvcNamespace)
+                if err := waitForPVCDeletion(ctx, k8sClient, pvcName, pvcNamespace); err != nil {
+                        logger.Error(err, "Timeout waiting for PVC deletion", "pvc", pvcName)
+                }
+        }
 
-	if err := patchPVReclaimPolicy(ctx, k8sClient, pv, corev1.PersistentVolumeReclaimDelete); err != nil {
-		logger.Error(err, "Failed to set PV reclaim policy to Delete after retries", "pv", pvName)
-		return fmt.Errorf("cannot delete PV %s: failed to set reclaim policy to Delete (would cause storage leakage): %w", pvName, err)
-	}
-
-	if err := k8sClient.Delete(ctx, pv); err != nil && !errors.IsNotFound(err) {
-		return fmt.Errorf("failed to delete PV %s: %w", pvName, err)
-	}
-	logger.Info("Deleted PV", "pv", pvName)
-
-	return nil
+        // Do not delete the PV object ourselves. With reclaim=Delete, the PV
+        // controller + CSI provisioner must run DeleteVolume, then remove the PV.
+        if err := waitForPVDeletion(ctx, k8sClient, pvName); err != nil {
+                return fmt.Errorf("PV %s still present after setting Delete (CSI DeleteVolume did not complete): %w", pvName, err)
+        }
+        logger.Info("PV removed by reclaim Delete (CSI DeleteVolume completed)", "pv", pvName)
+        return nil
 }
+
+func waitForPVDeletion(ctx context.Context, k8sClient client.Client, pvName string) error {
+        deadline := time.Now().Add(pvRebindTimeout)
+        for time.Now().Before(deadline) {
+                pv := &corev1.PersistentVolume{}
+                err := k8sClient.Get(ctx, types.NamespacedName{Name: pvName}, pv)
+                if errors.IsNotFound(err) {
+                        return nil
+                }
+                if err != nil {
+                        return err
+                }
+                time.Sleep(2 * time.Second)
+        }
+        return fmt.Errorf("timeout waiting for PV %s to be deleted", pvName)
+}
+
