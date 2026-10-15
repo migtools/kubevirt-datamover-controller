@@ -32,7 +32,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 )
@@ -53,6 +55,61 @@ const immediateRequeueDelay = time.Second
 // otherwise flood the controller's logs with no bound; keeping only the last
 // N lines still surfaces the most relevant (final) output.
 const maxEmittedPodLogLines = 200
+
+// dataMoverControllerOptions returns the controller options shared by the
+// DataUpload and DataDownload controllers, defaulting maxConcurrentReconciles
+// to DefaultMaxConcurrentReconciles when it isn't positive.
+//
+// The priority queue (enabled by default in controller-runtime) is turned
+// off. It enqueues everything from an informer's initial list at
+// LowPriority, and a RequeueAfter keeps the priority the item was dequeued
+// with, so after a controller restart any object that keeps receiving fresh
+// events (priority 0) is always dequeued ahead of the re-listed ones. A few
+// such objects can occupy every worker and starve the rest indefinitely --
+// e.g. DataUploads waiting on their VirtualMachineBackup, which nothing
+// watches, are only ever woken by their own RequeueAfter. Plain FIFO
+// ordering bounds every item's wait.
+func dataMoverControllerOptions(maxConcurrentReconciles int) controller.Options {
+	if maxConcurrentReconciles <= 0 {
+		maxConcurrentReconciles = DefaultMaxConcurrentReconciles
+	}
+	usePriorityQueue := false
+	return controller.Options{
+		MaxConcurrentReconciles: maxConcurrentReconciles,
+		UsePriorityQueue:        &usePriorityQueue,
+	}
+}
+
+// ManagerCacheOptions returns the manager cache configuration. The cache is
+// cluster-wide by default, and the first cached Get/List of a type starts an
+// informer for every object of that type in the cluster, so on a large cluster
+// a single read can add tens of MiB to the controller's footprint:
+//   - Pods are only ever read in the OADP namespace (getPodNamespace), so when
+//     oadpNamespace is set the Pod informer is restricted to it.
+//   - managedFields are stripped from every cached object; nothing reads them.
+//
+// Secrets are kept out of the cache entirely; see ManagerClientCacheOptions.
+func ManagerCacheOptions(oadpNamespace string) cache.Options {
+	opts := cache.Options{
+		DefaultTransform: cache.TransformStripManagedFields(),
+	}
+	if oadpNamespace != "" {
+		opts.ByObject = map[client.Object]cache.ByObject{
+			&corev1.Pod{}: {Namespaces: map[string]cache.Config{oadpNamespace: {}}},
+		}
+	}
+	return opts
+}
+
+// ManagerClientCacheOptions makes the manager's client read Secrets directly
+// from the API server. The only Secret read is the occasional BSL credential
+// lookup, and serving it from the cache would start an informer holding every
+// Secret in the cluster.
+func ManagerClientCacheOptions() *client.CacheOptions {
+	return &client.CacheOptions{
+		DisableFor: []client.Object{&corev1.Secret{}},
+	}
+}
 
 // operationTimeoutExceeded reports whether the time elapsed since acceptedAt
 // exceeds the effective operation timeout: specTimeout when positive, otherwise

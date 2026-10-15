@@ -4350,8 +4350,8 @@ func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
 	// (by CreationTimestamp) so they always outrank du regardless of UID --
 	// these tests exercise the count/limit comparison itself, not ranking
 	// direction (that's TestCountHigherPriorityActiveDataUploads's job). du's
-	// own AcceptedTimestamp is separately seeded to exercise the gate's
-	// advance-on-defer behavior -- ranking never reads it.
+	// own AcceptedTimestamp is seeded so the at-limit case can assert the gate
+	// leaves it untouched -- ranking never reads it.
 	newFixtureWithOthers := func(otherActiveCount int) (*velerov2alpha1.DataUpload, []runtime.Object) {
 		du := &velerov2alpha1.DataUpload{
 			ObjectMeta: metav1.ObjectMeta{
@@ -4471,6 +4471,10 @@ func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
 			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
 			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 3,
 		}
+		var before velerov2alpha1.DataUpload
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, &before); err != nil {
+			t.Fatalf("failed to get DataUpload: %v", err)
+		}
 
 		result, err := r.handlePrepared(context.Background(), logr.Discard(), du)
 		if err != nil {
@@ -4494,13 +4498,14 @@ func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
 			t.Error("expected no datamover pod to be created while gated")
 		}
 
-		// Deferring due to the concurrency limit is intentional throttling, not
-		// a stalled operation -- AcceptedTimestamp must advance by exactly the
-		// requeue interval so this wait doesn't consume Spec.OperationTimeout's
-		// budget (see the gate's defer branch in checkConcurrentDataMoverLimit).
-		wantAdvanced := baseTime.Add(RequeueAfterLong)
-		if updated.Status.AcceptedTimestamp == nil || !updated.Status.AcceptedTimestamp.Time.Equal(wantAdvanced) {
-			t.Errorf("AcceptedTimestamp = %v, want %v (baseTime + RequeueAfterLong)", updated.Status.AcceptedTimestamp, wantAdvanced)
+		// The gate must not write du: any write bumps resourceVersion, and the
+		// resulting Update event would re-enqueue du immediately instead of
+		// after RequeueAfterLong (see checkConcurrentDataMoverLimit).
+		if updated.ResourceVersion != before.ResourceVersion {
+			t.Errorf("resourceVersion = %q, want unchanged %q (gate must not write the DataUpload)", updated.ResourceVersion, before.ResourceVersion)
+		}
+		if updated.Status.AcceptedTimestamp == nil || !updated.Status.AcceptedTimestamp.Time.Equal(baseTime.Time) {
+			t.Errorf("AcceptedTimestamp = %v, want unchanged %v", updated.Status.AcceptedTimestamp, baseTime)
 		}
 	})
 

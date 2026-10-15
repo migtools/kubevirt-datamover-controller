@@ -33,6 +33,91 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
+func TestManagerCacheOptions(t *testing.T) {
+	t.Run("scopes Pods to the OADP namespace and strips managedFields", func(t *testing.T) {
+		opts := ManagerCacheOptions("openshift-adp")
+		if opts.DefaultTransform == nil {
+			t.Fatal("DefaultTransform = nil, want managedFields stripping")
+		}
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			ManagedFields: []metav1.ManagedFieldsEntry{{Manager: "kubelet"}},
+		}}
+		out, err := opts.DefaultTransform(pod)
+		if err != nil {
+			t.Fatalf("DefaultTransform: %v", err)
+		}
+		if mf := out.(*corev1.Pod).ManagedFields; mf != nil {
+			t.Errorf("ManagedFields = %v, want stripped", mf)
+		}
+
+		if len(opts.ByObject) != 1 {
+			t.Fatalf("ByObject has %d entries, want 1 (Pod)", len(opts.ByObject))
+		}
+		for obj, byObj := range opts.ByObject {
+			if _, ok := obj.(*corev1.Pod); !ok {
+				t.Errorf("ByObject key = %T, want *corev1.Pod", obj)
+			}
+			if _, ok := byObj.Namespaces["openshift-adp"]; !ok || len(byObj.Namespaces) != 1 {
+				t.Errorf("Pod Namespaces = %v, want only openshift-adp", byObj.Namespaces)
+			}
+		}
+	})
+
+	t.Run("leaves Pods cluster-wide when no OADP namespace is set", func(t *testing.T) {
+		// getPodNamespace falls back to the CR's own namespace in this case,
+		// which the cache can't know up front.
+		opts := ManagerCacheOptions("")
+		if len(opts.ByObject) != 0 {
+			t.Errorf("ByObject = %v, want empty", opts.ByObject)
+		}
+		if opts.DefaultTransform == nil {
+			t.Error("DefaultTransform = nil, want managedFields stripping")
+		}
+	})
+}
+
+func TestManagerClientCacheOptions(t *testing.T) {
+	// A cached Secret read would start a cluster-wide Secret informer.
+	opts := ManagerClientCacheOptions()
+	if opts == nil {
+		t.Fatal("ManagerClientCacheOptions() = nil")
+	}
+	found := false
+	for _, obj := range opts.DisableFor {
+		if _, ok := obj.(*corev1.Secret); ok {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("DisableFor = %v, want it to include *corev1.Secret", opts.DisableFor)
+	}
+}
+
+func TestDataMoverControllerOptions(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{name: "zero falls back to default", in: 0, want: DefaultMaxConcurrentReconciles},
+		{name: "negative falls back to default", in: -1, want: DefaultMaxConcurrentReconciles},
+		{name: "positive is kept", in: 7, want: 7},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := dataMoverControllerOptions(tt.in)
+			if opts.MaxConcurrentReconciles != tt.want {
+				t.Errorf("MaxConcurrentReconciles = %d, want %d", opts.MaxConcurrentReconciles, tt.want)
+			}
+			// nil would fall back to controller-runtime's default (priority
+			// queue on), which can starve re-listed objects after a restart.
+			if opts.UsePriorityQueue == nil || *opts.UsePriorityQueue {
+				t.Errorf("UsePriorityQueue = %v, want explicit false", opts.UsePriorityQueue)
+			}
+		})
+	}
+}
+
 func TestOperationTimeoutExceeded(t *testing.T) {
 	tests := []struct {
 		name          string

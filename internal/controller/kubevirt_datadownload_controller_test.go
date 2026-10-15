@@ -2671,11 +2671,9 @@ func TestCountHigherPriorityActiveDataDownloads(t *testing.T) {
 			otherDDs: []client.Object{
 				func() *velerov2alpha1.DataDownload {
 					// A newer CreationTimestamp but an older AcceptedTimestamp --
-					// if ranking still consulted AcceptedTimestamp (as it did
-					// before handlePrepared started advancing that field to
-					// exempt gate-wait time from Spec.OperationTimeout) this peer
+					// if ranking still consulted AcceptedTimestamp this peer
 					// would wrongly outrank self. It must not: CreationTimestamp
-					// alone decides rank now.
+					// alone decides rank.
 					dd := makeDD("dd-newer-creation-older-accepted", "uid-1", velerov2alpha1.DataDownloadPhaseInProgress, common.DataMoverKubeVirt, &newerTime)
 					dd.Status.AcceptedTimestamp = &olderTime
 					return dd
@@ -2712,9 +2710,8 @@ func TestHandlePreparedDataDownload_ConcurrencyLimit(t *testing.T) {
 	// f.dd (by CreationTimestamp) so they always outrank f.dd regardless of
 	// UID -- these tests are exercising the count/limit comparison itself,
 	// not ranking direction (that's TestCountHigherPriorityActiveDataDownloads's
-	// job). f.dd's own AcceptedTimestamp is separately seeded to exercise the
-	// gate's advance-on-defer behavior (see "requeues ... advances
-	// AcceptedTimestamp" below) -- ranking never reads it.
+	// job). f.dd's own AcceptedTimestamp is seeded so the at-limit case can
+	// assert the gate leaves it untouched -- ranking never reads it.
 	newFixtureWithOthers := func(t *testing.T, otherActiveCount int) (*ddTestFixture, []client.Object) {
 		t.Helper()
 		f := newDDTestFixture(t)
@@ -2772,6 +2769,10 @@ func TestHandlePreparedDataDownload_ConcurrencyLimit(t *testing.T) {
 			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
 			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 3,
 		}
+		var before velerov2alpha1.DataDownload
+		if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: f.dd.Name, Namespace: f.dd.Namespace}, &before); err != nil {
+			t.Fatalf("failed to get DataDownload: %v", err)
+		}
 
 		result, err := r.handlePrepared(context.Background(), logr.Discard(), f.dd)
 		if err != nil {
@@ -2795,13 +2796,14 @@ func TestHandlePreparedDataDownload_ConcurrencyLimit(t *testing.T) {
 			t.Error("expected no downloader pod to be created while gated")
 		}
 
-		// Deferring due to the concurrency limit is intentional throttling, not a
-		// stalled operation -- AcceptedTimestamp must advance by exactly the
-		// requeue interval so this wait doesn't consume Spec.OperationTimeout's
-		// budget (see the gate's defer branch in handlePrepared).
-		wantAdvanced := baseTime.Add(RequeueAfterLong)
-		if updated.Status.AcceptedTimestamp == nil || !updated.Status.AcceptedTimestamp.Time.Equal(wantAdvanced) {
-			t.Errorf("AcceptedTimestamp = %v, want %v (baseTime + RequeueAfterLong)", updated.Status.AcceptedTimestamp, wantAdvanced)
+		// The gate must not write dd: any write bumps resourceVersion, and the
+		// resulting Update event would re-enqueue dd immediately instead of
+		// after RequeueAfterLong (see checkConcurrentDataMoverLimit).
+		if updated.ResourceVersion != before.ResourceVersion {
+			t.Errorf("resourceVersion = %q, want unchanged %q (gate must not write the DataDownload)", updated.ResourceVersion, before.ResourceVersion)
+		}
+		if updated.Status.AcceptedTimestamp == nil || !updated.Status.AcceptedTimestamp.Time.Equal(baseTime.Time) {
+			t.Errorf("AcceptedTimestamp = %v, want unchanged %v", updated.Status.AcceptedTimestamp, baseTime)
 		}
 	})
 

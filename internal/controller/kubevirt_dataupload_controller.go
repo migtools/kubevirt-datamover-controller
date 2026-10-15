@@ -43,7 +43,6 @@ import (
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -1469,17 +1468,10 @@ func (r *KubeVirtDataUploadReconciler) getPodNamespace(du *velerov2alpha1.DataUp
 
 // SetupWithManager sets up the controller with the Manager
 func (r *KubeVirtDataUploadReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	maxConcurrent := r.MaxConcurrentReconciles
-	if maxConcurrent <= 0 {
-		maxConcurrent = DefaultMaxConcurrentReconciles
-	}
-
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&velerov2alpha1.DataUpload{}).
 		WithEventFilter(r.filterKubeVirtDataMover()).
-		WithOptions(controller.Options{
-			MaxConcurrentReconciles: maxConcurrent,
-		}).
+		WithOptions(dataMoverControllerOptions(r.MaxConcurrentReconciles)).
 		Named("kubevirt-dataupload").
 		Complete(r)
 }
@@ -2067,36 +2059,21 @@ func (r *KubeVirtDataUploadReconciler) checkConcurrentDataMoverLimit(ctx context
 
 	logger.Info("Deferring datamover pod creation, at concurrent data mover limit",
 		"higherPriorityCount", higherPriorityCount, "limit", r.MaxConcurrentDataMovers)
-	// Waiting for a concurrent-data-mover slot is intentional throttling, not a
-	// stalled operation -- advance AcceptedTimestamp by the same duration we're
-	// about to wait so this deferral doesn't consume the DataUpload's
-	// Spec.OperationTimeout budget (checked unconditionally on every reconcile
-	// in Reconcile, before dispatch reaches handlePrepared). A genuinely stuck
-	// higher-priority peer still ages out normally (its own AcceptedTimestamp
-	// is untouched by this), freeing this DU's slot once that peer times out
-	// or completes -- so this can't cause indefinite starvation, only push the
-	// deadline out for as long as this DU is legitimately waiting its turn.
-	if du.Status.AcceptedTimestamp != nil {
-		// Re-fetch immediately before writing: this path runs every
-		// RequeueAfterLong for as long as du stays gated -- potentially many
-		// times over a long queue wait -- far more often than any other write
-		// in this reconciler, so it's the one most likely to collide with a
-		// concurrent external update (e.g. an annotation patch) and hit a
-		// resource-version conflict. A Get failure here only costs this one
-		// cycle's timeout-budget exemption, not the gating decision itself, so
-		// it's logged and skipped rather than propagated as a reconcile error.
-		latest := du.DeepCopy()
-		if getErr := r.Get(ctx, client.ObjectKeyFromObject(du), latest); getErr != nil {
-			logger.Error(getErr, "Failed to re-fetch DataUpload before advancing AcceptedTimestamp, skipping this cycle's advance")
-		} else if latest.Status.AcceptedTimestamp != nil {
-			advanced := metav1.NewTime(latest.Status.AcceptedTimestamp.Add(RequeueAfterLong))
-			latest.Status.AcceptedTimestamp = &advanced
-			if err := r.Update(ctx, latest); err != nil {
-				return false, ctrl.Result{}, fmt.Errorf("failed to advance AcceptedTimestamp while gated: %w", err)
-			}
-			*du = *latest
-		}
-	}
+	// The gate must not write du. Any write bumps resourceVersion, and the
+	// For() watch passes every Update event through (its only predicate checks
+	// Spec.DataMover), so the write would re-enqueue du immediately and bypass
+	// RequeueAfterLong: a gated DU would re-reconcile several times per second
+	// for as long as it waits, and those self-triggered events can starve every
+	// other DataUpload of workers. A generation predicate wouldn't help either:
+	// without a status subresource, status writes bump generation too.
+	//
+	// Time spent gated therefore counts toward Spec.OperationTimeout. The plugin
+	// sets that from the backup's ItemOperationTimeout (capped at 24h), which
+	// Velero enforces from operation creation regardless of gating; once it
+	// expires Velero fails the operation, so exempting gated time here would
+	// only keep this DU running after its operation has already failed. A
+	// genuinely stuck higher-priority peer still ages out on its own deadline,
+	// freeing this DU's slot.
 	return true, ctrl.Result{RequeueAfter: RequeueAfterLong}, nil
 }
 
@@ -2119,14 +2096,11 @@ func (r *KubeVirtDataUploadReconciler) checkConcurrentDataMoverLimit(ctx context
 // MaxConcurrentDataMovers-ranked siblings ever see a higher-priority count
 // below the limit and proceed. As earlier-ranked ones complete (leaving the
 // active set), later-ranked siblings' count drops and they get their turn.
-// Ranking deliberately does NOT use Status.AcceptedTimestamp:
-// checkConcurrentDataMoverLimit's gate-defer path advances that field
-// forward to exempt legitimate queue-wait time from Spec.OperationTimeout,
-// and CreationTimestamp staying untouched by that is what keeps ranking a
-// fixed, fair order instead of one a deferred DU could perturb by
-// continuing to wait. New (pre-provisioning) is excluded from the count,
-// same as the phase set the full resource window (backup PVC, mover pod)
-// actually covers.
+// Ranking uses CreationTimestamp rather than Status.AcceptedTimestamp:
+// CreationTimestamp is immutable, so the order stays fixed for the life of
+// the sibling set and no DU can perturb it by continuing to wait. New
+// (pre-provisioning) is excluded from the count, same as the phase set the
+// full resource window (backup PVC, mover pod) actually covers.
 func (r *KubeVirtDataUploadReconciler) countHigherPriorityActiveDataUploads(ctx context.Context, du *velerov2alpha1.DataUpload) (int, error) {
 	duList := &velerov2alpha1.DataUploadList{}
 	if err := r.List(ctx, duList, client.InNamespace(du.Namespace)); err != nil {
