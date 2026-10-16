@@ -1773,8 +1773,10 @@ func (r *KubeVirtDataUploadReconciler) prepareVMBackupTracker(ctx context.Contex
 	// If we have an archived VMBT with LatestCheckpoint, set it on the new VMBT's status.
 	// K8s ignores Status during creation, so we must use Status().Update() separately.
 	if archivedVMBT != nil && archivedVMBT.Status != nil && archivedVMBT.Status.LatestCheckpoint != nil {
+		redefinitionRequired := true
 		vmbt.Status = &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerStatus{
-			LatestCheckpoint: archivedVMBT.Status.LatestCheckpoint.DeepCopy(),
+			LatestCheckpoint:               archivedVMBT.Status.LatestCheckpoint.DeepCopy(),
+			CheckpointRedefinitionRequired: &redefinitionRequired,
 		}
 		if err := r.Status().Update(ctx, vmbt); err != nil {
 			return nil, fmt.Errorf("failed to update VMBT status with LatestCheckpoint: %w", err)

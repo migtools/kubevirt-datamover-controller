@@ -8180,6 +8180,9 @@ func TestPrepareVMBackupTracker_FromS3(t *testing.T) {
 	if vmbt.Status.LatestCheckpoint.Name != "cp-002" {
 		t.Errorf("LatestCheckpoint.Name = %q, want %q", vmbt.Status.LatestCheckpoint.Name, "cp-002")
 	}
+	if vmbt.Status.CheckpointRedefinitionRequired == nil || !*vmbt.Status.CheckpointRedefinitionRequired {
+		t.Error("expected checkpoint redefinition to be required for an archived checkpoint")
+	}
 }
 
 func TestPrepareVMBackupTracker_ReusesExisting(t *testing.T) {
