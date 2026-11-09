@@ -141,7 +141,7 @@ The controller supports the following CLI flags:
 | `--stale-dataupload-threshold` | `2h` | Duration after which a stale DataUpload stops blocking younger ones for the same VM |
 | `--datamover-image` | `quay.io/konveyor/kubevirt-datamover-controller:latest` | Image used for datamover pods |
 | `--datamover-image-pull-policy` | `Always` | Image pull policy for datamover pods |
-| `--oadp-namespace` | `openshift-adp` | Namespace where OADP/Velero resources are located |
+| `--oadp-namespace` | `openshift-adp` | Namespace where OADP/Velero resources are located. The controller caches Pods only in this namespace. |
 
 #### Quiesce Behavior
 

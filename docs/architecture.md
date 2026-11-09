@@ -148,6 +148,10 @@ This is where most of the work happens:
    resource type independently, so the default value of `3` allows up to 3 DataUploads active
    at once and, separately, up to 3 DataDownloads active at once, not 3 total across both. A
    value of `0` disables this limit. This gates pod creation before any further work happens.
+   Slots go in a fixed order: by `CreationTimestamp`, with UID breaking exact ties. A CR
+   proceeds only while the number of earlier-ranked CRs in its namespace that are in
+   `Accepted`, `Prepared` or `InProgress` is below the limit. A CR over the limit is requeued
+   every 30s and is not written to while it waits.
 2. **Rebind the PV** holding the temp backup PVC from the VM's namespace into the OADP
    namespace (`rebindPVToNamespace` in `pv_rebind.go`). This is needed because the datamover
    pod has to access both the backed-up data and the BSL credentials/config at the same time,
@@ -303,7 +307,18 @@ stateDiagram-v2
   slow local cleanup step is never mistaken for failure. For a DataDownload, enforcement keeps
   running even after the downloader pod succeeds, and is only skipped once the restored PV has
   already been rebound onto the target PVC, since the rebind itself can still legitimately fail
-  or need retrying.
+  or need retrying. Time spent waiting at the `--max-concurrent-data-movers` gate counts toward
+  the timeout. Velero does the same: it enforces `itemOperationTimeout` from when the operation
+  was created, whether or not the CR is waiting.
+- **Plain FIFO work queue**: the DataUpload and DataDownload controllers opt out of
+  controller-runtime's priority queue (the default since v0.23). With the priority queue, CRs
+  re-listed after a controller restart are queued at low priority, and CRs that requeue
+  themselves can keep them from being processed indefinitely. With FIFO, items queued later
+  cannot overtake a queued CR, so it is processed once the items ahead of it are done.
+- **Scoped cache**: Pods are cached only in `--oadp-namespace`, where the datamover pods run.
+  Secrets are not cached; the BSL credential lookup reads them directly from the API server.
+  managedFields are stripped from cached objects. This keeps controller memory from growing
+  with the number of Pods and Secrets in the cluster.
 - **Idempotent phase handlers**: every phase handler re-checks for already-created resources
   (existing VMB, pod, rebound PVC) before creating new ones, so a reconcile retried after a
   partial failure or cache staleness doesn't duplicate work.
