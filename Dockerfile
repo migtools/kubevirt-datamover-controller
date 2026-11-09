@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Build the manager binary
 FROM golang:1.26 AS builder
 ARG TARGETOS
@@ -14,8 +15,11 @@ COPY go.sum go.sum
 # module fetch mid-transfer ("stream error: stream ID NNNN; INTERNAL_ERROR;
 # received from peer"), failing the whole image build over a transient proxy
 # hiccup unrelated to any code change. `go mod download` has no built-in
-# retry flag, so wrap it in a short shell retry loop.
-RUN retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "retrying ($i/5): $*" >&2; sleep 5; done; return 1; }; \
+# retry flag, so wrap it in a short shell retry loop. Combined with the cache
+# mount so retries reuse whatever modules already downloaded instead of
+# restarting from scratch.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "retrying ($i/5): $*" >&2; sleep 5; done; return 1; }; \
     retry go mod download
 
 # Copy the go source
@@ -28,7 +32,9 @@ COPY pkg/ pkg/
 # was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
 # the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o manager cmd/main.go
 
 # Use CentOS Stream 9 minimal as base image to include qemu-img for VM disk restore.
 # qemu-img is required by the datamover download path to reconstruct qcow2
