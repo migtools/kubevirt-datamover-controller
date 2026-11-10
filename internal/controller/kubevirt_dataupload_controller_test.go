@@ -9898,6 +9898,7 @@ func TestHandleInProgress_PodLogCollectionFailureDoesNotBlock(t *testing.T) {
 // vendored kubevirt.io/api (v1.8.0-alpha.0) cannot model.
 type vmbStatusReader struct {
 	includedVolumes []any
+	legacyType      string
 	err             error
 }
 
@@ -9909,7 +9910,13 @@ func (f *vmbStatusReader) Get(_ context.Context, _ client.ObjectKey, obj client.
 	if !ok {
 		return fmt.Errorf("unexpected object type %T", obj)
 	}
-	return unstructured.SetNestedSlice(u.Object, f.includedVolumes, "status", "includedVolumes")
+	if err := unstructured.SetNestedSlice(u.Object, f.includedVolumes, "status", "includedVolumes"); err != nil {
+		return err
+	}
+	if f.legacyType != "" {
+		return unstructured.SetNestedField(u.Object, f.legacyType, "status", "type")
+	}
+	return nil
 }
 
 func (f *vmbStatusReader) List(context.Context, client.ObjectList, ...client.ListOption) error {
@@ -9930,8 +9937,11 @@ func TestResolveVMBBackupType(t *testing.T) {
 		{"mixed volumes stay incremental to preserve the parent chain", &vmbStatusReader{includedVolumes: []any{vol("Full"), vol("Incremental")}}, uploader.BackupTypeIncremental, false},
 		{"all volumes full", &vmbStatusReader{includedVolumes: []any{vol("Full"), vol("Full")}}, uploader.BackupTypeFull, false},
 		{"single full volume", &vmbStatusReader{includedVolumes: []any{vol("Full")}}, uploader.BackupTypeFull, false},
-		{"no included volumes is an error", &vmbStatusReader{}, "", true},
-		{"volumes without a type is an error", &vmbStatusReader{includedVolumes: []any{map[string]any{"volumeName": "disk0"}}}, "", true},
+		{"no included volumes falls back to legacy status.type full", &vmbStatusReader{legacyType: "Full"}, uploader.BackupTypeFull, false},
+		{"no included volumes falls back to legacy status.type incremental", &vmbStatusReader{legacyType: "Incremental"}, uploader.BackupTypeIncremental, false},
+		{"untyped volumes fall back to legacy status.type", &vmbStatusReader{includedVolumes: []any{map[string]any{"volumeName": "disk0"}}, legacyType: "Incremental"}, uploader.BackupTypeIncremental, false},
+		{"neither per-volume nor legacy type is an error", &vmbStatusReader{}, "", true},
+		{"volumes without a type and no legacy type is an error", &vmbStatusReader{includedVolumes: []any{map[string]any{"volumeName": "disk0"}}}, "", true},
 		{"read failure is an error, not a guess", &vmbStatusReader{err: fmt.Errorf("boom")}, "", true},
 	}
 	for _, tt := range tests {

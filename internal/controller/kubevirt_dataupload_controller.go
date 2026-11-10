@@ -651,19 +651,24 @@ const conditionComplete kubevirtbackupv1alpha1.ConditionType = "Complete"
 // resolveVMBBackupType returns the backup type ("full" or "incremental") to
 // record for vmb.
 //
-// KubeVirt dropped the whole-backup VirtualMachineBackup.status.type field
-// (kubevirt/kubevirt f1a69f53c) in favour of status.includedVolumes[].type
-// (c32da47a4). The vendored kubevirt.io/api (v1.8.0-alpha.0) only models the
-// removed field, so the per-volume types are read from the live object as
-// unstructured.
+// KubeVirt swapped the whole-backup VirtualMachineBackup.status.type field for
+// per-volume status.includedVolumes[].type (kubevirt/kubevirt c32da47a4,
+// dropping status.type in f1a69f53c); that KubeVirt generation ships in HCO
+// 1.20.0+ nightly only. oadp-1.6 runs against BOTH generations -- 4.22
+// clusters pin HCO 1.19.0 (KubeVirt serves status.type only, never populates
+// includedVolumes) while 4.23+/5.0 track nightly -- so on oadp-1.6 this reads
+// the per-volume types when present and falls back to status.type otherwise.
+// The vendored kubevirt.io/api (v1.8.0-alpha.0) only models the legacy field,
+// so both are read from the live object as unstructured.
 //
 // The checkpoint index stores a single Type/Parent per checkpoint, shared by
 // all volumes, so per-volume types must be collapsed. The result is
 // "incremental" if ANY volume is incremental, and "full" only if every volume
 // is full.
 //
-// A failure to read the VMB, or a VMB that reports no per-volume type at all,
-// is returned as an error instead of guessing a type: defaulting to "full" for an incremental backup would make the uploader
+// A failure to read the VMB, or a VMB that reports neither a per-volume nor a
+// whole-backup type, is returned as an error instead of guessing a type:
+// defaulting to "full" for an incremental backup would make the uploader
 // drop the checkpoint's parent pointer (mismatchToFull) and leave the uploaded
 // image unrestorable.
 //
@@ -703,13 +708,23 @@ func (r *KubeVirtDataUploadReconciler) resolveVMBBackupType(
 			return uploader.BackupTypeIncremental, nil
 		}
 	}
-	if !typed {
-		// Neither a per-volume type nor anything else to go on (for example a
-		// KubeVirt that predates status.includedVolumes[].type): fail loudly
-		// instead of recording the backup as full.
-		return "", fmt.Errorf("VirtualMachineBackup %s/%s reports no per-volume backup type in status.includedVolumes[].type", vmb.Namespace, vmb.Name)
+	if typed {
+		return uploader.BackupTypeFull, nil
 	}
-	return uploader.BackupTypeFull, nil
+	// No per-volume type at all: a KubeVirt that predates
+	// status.includedVolumes[].type (HCO <= 1.19.0, e.g. the oadp-1.6 4.22
+	// fallback pin) -- fall back to the legacy whole-backup status.type.
+	legacy, found, err := unstructured.NestedString(live.Object, "status", "type")
+	if err != nil {
+		return "", fmt.Errorf("failed to read status.type from VirtualMachineBackup %s/%s: %w", vmb.Namespace, vmb.Name, err)
+	}
+	if found && legacy != "" {
+		if strings.EqualFold(legacy, uploader.BackupTypeIncremental) {
+			return uploader.BackupTypeIncremental, nil
+		}
+		return uploader.BackupTypeFull, nil
+	}
+	return "", fmt.Errorf("VirtualMachineBackup %s/%s reports neither a per-volume backup type in status.includedVolumes[].type nor a whole-backup status.type", vmb.Namespace, vmb.Name)
 }
 
 // evaluateVMBackupStatus checks conditions on a VirtualMachineBackup to determine
