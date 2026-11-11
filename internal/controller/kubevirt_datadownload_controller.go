@@ -133,6 +133,13 @@ type KubeVirtDataDownloadReconciler struct {
 	// PodLogCollector reads logs from a completed datamover pod.
 	// If nil, pod log collection is skipped. Override in tests to inject mocks.
 	PodLogCollector func(ctx context.Context, podName, podNamespace string) (string, error)
+
+	// activePhaseIndexAvailable is true when the active-phase field indexer
+	// was successfully registered during SetupWithManager. When false (e.g.
+	// because the Velero CRDs are not installed and API discovery failed),
+	// List calls fall back to unindexed listing with in-memory filtering so
+	// the controller can still start without crashing.
+	activePhaseIndexAvailable bool
 }
 
 // +kubebuilder:rbac:groups=velero.io,resources=datadownloads,verbs=get;list;watch;update;patch
@@ -2115,7 +2122,11 @@ func (r *KubeVirtDataDownloadReconciler) checkConcurrentDataMoverLimit(ctx conte
 // covers.
 func (r *KubeVirtDataDownloadReconciler) countHigherPriorityActiveDataDownloads(ctx context.Context, dd *velerov2alpha1.DataDownload) (int, error) {
 	ddList := &velerov2alpha1.DataDownloadList{}
-	if err := r.List(ctx, ddList, client.InNamespace(dd.Namespace)); err != nil {
+	listOpts := []client.ListOption{client.InNamespace(dd.Namespace)}
+	if r.activePhaseIndexAvailable {
+		listOpts = append(listOpts, client.MatchingFields{IndexFieldDataDownloadActivePhase: indexValueTrue})
+	}
+	if err := r.List(ctx, ddList, listOpts...); err != nil {
 		return 0, fmt.Errorf("failed to list DataDownloads: %w", err)
 	}
 
@@ -2125,14 +2136,9 @@ func (r *KubeVirtDataDownloadReconciler) countHigherPriorityActiveDataDownloads(
 		if other.UID == dd.UID {
 			continue
 		}
-		if other.Spec.DataMover != common.DataMoverKubeVirt {
-			continue
-		}
-		switch other.Status.Phase {
-		case velerov2alpha1.DataDownloadPhaseAccepted,
-			velerov2alpha1.DataDownloadPhasePrepared,
-			velerov2alpha1.DataDownloadPhaseInProgress:
-		default:
+		// When the index is unavailable, the list includes all DataDownloads;
+		// apply the same datamover + active-phase filter in memory.
+		if !r.activePhaseIndexAvailable && dataDownloadActivePhaseIndexFunc(other) == nil {
 			continue
 		}
 		if outranksDataDownload(other, dd) {
@@ -2196,8 +2202,54 @@ func (r *KubeVirtDataDownloadReconciler) findPodForDataDownload(ctx context.Cont
 	return findPodByUID(ctx, r.Client, r.APIReader, common.LabelDataDownloadUID, string(dd.UID), namespace)
 }
 
+// IndexFieldDataDownloadActivePhase is the field index key for DataDownloads in
+// an active phase (Accepted, Prepared, InProgress) with DataMover == kubevirt.
+// Used by countHigherPriorityActiveDataDownloads to pre-filter List results
+// instead of iterating all DataDownloads in the namespace.
+const IndexFieldDataDownloadActivePhase = "index.kubevirt.activePhase"
+
+// dataDownloadActivePhaseIndexFunc is the indexer callback for
+// IndexFieldDataDownloadActivePhase. Extracted as a named function for
+// the same reasons as dataUploadActivePhaseIndexFunc (see its doc comment).
+func dataDownloadActivePhaseIndexFunc(obj client.Object) []string {
+	dd, ok := obj.(*velerov2alpha1.DataDownload)
+	if !ok {
+		return nil
+	}
+	if dd.Spec.DataMover != common.DataMoverKubeVirt {
+		return nil
+	}
+	switch dd.Status.Phase {
+	case velerov2alpha1.DataDownloadPhaseAccepted,
+		velerov2alpha1.DataDownloadPhasePrepared,
+		velerov2alpha1.DataDownloadPhaseInProgress:
+		return []string{indexValueTrue}
+	default:
+		return nil
+	}
+}
+
+// RegisterDataDownloadActivePhaseIndex registers a field indexer on
+// DataDownload that returns "true" when Spec.DataMover == kubevirt AND
+// Status.Phase is one of Accepted, Prepared, or InProgress. Exported so
+// SetupWithManager and tests can both call it.
+func RegisterDataDownloadActivePhaseIndex(ctx context.Context, indexer client.FieldIndexer) error {
+	return indexer.IndexField(ctx, &velerov2alpha1.DataDownload{}, IndexFieldDataDownloadActivePhase, dataDownloadActivePhaseIndexFunc)
+}
+
 // SetupWithManager sets up the controller with the Manager
 func (r *KubeVirtDataDownloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	ctx := context.Background()
+
+	// Best-effort: see KubeVirtDataUploadReconciler.SetupWithManager's comment
+	// on why IndexField errors are non-fatal.
+	if err := RegisterDataDownloadActivePhaseIndex(ctx, mgr.GetFieldIndexer()); err != nil {
+		ctrl.Log.WithName("setup").Info("DataDownload active-phase index unavailable, falling back to unindexed listing",
+			"reason", err.Error())
+	} else {
+		r.activePhaseIndexAvailable = true
+	}
+
 	maxConcurrent := r.MaxConcurrentReconciles
 	if maxConcurrent <= 0 {
 		maxConcurrent = DefaultMaxConcurrentReconciles
