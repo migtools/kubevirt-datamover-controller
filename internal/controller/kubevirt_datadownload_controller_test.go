@@ -2688,8 +2688,10 @@ func TestCountHigherPriorityActiveDataDownloads(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			objs := append([]client.Object{self}, tt.otherDDs...)
-			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
-			r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).
+				WithIndex(&velerov2alpha1.DataDownload{}, IndexFieldDataDownloadActivePhase, dataDownloadActivePhaseIndexFunc).
+				Build()
+			r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), activePhaseIndexAvailable: true}
 
 			count, err := r.countHigherPriorityActiveDataDownloads(context.Background(), self)
 			if err != nil {
@@ -2747,10 +2749,13 @@ func TestHandlePreparedDataDownload_ConcurrencyLimit(t *testing.T) {
 	t.Run("proceeds when under the limit", func(t *testing.T) {
 		f, objs := newFixtureWithOthers(t, 2)
 		scheme := ddScheme()
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).
+			WithIndex(&velerov2alpha1.DataDownload{}, IndexFieldDataDownloadActivePhase, dataDownloadActivePhaseIndexFunc).
+			Build()
 		r := &KubeVirtDataDownloadReconciler{
 			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
 			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 3,
+			activePhaseIndexAvailable: true,
 		}
 
 		if _, err := r.handlePrepared(context.Background(), logr.Discard(), f.dd); err != nil {
@@ -2767,10 +2772,13 @@ func TestHandlePreparedDataDownload_ConcurrencyLimit(t *testing.T) {
 	t.Run("requeues without creating a pod when at the limit", func(t *testing.T) {
 		f, objs := newFixtureWithOthers(t, 3)
 		scheme := ddScheme()
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).
+			WithIndex(&velerov2alpha1.DataDownload{}, IndexFieldDataDownloadActivePhase, dataDownloadActivePhaseIndexFunc).
+			Build()
 		r := &KubeVirtDataDownloadReconciler{
 			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
 			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 3,
+			activePhaseIndexAvailable: true,
 		}
 
 		result, err := r.handlePrepared(context.Background(), logr.Discard(), f.dd)
@@ -2808,10 +2816,13 @@ func TestHandlePreparedDataDownload_ConcurrencyLimit(t *testing.T) {
 	t.Run("unlimited (MaxConcurrentDataMovers=0) always proceeds", func(t *testing.T) {
 		f, objs := newFixtureWithOthers(t, 50)
 		scheme := ddScheme()
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).
+			WithIndex(&velerov2alpha1.DataDownload{}, IndexFieldDataDownloadActivePhase, dataDownloadActivePhaseIndexFunc).
+			Build()
 		r := &KubeVirtDataDownloadReconciler{
 			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
 			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 0,
+			activePhaseIndexAvailable: true,
 		}
 
 		if _, err := r.handlePrepared(context.Background(), logr.Discard(), f.dd); err != nil {
@@ -2906,10 +2917,13 @@ func TestHandlePreparedDataDownload_MultiDiskDeadlockRegression(t *testing.T) {
 		objs = append(objs, dd, scratchPVC)
 	}
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).
+		WithIndex(&velerov2alpha1.DataDownload{}, IndexFieldDataDownloadActivePhase, dataDownloadActivePhaseIndexFunc).
+		Build()
 	r := &KubeVirtDataDownloadReconciler{
 		Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: oadpNS,
 		DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: limit,
+		activePhaseIndexAvailable: true,
 	}
 
 	// Reconcile every sibling exactly once, in reverse order -- if the gate's
