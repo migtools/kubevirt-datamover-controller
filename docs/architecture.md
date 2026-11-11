@@ -137,7 +137,7 @@ This is where most of the work happens:
 7. **Wait for VMB completion** (`evaluateVMBackupStatus`): poll the VMB's `status.conditions`
    (`Progressing`, `Done`, `Initializing`). `Done=True` without a failure reason means the
    backup succeeded and the qcow2 file(s) are now in the temp PVC. The controller reads
-   `status.type` (`full`/`incremental`) and `status.checkpointName` from the completed VMB and
+   the backup type (`full`/`incremental`, derived from `status.includedVolumes[].type`) and `status.checkpointName` from the completed VMB and
    moves to `Prepared`. Any failure condition moves to `Failed` with the extracted reason. A
    VMB stuck in `Initializing` with a since-deleted VMBT is detected and failed immediately
    rather than polled forever.

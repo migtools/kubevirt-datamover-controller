@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
@@ -4192,6 +4193,7 @@ func TestHandlePrepared(t *testing.T) {
 
 			r := &KubeVirtDataUploadReconciler{
 				Client:         fakeClient,
+				APIReader:      withVMBIncludedVolumeTypes(fakeClient, "Full"),
 				Scheme:         scheme,
 				Log:            logr.Discard(),
 				OADPNamespace:  "openshift-adp",
@@ -4478,6 +4480,7 @@ func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
 		fakeClient := builder.Build()
 		r := &KubeVirtDataUploadReconciler{
 			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+			APIReader:      withVMBIncludedVolumeTypes(fakeClient, "Full"),
 			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 3,
 		}
 
@@ -4501,6 +4504,7 @@ func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
 		fakeClient := builder.Build()
 		r := &KubeVirtDataUploadReconciler{
 			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+			APIReader:      withVMBIncludedVolumeTypes(fakeClient, "Full"),
 			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 3,
 		}
 
@@ -4545,6 +4549,7 @@ func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
 		fakeClient := builder.Build()
 		r := &KubeVirtDataUploadReconciler{
 			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+			APIReader:      withVMBIncludedVolumeTypes(fakeClient, "Full"),
 			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 0,
 		}
 
@@ -4674,6 +4679,7 @@ func TestHandlePreparedDataUpload_ConcurrentDeadlockRegression(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 	r := &KubeVirtDataUploadReconciler{
 		Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: oadpNS,
+		APIReader:      withVMBIncludedVolumeTypes(fakeClient, "Full"),
 		DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: limit,
 	}
 
@@ -9932,4 +9938,82 @@ func TestHandleInProgress_PodLogCollectionFailureDoesNotBlock(t *testing.T) {
 			}
 		})
 	}
+}
+
+// vmbStatusReader serves status.includedVolumes as unstructured, which the
+// vendored kubevirt.io/api (v1.8.0-alpha.0) cannot model.
+type vmbStatusReader struct {
+	includedVolumes []any
+	err             error
+}
+
+func (f *vmbStatusReader) Get(_ context.Context, _ client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+	if f.err != nil {
+		return f.err
+	}
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return fmt.Errorf("unexpected object type %T", obj)
+	}
+	return unstructured.SetNestedSlice(u.Object, f.includedVolumes, "status", "includedVolumes")
+}
+
+func (f *vmbStatusReader) List(context.Context, client.ObjectList, ...client.ListOption) error {
+	return fmt.Errorf("not implemented")
+}
+
+func TestResolveVMBBackupType(t *testing.T) {
+	vol := func(typ string) any {
+		return map[string]any{"volumeName": "disk0", "type": typ}
+	}
+	tests := []struct {
+		name    string
+		reader  *vmbStatusReader
+		want    string
+		wantErr bool
+	}{
+		{"all volumes incremental", &vmbStatusReader{includedVolumes: []any{vol("Incremental"), vol("Incremental")}}, uploader.BackupTypeIncremental, false},
+		{"mixed volumes stay incremental to preserve the parent chain", &vmbStatusReader{includedVolumes: []any{vol("Full"), vol("Incremental")}}, uploader.BackupTypeIncremental, false},
+		{"all volumes full", &vmbStatusReader{includedVolumes: []any{vol("Full"), vol("Full")}}, uploader.BackupTypeFull, false},
+		{"single full volume", &vmbStatusReader{includedVolumes: []any{vol("Full")}}, uploader.BackupTypeFull, false},
+		{"no included volumes is an error", &vmbStatusReader{}, "", true},
+		{"volumes without a type is an error", &vmbStatusReader{includedVolumes: []any{map[string]any{"volumeName": "disk0"}}}, "", true},
+		{"read failure is an error, not a guess", &vmbStatusReader{err: fmt.Errorf("boom")}, "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &KubeVirtDataUploadReconciler{APIReader: tt.reader}
+			vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{ObjectMeta: metav1.ObjectMeta{Name: "vmb", Namespace: "ns"}}
+			got, err := r.resolveVMBBackupType(context.Background(), vmb)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("resolveVMBBackupType() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Fatalf("resolveVMBBackupType() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// vmbIncludedVolumesReader serves status.includedVolumes[].type for the
+// unstructured VirtualMachineBackup read in resolveVMBBackupType, and
+// delegates every other read to the wrapped reader.
+type vmbIncludedVolumesReader struct {
+	client.Reader
+	volumeTypes []string
+}
+
+func withVMBIncludedVolumeTypes(r client.Reader, volumeTypes ...string) client.Reader {
+	return &vmbIncludedVolumesReader{Reader: r, volumeTypes: volumeTypes}
+}
+
+func (v *vmbIncludedVolumesReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if u, ok := obj.(*unstructured.Unstructured); ok {
+		volumes := make([]any, 0, len(v.volumeTypes))
+		for i, typ := range v.volumeTypes {
+			volumes = append(volumes, map[string]any{"volumeName": fmt.Sprintf("volume%d", i), "type": typ})
+		}
+		return unstructured.SetNestedSlice(u.Object, volumes, "status", "includedVolumes")
+	}
+	return v.Reader.Get(ctx, key, obj, opts...)
 }
