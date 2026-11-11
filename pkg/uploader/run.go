@@ -22,6 +22,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +43,9 @@ import (
 )
 
 const apiGroupKubeVirt = "kubevirt.io"
+
+const EnvPodName = "POD_NAME"
+const EnvPodNamespace = "POD_NAMESPACE"
 
 // Run is the main entrypoint for the uploader.
 func Run(ctx context.Context, logger logr.Logger) error {
@@ -66,8 +70,14 @@ func Run(ctx context.Context, logger logr.Logger) error {
 
 	logger.Info("Object store initialized", "bucket", config.BSLBucket, "prefix", config.BSLPrefix)
 
+	// Create K8s client early for progress reporting
+	k8sClient, err := newKubeClient()
+	if err != nil {
+		return fmt.Errorf("failed to create K8s client: %w", err)
+	}
+
 	// Upload qcow2 files
-	files, err := uploadQcow2Files(ctx, store, config, logger)
+	files, err := uploadQcow2Files(ctx, store, config, k8sClient, logger)
 	if err != nil {
 		return fmt.Errorf("failed to upload qcow2 files: %w", err)
 	}
@@ -77,12 +87,6 @@ func Run(ctx context.Context, logger logr.Logger) error {
 	}
 
 	logger.Info("Uploaded qcow2 files", "count", len(files))
-
-	// Create K8s client once — reused for archiving and cleanup
-	k8sClient, err := newKubeClient()
-	if err != nil {
-		return fmt.Errorf("failed to create K8s client: %w", err)
-	}
 
 	// Archive VMB/VMBT CRs to S3 (FATAL if fails — index references must be valid)
 	archived, err := archiveKubeResources(ctx, store, k8sClient, config, logger)
@@ -105,9 +109,6 @@ func Run(ctx context.Context, logger logr.Logger) error {
 
 	logger.Info("Backup manifests updated")
 
-	// Delete VMB/VMBT from cluster (non-fatal — S3 is now source of truth)
-	cleanupKubeResources(ctx, k8sClient, config, logger)
-
 	logger.Info("Upload completed successfully")
 
 	return nil
@@ -115,7 +116,11 @@ func Run(ctx context.Context, logger logr.Logger) error {
 
 // LoadConfigFromEnv parses environment variables into UploaderConfig.
 func LoadConfigFromEnv() (*UploaderConfig, error) {
+	totalBytes, _ := strconv.ParseInt(os.Getenv(EnvTotalBytes), 10, 64)
+
 	config := &UploaderConfig{
+		PodName:      os.Getenv(EnvPodName),
+		PodNamespace: os.Getenv(EnvPodNamespace),
 		ObjectStoreConfig: common.ObjectStoreConfig{
 			BSLProvider:                    os.Getenv(common.EnvBSLProvider),
 			BSLBucket:                      os.Getenv(common.EnvBSLBucket),
@@ -151,6 +156,7 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 		DataUploadUID:      os.Getenv(EnvDataUploadUID),
 		VMBName:            os.Getenv(EnvVMBName),
 		VMBTName:           os.Getenv(EnvVMBTName),
+		TotalBytes:         totalBytes,
 		SourcePVCPath:      os.Getenv(EnvSourcePVCPath),
 	}
 
@@ -196,9 +202,37 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 
 // uploadQcow2Files walks the source path and uploads all qcow2 files.
 func uploadQcow2Files(
-	_ context.Context, store velero.ObjectStore, config *UploaderConfig, logger logr.Logger,
+	ctx context.Context, store velero.ObjectStore, config *UploaderConfig, k8sClient client.Client, logger logr.Logger,
 ) ([]CheckpointFile, error) {
 	var files []CheckpointFile
+	var incrementalBytes int64
+	var bytesDone int64
+
+	// First pass: calculate total payload size (IncrementalBytes)
+	_ = filepath.WalkDir(config.SourcePVCPath, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".qcow2") {
+			if info, err := d.Info(); err == nil {
+				incrementalBytes += info.Size()
+			}
+		}
+		return nil
+	})
+
+	if strings.ToLower(config.BackupType) == BackupTypeFull {
+		config.TotalBytes = incrementalBytes
+	} else if config.TotalBytes == 0 {
+		config.TotalBytes = incrementalBytes // Fallback if env var was missing
+	}
+
+	reportProgress := func(currentDone int64) {
+		if config.PodName != "" && config.PodNamespace != "" {
+			common.PatchPodProgress(ctx, k8sClient, config.PodName, config.PodNamespace,
+				config.TotalBytes, incrementalBytes, currentDone, logger)
+		}
+	}
+
+	// Initial report
+	reportProgress(0)
 
 	err := filepath.WalkDir(config.SourcePVCPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -233,8 +267,16 @@ func uploadQcow2Files(
 
 		logger.Info("Uploading file", "filename", d.Name(), "size", info.Size(), "objectPath", objectPath)
 
+		progressReader := &common.ProgressReader{
+			Reader:     file,
+			UpdateFreq: 5 * time.Second,
+			Reporter: func(read int64) {
+				reportProgress(bytesDone + read)
+			},
+		}
+
 		// Upload file using velero.ObjectStore interface
-		uploadErr := store.PutObject(config.BSLBucket, objectPath, file)
+		uploadErr := store.PutObject(config.BSLBucket, objectPath, progressReader)
 		// Close file immediately after upload to avoid resource exhaustion with many files
 		_ = file.Close()
 		if uploadErr != nil {
@@ -249,6 +291,8 @@ func uploadQcow2Files(
 			Size:       info.Size(),
 			ObjectPath: objectPath,
 		})
+
+		bytesDone += info.Size()
 
 		return nil
 	})
@@ -362,7 +406,8 @@ func updateVMIndex(
 			if pvc.Spec.VolumeName != "" {
 				pv := &corev1.PersistentVolume{}
 				if err := k8sClient.Get(ctx, types.NamespacedName{Name: pvc.Spec.VolumeName}, pv); err != nil {
-					return fmt.Errorf("failed to get bound PV %s for PVC %s: %w", pvc.Spec.VolumeName, pvcName, err)
+					return fmt.Errorf("failed to get bound PV %s for PVC %s: %w",
+						pvc.Spec.VolumeName, pvcName, err)
 				}
 				capacity, ok := pv.Spec.Capacity[corev1.ResourceStorage]
 				if !ok {
@@ -660,29 +705,6 @@ func reconstructVMBT(cfg *UploaderConfig) *kubevirtbackupv1alpha1.VirtualMachine
 				Name:     cfg.VMName,
 			},
 		},
-	}
-}
-
-// cleanupKubeResources deletes VMB CRs from the cluster after they have been
-// archived to S3. The VMBT is intentionally preserved so KubeVirt can use it
-// during VM lifecycle events (restarts, migrations) to redefine libvirt checkpoints.
-// This is non-fatal — if deletion fails, we log a warning but don't fail the upload.
-// See https://github.com/migtools/kubevirt-datamover-controller/issues/32.
-func cleanupKubeResources(ctx context.Context, k8sClient client.Client, cfg *UploaderConfig, logger logr.Logger) {
-	// Delete VMB by constructing a minimal object with just name/namespace.
-	// No need to Get first — Delete with NotFound is a no-op.
-	if cfg.VMBName != "" {
-		vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
-		vmb.Name = cfg.VMBName
-		vmb.Namespace = cfg.VMNamespace
-		if err := k8sClient.Delete(ctx, vmb); err != nil {
-			if !apierrors.IsNotFound(err) {
-				logger.Info("Failed to delete VMB from cluster",
-					"vmb", cfg.VMNamespace+"/"+cfg.VMBName, "reason", err.Error())
-			}
-		} else {
-			logger.Info("Deleted VMB from cluster", "vmb", cfg.VMNamespace+"/"+cfg.VMBName)
-		}
 	}
 }
 

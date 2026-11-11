@@ -148,6 +148,9 @@ type DatamoverPodConfig struct {
 	// Source PVC (upload mode only): the app PVC being backed up, mounted read-only.
 	SourcePVCName string
 
+	// TotalBytes (upload mode only): the total capacity of the source PVCs.
+	TotalBytes int64
+
 	// ScratchPVCName (download mode only): read-write Filesystem-mode PVC that
 	// stages the downloaded qcow2 chain. For a Filesystem-mode target volume,
 	// this also holds the final flattened raw disk image and is the volume
@@ -354,6 +357,18 @@ func buildDownloadPodResources(config *DatamoverPodConfig) ([]corev1.EnvVar, []c
 		corev1.EnvVar{Name: downloader.EnvScratchPath, Value: downloader.DefaultScratchPath},
 		corev1.EnvVar{Name: downloader.EnvTargetPath, Value: targetPath},
 		corev1.EnvVar{Name: downloader.EnvTargetIsBlockDevice, Value: strconv.FormatBool(targetIsBlockDevice)},
+		corev1.EnvVar{
+			Name: downloader.EnvPodName,
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+		},
+		corev1.EnvVar{
+			Name: downloader.EnvPodNamespace,
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+			},
+		},
 	)
 
 	volumes := []corev1.Volume{
@@ -482,6 +497,19 @@ func buildUploadPodResources(config *DatamoverPodConfig) ([]corev1.EnvVar, []cor
 		corev1.EnvVar{Name: uploader.EnvDataUploadUID, Value: config.ResourceUID},
 		corev1.EnvVar{Name: uploader.EnvVMBName, Value: config.VMBName},
 		corev1.EnvVar{Name: uploader.EnvVMBTName, Value: config.VMBTName},
+		corev1.EnvVar{Name: uploader.EnvTotalBytes, Value: strconv.FormatInt(config.TotalBytes, 10)},
+		corev1.EnvVar{
+			Name: uploader.EnvPodName,
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+		},
+		corev1.EnvVar{
+			Name: uploader.EnvPodNamespace,
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+			},
+		},
 	)
 
 	volumes := []corev1.Volume{
