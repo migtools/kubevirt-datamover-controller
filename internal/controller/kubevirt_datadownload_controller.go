@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
@@ -41,11 +42,15 @@ import (
 	"k8s.io/client-go/tools/record"
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // DefaultScratchPVCSize is the fallback size for the scratch PVC when neither
@@ -53,6 +58,17 @@ import (
 // (older/partial index). This is a much weaker guess than the sized path, so
 // calculateScratchPVCSize logs loudly when it falls back to this value.
 const DefaultScratchPVCSize = "10Gi"
+
+// IndexFieldDataDownloadPreparedPhase is the field index key used to narrow
+// List calls in enqueueWaitingOnSlotOpen to kubevirt DataDownloads in the
+// Prepared phase, avoiding an unfiltered namespace-wide list followed by
+// in-memory filtering.
+const IndexFieldDataDownloadPreparedPhase = "index.kubevirt.datadownload.preparedPhase"
+
+// indexValueTrue is the sentinel value stored and queried in the
+// Prepared-phase field index. Declared once so the indexer callback and
+// MatchingFields filter stay in sync.
+const indexValueTrue = "true"
 
 // AnnotationTargetDiskName is the annotation key used to persist the resolved
 // KubeVirt disk/volume name (translated from dd.Spec.TargetVolume.PVC via
@@ -1915,6 +1931,24 @@ func isTerminalDataDownloadPhase(phase velerov2alpha1.DataDownloadPhase) bool {
 	}
 }
 
+// isActiveDataDownloadPhase reports whether phase is one of the phases that
+// countHigherPriorityActiveDataDownloads counts as occupying a concurrency
+// slot: empty string, New, Accepted, Prepared, InProgress. This is the
+// complement of terminal + Canceling: a DataDownload in Canceling no longer
+// counts as active (the slot is freed), but it's not terminal either until
+// pod cleanup finishes and transitions it to Canceled.
+func isActiveDataDownloadPhase(phase velerov2alpha1.DataDownloadPhase) bool {
+	switch phase {
+	case "", velerov2alpha1.DataDownloadPhaseNew,
+		velerov2alpha1.DataDownloadPhaseAccepted,
+		velerov2alpha1.DataDownloadPhasePrepared,
+		velerov2alpha1.DataDownloadPhaseInProgress:
+		return true
+	default:
+		return false
+	}
+}
+
 // restoreVMRunStateIfAllSiblingsCompleted flips a restored VM back to its
 // pre-restore run state once every DataDownload targeting it has reached
 // Completed. This is the controller-side half of the VM-restore race fix: the
@@ -2032,11 +2066,16 @@ func (r *KubeVirtDataDownloadReconciler) allSiblingDataDownloadsCompleted(ctx co
 // MaxConcurrentDataMovers, called from handlePrepared right after the
 // existing-pod idempotency check -- before any of the VM-ref/BSL/scratch-PVC
 // lookups that only exist to build the pod, since none of that work is
-// needed while gated. Returns gated=true (with a RequeueAfterLong result)
+// needed while gated. Returns gated=true (with a RequeueAfterGated result)
 // when dd must wait its turn; gated=false when it's clear to proceed
 // (including when the limit is disabled, MaxConcurrentDataMovers <= 0).
 // Extracted out of handlePrepared to keep that function's cyclomatic
 // complexity down (gocyclo).
+//
+// The primary wake-up path is event-driven: a secondary Watch on DataDownload
+// fires enqueueWaitingOnSlotOpen when a peer reaches a terminal phase,
+// immediately re-enqueuing gated DDs. RequeueAfterGated (2m) acts only as a
+// safety-net poll in case a Watch event is missed.
 func (r *KubeVirtDataDownloadReconciler) checkConcurrentDataMoverLimit(ctx context.Context, logger logr.Logger, dd *velerov2alpha1.DataDownload) (gated bool, result ctrl.Result, err error) {
 	if r.MaxConcurrentDataMovers <= 0 {
 		return false, ctrl.Result{}, nil
@@ -2047,23 +2086,36 @@ func (r *KubeVirtDataDownloadReconciler) checkConcurrentDataMoverLimit(ctx conte
 		return false, ctrl.Result{}, err
 	}
 	if higherPriorityCount < r.MaxConcurrentDataMovers {
+		// Gate opening: clear the gated-since annotation if this DD was
+		// previously gated. The annotation is only present if a prior reconcile
+		// entered the gated path below, so the delete is a no-op for DDs that
+		// were never gated.
+		if _, hasGatedSince := dd.Annotations[AnnotationGatedSince]; hasGatedSince {
+			delete(dd.Annotations, AnnotationGatedSince)
+			if err := r.Update(ctx, dd); err != nil {
+				return false, ctrl.Result{}, fmt.Errorf("failed to clear gated-since annotation: %w", err)
+			}
+			logger.Info("Gate opened, cleared gated-since annotation")
+		}
 		return false, ctrl.Result{}, nil
 	}
 
 	logger.Info("Deferring downloader pod creation, at concurrent data mover limit",
 		"higherPriorityCount", higherPriorityCount, "limit", r.MaxConcurrentDataMovers)
 	// Waiting for a concurrent-data-mover slot is intentional throttling, not a
-	// stalled operation -- advance AcceptedTimestamp by the same duration we're
-	// about to wait so this deferral doesn't consume the DataDownload's
+	// stalled operation -- advance AcceptedTimestamp by exactly the wall-clock
+	// time this DD spent gated so this deferral doesn't consume the DataDownload's
 	// Spec.OperationTimeout budget (checked unconditionally on every reconcile
-	// in Reconcile, before dispatch reaches handlePrepared). A genuinely stuck
-	// higher-priority peer still ages out normally (its own AcceptedTimestamp
-	// is untouched by this), freeing this DD's slot once that peer times out
-	// or completes -- so this can't cause indefinite starvation, only push the
-	// deadline out for as long as this DD is legitimately waiting its turn.
+	// in Reconcile, before dispatch reaches handlePrepared). Pre-gate time
+	// (Accepted→Prepared) is preserved by crediting only gated time, not
+	// resetting AcceptedTimestamp to now. A genuinely stuck higher-priority
+	// peer still ages out normally (its own AcceptedTimestamp is untouched by
+	// this), freeing this DD's slot once that peer times out or completes --
+	// so this can't cause indefinite starvation, only push the deadline out
+	// for as long as this DD is legitimately waiting its turn.
 	if dd.Status.AcceptedTimestamp != nil {
 		// Re-fetch immediately before writing: this path runs every
-		// RequeueAfterLong for as long as dd stays gated -- potentially many
+		// RequeueAfterGated for as long as dd stays gated -- potentially many
 		// times over a long queue wait -- far more often than any other write
 		// in this reconciler, so it's the one most likely to collide with a
 		// concurrent external update (e.g. an annotation patch) and hit a
@@ -2074,15 +2126,39 @@ func (r *KubeVirtDataDownloadReconciler) checkConcurrentDataMoverLimit(ctx conte
 		if getErr := r.Get(ctx, client.ObjectKeyFromObject(dd), latest); getErr != nil {
 			logger.Error(getErr, "Failed to re-fetch DataDownload before advancing AcceptedTimestamp, skipping this cycle's advance")
 		} else if latest.Status.AcceptedTimestamp != nil {
-			advanced := metav1.NewTime(latest.Status.AcceptedTimestamp.Add(RequeueAfterLong))
-			latest.Status.AcceptedTimestamp = &advanced
+			now := time.Now()
+			if latest.Annotations == nil {
+				latest.Annotations = make(map[string]string)
+			}
+			gatedSinceStr, hasGatedSince := latest.Annotations[AnnotationGatedSince]
+			if !hasGatedSince {
+				// First gated pass: record when gating started. AcceptedTimestamp
+				// is NOT advanced yet -- the first interval's elapsed time will
+				// be credited on the next gated reconcile.
+				latest.Annotations[AnnotationGatedSince] = now.UTC().Format(time.RFC3339)
+				logger.Info("First gated pass, recording gated-since timestamp")
+			} else {
+				// Subsequent gated pass: credit only the elapsed gated time.
+				gatedSince, parseErr := time.Parse(time.RFC3339, gatedSinceStr)
+				if parseErr != nil {
+					logger.Error(parseErr, "Failed to parse gated-since annotation, resetting")
+					latest.Annotations[AnnotationGatedSince] = now.UTC().Format(time.RFC3339)
+				} else {
+					elapsed := now.Sub(gatedSince)
+					advanced := metav1.NewTime(latest.Status.AcceptedTimestamp.Add(elapsed))
+					latest.Status.AcceptedTimestamp = &advanced
+					latest.Annotations[AnnotationGatedSince] = now.UTC().Format(time.RFC3339)
+					logger.Info("Advancing AcceptedTimestamp by gated elapsed time",
+						"elapsed", elapsed.Round(time.Millisecond))
+				}
+			}
 			if err := r.Update(ctx, latest); err != nil {
 				return false, ctrl.Result{}, fmt.Errorf("failed to advance AcceptedTimestamp while gated: %w", err)
 			}
 			*dd = *latest
 		}
 	}
-	return true, ctrl.Result{RequeueAfter: RequeueAfterLong}, nil
+	return true, ctrl.Result{RequeueAfter: RequeueAfterGated}, nil
 }
 
 // countHigherPriorityActiveDataDownloads counts kubevirt-datamover
@@ -2196,6 +2272,26 @@ func (r *KubeVirtDataDownloadReconciler) findPodForDataDownload(ctx context.Cont
 	return findPodByUID(ctx, r.Client, r.APIReader, common.LabelDataDownloadUID, string(dd.UID), namespace)
 }
 
+// registerDataDownloadPreparedPhaseIndex adds a field index for kubevirt
+// DataDownloads in the Prepared phase, so enqueueWaitingOnSlotOpen can use
+// client.MatchingFields instead of listing ALL DataDownloads and filtering
+// in-memory. Returns nil on success; callers may treat the error as non-fatal
+// (the controller still works via the safety-net poll) or propagate it.
+func registerDataDownloadPreparedPhaseIndex(ctx context.Context, mgr ctrl.Manager) error {
+	return mgr.GetFieldIndexer().IndexField(ctx, &velerov2alpha1.DataDownload{}, IndexFieldDataDownloadPreparedPhase,
+		func(obj client.Object) []string {
+			dd, ok := obj.(*velerov2alpha1.DataDownload)
+			if !ok {
+				return nil
+			}
+			if dd.Spec.DataMover == common.DataMoverKubeVirt && dd.Status.Phase == velerov2alpha1.DataDownloadPhasePrepared {
+				return []string{indexValueTrue}
+			}
+			return nil
+		},
+	)
+}
+
 // SetupWithManager sets up the controller with the Manager
 func (r *KubeVirtDataDownloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	maxConcurrent := r.MaxConcurrentReconciles
@@ -2203,8 +2299,19 @@ func (r *KubeVirtDataDownloadReconciler) SetupWithManager(mgr ctrl.Manager) erro
 		maxConcurrent = DefaultMaxConcurrentReconciles
 	}
 
+	// Best-effort: if the index registration fails the controller still works
+	// via the safety-net poll; enqueueWaitingOnSlotOpen falls back to an
+	// unindexed List when the index is absent.
+	if err := registerDataDownloadPreparedPhaseIndex(context.Background(), mgr); err != nil {
+		log.Log.Error(err, "Failed to register Prepared-phase field index for DataDownload, falling back to unindexed list")
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&velerov2alpha1.DataDownload{}).
+		Watches(&velerov2alpha1.DataDownload{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueWaitingOnSlotOpen),
+			builder.WithPredicates(r.slotFreedPredicate()),
+		).
 		WithEventFilter(r.filterKubeVirtDataMoverDownload()).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: maxConcurrent,
@@ -2223,4 +2330,102 @@ func (r *KubeVirtDataDownloadReconciler) filterKubeVirtDataMoverDownload() predi
 		}
 		return dd.Spec.DataMover == common.DataMoverKubeVirt
 	})
+}
+
+// enqueueWaitingOnSlotOpen is the handler.MapFunc for the secondary Watch.
+// When a kubevirt DataDownload frees a concurrency slot (terminal phase
+// transition, InProgress→Canceling, or deletion while in an active phase),
+// this handler lists all Prepared kubevirt DDs in the same namespace and
+// returns reconcile.Requests for each so they promptly re-evaluate the
+// concurrency gate instead of waiting for the safety-net poll.
+func (r *KubeVirtDataDownloadReconciler) enqueueWaitingOnSlotOpen(ctx context.Context, obj client.Object) []reconcile.Request {
+	dd, ok := obj.(*velerov2alpha1.DataDownload)
+	if !ok {
+		return nil
+	}
+
+	// Only react to kubevirt datamover DDs
+	if dd.Spec.DataMover != common.DataMoverKubeVirt {
+		return nil
+	}
+
+	// Skip if this is a live object (not being deleted) with an active phase —
+	// it still occupies a slot and hasn't freed one. For Update events,
+	// EnqueueRequestsFromMapFunc passes ObjectNew (whose phase is non-active,
+	// per the predicate), so this check passes. For Delete events, the object's
+	// phase is still active (the phase at deletion time), but DeletionTimestamp
+	// is set, so it's correctly recognized as a slot-freeing deletion.
+	if isActiveDataDownloadPhase(dd.Status.Phase) && dd.DeletionTimestamp == nil {
+		return nil
+	}
+
+	// Only when the concurrency limit is enabled
+	if r.MaxConcurrentDataMovers <= 0 {
+		return nil
+	}
+
+	// Use the Prepared-phase field index to narrow the List to only kubevirt
+	// DataDownloads in Prepared phase, avoiding an unfiltered namespace-wide
+	// list. Fall back to the unindexed path if the index was not registered.
+	ddList := &velerov2alpha1.DataDownloadList{}
+	err := r.List(ctx, ddList,
+		client.InNamespace(dd.Namespace),
+		client.MatchingFields{IndexFieldDataDownloadPreparedPhase: indexValueTrue},
+	)
+	if err != nil {
+		// Best-effort: the safety-net poll will catch any missed DDs
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for i := range ddList.Items {
+		other := &ddList.Items[i]
+		if other.UID == dd.UID {
+			continue
+		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      other.Name,
+				Namespace: other.Namespace,
+			},
+		})
+	}
+	return requests
+}
+
+// slotFreedPredicate returns a predicate that fires when a DataDownload frees a
+// concurrency slot. This covers three cases:
+//
+//  1. Update: old phase was active ("", New, Accepted, Prepared, InProgress)
+//     AND new phase is NOT active. This catches terminal transitions
+//     (InProgress→Completed/Failed) AND InProgress→Canceling (the slot frees
+//     at Canceling because countHigherPriorityActiveDataDownloads doesn't count
+//     Canceling as active).
+//  2. Delete: the deleted object's phase was active. This catches DD
+//     deletion during any active phase (restore deletion, manual cleanup).
+//  3. Create: always false — a new DD doesn't free a slot.
+func (r *KubeVirtDataDownloadReconciler) slotFreedPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc:  func(e event.CreateEvent) bool { return false },
+		GenericFunc: func(e event.GenericEvent) bool { return false },
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			dd, ok := e.Object.(*velerov2alpha1.DataDownload)
+			if !ok {
+				return false
+			}
+			return isActiveDataDownloadPhase(dd.Status.Phase)
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldDD, ok := e.ObjectOld.(*velerov2alpha1.DataDownload)
+			if !ok {
+				return false
+			}
+			newDD, ok := e.ObjectNew.(*velerov2alpha1.DataDownload)
+			if !ok {
+				return false
+			}
+			// Fire when old phase was active AND new phase is NOT active
+			return isActiveDataDownloadPhase(oldDD.Status.Phase) && !isActiveDataDownloadPhase(newDD.Status.Phase)
+		},
+	}
 }
