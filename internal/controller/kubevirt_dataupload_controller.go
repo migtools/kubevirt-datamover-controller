@@ -43,11 +43,15 @@ import (
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
@@ -63,11 +67,24 @@ const (
 	// RequeueAfterLong is the longer requeue duration
 	RequeueAfterLong = 30 * time.Second
 
+	// RequeueAfterGated is the safety-net poll interval for DUs/DDs waiting
+	// for a concurrency slot. With event-driven slot notification (Watches on
+	// terminal phase transitions), gated DUs/DDs are promptly re-enqueued when
+	// a peer completes. This longer interval acts only as a fallback in case a
+	// Watch event is missed.
+	RequeueAfterGated = 2 * time.Minute
+
 	// bslValidatedValue is the annotation value indicating BSL validation is complete
 	bslValidatedValue = "true"
 
 	// AnnotationVMBTName is the annotation key for the generated VMBT name on a DataUpload
 	AnnotationVMBTName = "kubevirt-datamover.io/vmbt-name"
+
+	// IndexFieldDataUploadPreparedPhase is the field index key used to narrow
+	// List calls in enqueueWaitingOnSlotOpen to kubevirt DataUploads in the
+	// Prepared phase, avoiding an unfiltered namespace-wide list followed by
+	// in-memory filtering.
+	IndexFieldDataUploadPreparedPhase = "index.kubevirt.dataupload.preparedPhase"
 
 	// k8sGenerateNameRandomLen is the number of random characters K8s appends to GenerateName
 	k8sGenerateNameRandomLen = 5
@@ -1541,6 +1558,26 @@ func (r *KubeVirtDataUploadReconciler) getPodNamespace(du *velerov2alpha1.DataUp
 	return du.Namespace
 }
 
+// registerDataUploadPreparedPhaseIndex adds a field index for kubevirt
+// DataUploads in the Prepared phase, so enqueueWaitingOnSlotOpen can use
+// client.MatchingFields instead of listing ALL DataUploads and filtering
+// in-memory. Returns nil on success; callers may treat the error as non-fatal
+// (the controller still works via the safety-net poll) or propagate it.
+func registerDataUploadPreparedPhaseIndex(ctx context.Context, mgr ctrl.Manager) error {
+	return mgr.GetFieldIndexer().IndexField(ctx, &velerov2alpha1.DataUpload{}, IndexFieldDataUploadPreparedPhase,
+		func(obj client.Object) []string {
+			du, ok := obj.(*velerov2alpha1.DataUpload)
+			if !ok {
+				return nil
+			}
+			if du.Spec.DataMover == common.DataMoverKubeVirt && du.Status.Phase == velerov2alpha1.DataUploadPhasePrepared {
+				return []string{indexValueTrue}
+			}
+			return nil
+		},
+	)
+}
+
 // SetupWithManager sets up the controller with the Manager
 func (r *KubeVirtDataUploadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	maxConcurrent := r.MaxConcurrentReconciles
@@ -1548,8 +1585,19 @@ func (r *KubeVirtDataUploadReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		maxConcurrent = DefaultMaxConcurrentReconciles
 	}
 
+	// Best-effort: if the index registration fails the controller still works
+	// via the safety-net poll; enqueueWaitingOnSlotOpen falls back to an
+	// unindexed List when the index is absent.
+	if err := registerDataUploadPreparedPhaseIndex(context.Background(), mgr); err != nil {
+		log.Log.Error(err, "Failed to register Prepared-phase field index for DataUpload, falling back to unindexed list")
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&velerov2alpha1.DataUpload{}).
+		Watches(&velerov2alpha1.DataUpload{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueWaitingOnSlotOpen),
+			builder.WithPredicates(r.terminalPhaseTransitionPredicate()),
+		).
 		WithEventFilter(r.filterKubeVirtDataMover()).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: maxConcurrent,
@@ -1568,6 +1616,90 @@ func (r *KubeVirtDataUploadReconciler) filterKubeVirtDataMover() predicate.Predi
 		}
 		return du.Spec.DataMover == common.DataMoverKubeVirt
 	})
+}
+
+// enqueueWaitingOnSlotOpen is the handler.MapFunc for the secondary Watch.
+// When a kubevirt DataUpload reaches a terminal phase (freeing a concurrency
+// slot), this handler lists all Prepared kubevirt DUs in the same namespace
+// and returns reconcile.Requests for each so they promptly re-evaluate the
+// concurrency gate instead of waiting for the safety-net poll.
+func (r *KubeVirtDataUploadReconciler) enqueueWaitingOnSlotOpen(ctx context.Context, obj client.Object) []reconcile.Request {
+	du, ok := obj.(*velerov2alpha1.DataUpload)
+	if !ok {
+		return nil
+	}
+
+	// Only react to kubevirt datamover DUs
+	if du.Spec.DataMover != common.DataMoverKubeVirt {
+		return nil
+	}
+
+	// Only react to terminal phase transitions — EnqueueRequestsFromMapFunc
+	// runs for both old and new objects on an Update event; the old (non-terminal)
+	// object would trigger a wasted namespace List.
+	switch du.Status.Phase {
+	case velerov2alpha1.DataUploadPhaseCompleted,
+		velerov2alpha1.DataUploadPhaseFailed,
+		velerov2alpha1.DataUploadPhaseCanceled:
+	default:
+		return nil
+	}
+
+	// Only when the concurrency limit is enabled
+	if r.MaxConcurrentDataMovers <= 0 {
+		return nil
+	}
+
+	// Use the Prepared-phase field index to narrow the List to only kubevirt
+	// DataUploads in Prepared phase, avoiding an unfiltered namespace-wide
+	// list. Fall back to the unindexed path if the index was not registered.
+	duList := &velerov2alpha1.DataUploadList{}
+	err := r.List(ctx, duList,
+		client.InNamespace(du.Namespace),
+		client.MatchingFields{IndexFieldDataUploadPreparedPhase: indexValueTrue},
+	)
+	if err != nil {
+		// Best-effort: the safety-net poll will catch any missed DUs
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for i := range duList.Items {
+		other := &duList.Items[i]
+		if other.UID == du.UID {
+			continue
+		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      other.Name,
+				Namespace: other.Namespace,
+			},
+		})
+	}
+	return requests
+}
+
+// terminalPhaseTransitionPredicate returns a predicate that only passes Update
+// events where a DataUpload transitions FROM a non-terminal phase TO a terminal
+// phase (Completed, Failed, Canceled). All other event types are suppressed.
+func (r *KubeVirtDataUploadReconciler) terminalPhaseTransitionPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc:  func(e event.CreateEvent) bool { return false },
+		DeleteFunc:  func(e event.DeleteEvent) bool { return false },
+		GenericFunc: func(e event.GenericEvent) bool { return false },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			newDU, ok := e.ObjectNew.(*velerov2alpha1.DataUpload)
+			if !ok {
+				return false
+			}
+			oldDU, ok := e.ObjectOld.(*velerov2alpha1.DataUpload)
+			if !ok {
+				return false
+			}
+			// Only fire when transitioning TO a terminal phase FROM a non-terminal phase
+			return isTerminalDataUploadPhase(newDU.Status.Phase) && !isTerminalDataUploadPhase(oldDU.Status.Phase)
+		},
+	}
 }
 
 // ensureTempPVC creates or retrieves the temporary PVC for backup output.
@@ -2123,9 +2255,14 @@ func (r *KubeVirtDataUploadReconciler) hasOlderActiveDUForVM(ctx context.Context
 // MaxConcurrentDataMovers, called from handlePrepared right after the
 // existing-pod idempotency check -- before any of the BSL/VMB/PV-rebind
 // lookups that only exist to build the pod, since none of that work is
-// needed while gated. Returns gated=true (with a RequeueAfterLong result)
+// needed while gated. Returns gated=true (with a RequeueAfterGated result)
 // when du must wait its turn; gated=false when it's clear to proceed
 // (including when the limit is disabled, MaxConcurrentDataMovers <= 0).
+//
+// The primary wake-up path is event-driven: a secondary Watch on DataUpload
+// fires enqueueWaitingOnSlotOpen when a peer reaches a terminal phase,
+// immediately re-enqueuing gated DUs. RequeueAfterGated (2m) acts only as a
+// safety-net poll in case a Watch event is missed.
 func (r *KubeVirtDataUploadReconciler) checkConcurrentDataMoverLimit(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload) (gated bool, result ctrl.Result, err error) {
 	if r.MaxConcurrentDataMovers <= 0 {
 		return false, ctrl.Result{}, nil
@@ -2152,7 +2289,7 @@ func (r *KubeVirtDataUploadReconciler) checkConcurrentDataMoverLimit(ctx context
 	// deadline out for as long as this DU is legitimately waiting its turn.
 	if du.Status.AcceptedTimestamp != nil {
 		// Re-fetch immediately before writing: this path runs every
-		// RequeueAfterLong for as long as du stays gated -- potentially many
+		// RequeueAfterGated for as long as du stays gated -- potentially many
 		// times over a long queue wait -- far more often than any other write
 		// in this reconciler, so it's the one most likely to collide with a
 		// concurrent external update (e.g. an annotation patch) and hit a
@@ -2163,7 +2300,14 @@ func (r *KubeVirtDataUploadReconciler) checkConcurrentDataMoverLimit(ctx context
 		if getErr := r.Get(ctx, client.ObjectKeyFromObject(du), latest); getErr != nil {
 			logger.Error(getErr, "Failed to re-fetch DataUpload before advancing AcceptedTimestamp, skipping this cycle's advance")
 		} else if latest.Status.AcceptedTimestamp != nil {
-			advanced := metav1.NewTime(latest.Status.AcceptedTimestamp.Add(RequeueAfterLong))
+			// Advance AcceptedTimestamp to "now" -- exactly the actual elapsed
+			// time since the last advancement. The previous approach added the
+			// fixed RequeueAfterGated interval, but with event-driven wakeups
+			// the DU can be reconciled well before the full 2-minute poll
+			// fires, over-crediting the timeout budget on each early wake.
+			// Setting to now always advances by exactly the wall-clock time
+			// that actually passed while gated.
+			advanced := metav1.NewTime(time.Now())
 			latest.Status.AcceptedTimestamp = &advanced
 			if err := r.Update(ctx, latest); err != nil {
 				return false, ctrl.Result{}, fmt.Errorf("failed to advance AcceptedTimestamp while gated: %w", err)
@@ -2171,7 +2315,7 @@ func (r *KubeVirtDataUploadReconciler) checkConcurrentDataMoverLimit(ctx context
 			*du = *latest
 		}
 	}
-	return true, ctrl.Result{RequeueAfter: RequeueAfterLong}, nil
+	return true, ctrl.Result{RequeueAfter: RequeueAfterGated}, nil
 }
 
 // countHigherPriorityActiveDataUploads counts kubevirt-datamover DataUploads
