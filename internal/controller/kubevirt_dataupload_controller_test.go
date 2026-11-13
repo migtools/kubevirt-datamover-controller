@@ -46,6 +46,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 func TestReconcile(t *testing.T) {
@@ -4480,8 +4482,8 @@ func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if result.RequeueAfter != RequeueAfterLong {
-			t.Errorf("RequeueAfter = %v, want %v", result.RequeueAfter, RequeueAfterLong)
+		if result.RequeueAfter != RequeueAfterGated {
+			t.Errorf("RequeueAfter = %v, want %v", result.RequeueAfter, RequeueAfterGated)
 		}
 
 		var updated velerov2alpha1.DataUpload
@@ -4499,12 +4501,16 @@ func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
 		}
 
 		// Deferring due to the concurrency limit is intentional throttling, not
-		// a stalled operation -- AcceptedTimestamp must advance by exactly the
-		// requeue interval so this wait doesn't consume Spec.OperationTimeout's
-		// budget (see the gate's defer branch in checkConcurrentDataMoverLimit).
-		wantAdvanced := baseTime.Add(RequeueAfterLong)
-		if updated.Status.AcceptedTimestamp == nil || !updated.Status.AcceptedTimestamp.Time.Equal(wantAdvanced) {
-			t.Errorf("AcceptedTimestamp = %v, want %v (baseTime + RequeueAfterLong)", updated.Status.AcceptedTimestamp, wantAdvanced)
+		// a stalled operation -- AcceptedTimestamp must advance by the actual
+		// elapsed time (set to "now") so this wait doesn't consume
+		// Spec.OperationTimeout's budget. With event-driven wakeups the DU can
+		// be reconciled before the full RequeueAfterGated poll fires, so the
+		// fixed-interval approach would over-credit the timeout budget.
+		if updated.Status.AcceptedTimestamp == nil {
+			t.Fatal("AcceptedTimestamp is nil after gated reconcile")
+		}
+		if !updated.Status.AcceptedTimestamp.After(baseTime.Time) {
+			t.Errorf("AcceptedTimestamp = %v, want after baseTime %v (should advance to ~now)", updated.Status.AcceptedTimestamp, baseTime)
 		}
 	})
 
@@ -9971,3 +9977,335 @@ func (v *vmbIncludedVolumesReader) Get(ctx context.Context, key client.ObjectKey
 	}
 	return v.Reader.Get(ctx, key, obj, opts...)
 }
+
+// TestEnqueueWaitingOnSlotOpen_DataUpload verifies the handler.MapFunc that
+// fires when a DataUpload reaches a terminal phase. It must return
+// reconcile.Requests for all Prepared kubevirt DUs in the same namespace,
+// excluding the terminal DU itself and non-kubevirt DUs.
+func TestEnqueueWaitingOnSlotOpen_DataUpload(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+
+	ns := "openshift-adp"
+
+	// The DU that just completed (triggering the handler)
+	completedDU := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{Name: "du-completed", Namespace: ns, UID: "uid-completed"},
+		Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+		Status:     velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseCompleted},
+	}
+
+	// A Prepared kubevirt DU — should be enqueued
+	preparedDU := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{Name: "du-prepared", Namespace: ns, UID: "uid-prepared"},
+		Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+		Status:     velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhasePrepared},
+	}
+
+	// An InProgress kubevirt DU — should NOT be enqueued (not Prepared)
+	inProgressDU := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{Name: "du-inprogress", Namespace: ns, UID: "uid-inprogress"},
+		Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+		Status:     velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseInProgress},
+	}
+
+	// A Prepared non-kubevirt DU — should NOT be enqueued
+	nonKVPrepared := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{Name: "du-velero-prepared", Namespace: ns, UID: "uid-velero"},
+		Spec:       velerov2alpha1.DataUploadSpec{DataMover: "velero"},
+		Status:     velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhasePrepared},
+	}
+
+	// A Completed kubevirt DU — should NOT be enqueued (terminal, not Prepared)
+	otherCompleted := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{Name: "du-other-completed", Namespace: ns, UID: "uid-other-completed"},
+		Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+		Status:     velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseCompleted},
+	}
+
+	// A second Prepared kubevirt DU — should also be enqueued
+	preparedDU2 := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{Name: "du-prepared-2", Namespace: ns, UID: "uid-prepared-2"},
+		Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+		Status:     velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhasePrepared},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(completedDU, preparedDU, inProgressDU, nonKVPrepared, otherCompleted, preparedDU2).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadPreparedPhase, func(obj client.Object) []string {
+			du, ok := obj.(*velerov2alpha1.DataUpload)
+			if !ok {
+				return nil
+			}
+			if du.Spec.DataMover == common.DataMoverKubeVirt && du.Status.Phase == velerov2alpha1.DataUploadPhasePrepared {
+				return []string{"true"}
+			}
+			return nil
+		}).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:                  fakeClient,
+		Scheme:                  scheme,
+		Log:                     logr.Discard(),
+		MaxConcurrentDataMovers: 3,
+	}
+
+	requests := r.enqueueWaitingOnSlotOpen(context.Background(), completedDU)
+
+	// Should return exactly 2 requests: du-prepared and du-prepared-2
+	if len(requests) != 2 {
+		t.Fatalf("expected 2 requests, got %d: %v", len(requests), requests)
+	}
+
+	names := map[string]bool{}
+	for _, req := range requests {
+		names[req.Name] = true
+	}
+
+	if !names["du-prepared"] {
+		t.Error("expected du-prepared to be enqueued")
+	}
+	if !names["du-prepared-2"] {
+		t.Error("expected du-prepared-2 to be enqueued")
+	}
+	if names["du-inprogress"] {
+		t.Error("du-inprogress should NOT be enqueued (not Prepared)")
+	}
+	if names["du-velero-prepared"] {
+		t.Error("du-velero-prepared should NOT be enqueued (non-kubevirt)")
+	}
+	if names["du-completed"] {
+		t.Error("du-completed should NOT be enqueued (it's the triggering DU)")
+	}
+
+	t.Run("returns nil when limit is disabled", func(t *testing.T) {
+		rUnlimited := &KubeVirtDataUploadReconciler{
+			Client:                  fakeClient,
+			Scheme:                  scheme,
+			Log:                     logr.Discard(),
+			MaxConcurrentDataMovers: 0,
+		}
+		reqs := rUnlimited.enqueueWaitingOnSlotOpen(context.Background(), completedDU)
+		if reqs != nil {
+			t.Errorf("expected nil when limit disabled, got %v", reqs)
+		}
+	})
+
+	t.Run("returns nil for non-kubevirt datamover", func(t *testing.T) {
+		nonKVDU := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{Name: "du-velero", Namespace: ns, UID: "uid-v"},
+			Spec:       velerov2alpha1.DataUploadSpec{DataMover: "velero"},
+			Status:     velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseCompleted},
+		}
+		reqs := r.enqueueWaitingOnSlotOpen(context.Background(), nonKVDU)
+		if reqs != nil {
+			t.Errorf("expected nil for non-kubevirt DU, got %v", reqs)
+		}
+	})
+
+	t.Run("returns nil for non-terminal phase (early return)", func(t *testing.T) {
+		// A kubevirt DU in Prepared phase (non-terminal) should return nil
+		// immediately — EnqueueRequestsFromMapFunc fires for both old and new
+		// objects on an Update event, so the non-terminal old object must not
+		// trigger a namespace List.
+		preparedTrigger := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{Name: "du-prepared-trigger", Namespace: ns, UID: "uid-pt"},
+			Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+			Status:     velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhasePrepared},
+		}
+		reqs := r.enqueueWaitingOnSlotOpen(context.Background(), preparedTrigger)
+		if reqs != nil {
+			t.Errorf("expected nil for non-terminal DU, got %v", reqs)
+		}
+
+		// InProgress is also non-terminal
+		inProgressTrigger := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{Name: "du-inprogress-trigger", Namespace: ns, UID: "uid-ipt"},
+			Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+			Status:     velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseInProgress},
+		}
+		reqs = r.enqueueWaitingOnSlotOpen(context.Background(), inProgressTrigger)
+		if reqs != nil {
+			t.Errorf("expected nil for non-terminal DU, got %v", reqs)
+		}
+	})
+}
+
+// TestTerminalPhaseTransitionPredicate_DataUpload verifies the predicate that
+// gates the secondary Watch. It must pass only Update events where the new
+// phase is terminal and the old phase was not.
+func TestTerminalPhaseTransitionPredicate_DataUpload(t *testing.T) {
+	r := &KubeVirtDataUploadReconciler{}
+	pred := r.terminalPhaseTransitionPredicate()
+
+	t.Run("fires on transition to Completed", func(t *testing.T) {
+		e := event.UpdateEvent{
+			ObjectOld: &velerov2alpha1.DataUpload{
+				Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseInProgress},
+			},
+			ObjectNew: &velerov2alpha1.DataUpload{
+				Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseCompleted},
+			},
+		}
+		if !pred.Update(e) {
+			t.Error("should fire on InProgress → Completed transition")
+		}
+	})
+
+	t.Run("fires on transition to Failed", func(t *testing.T) {
+		e := event.UpdateEvent{
+			ObjectOld: &velerov2alpha1.DataUpload{
+				Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhasePrepared},
+			},
+			ObjectNew: &velerov2alpha1.DataUpload{
+				Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseFailed},
+			},
+		}
+		if !pred.Update(e) {
+			t.Error("should fire on Prepared → Failed transition")
+		}
+	})
+
+	t.Run("fires on transition to Canceled", func(t *testing.T) {
+		e := event.UpdateEvent{
+			ObjectOld: &velerov2alpha1.DataUpload{
+				Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseAccepted},
+			},
+			ObjectNew: &velerov2alpha1.DataUpload{
+				Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseCanceled},
+			},
+		}
+		if !pred.Update(e) {
+			t.Error("should fire on Accepted → Canceled transition")
+		}
+	})
+
+	t.Run("does not fire on non-terminal transition", func(t *testing.T) {
+		e := event.UpdateEvent{
+			ObjectOld: &velerov2alpha1.DataUpload{
+				Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseAccepted},
+			},
+			ObjectNew: &velerov2alpha1.DataUpload{
+				Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhasePrepared},
+			},
+		}
+		if pred.Update(e) {
+			t.Error("should NOT fire on Accepted → Prepared (non-terminal) transition")
+		}
+	})
+
+	t.Run("does not fire when already terminal", func(t *testing.T) {
+		e := event.UpdateEvent{
+			ObjectOld: &velerov2alpha1.DataUpload{
+				Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseCompleted},
+			},
+			ObjectNew: &velerov2alpha1.DataUpload{
+				Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseCompleted},
+			},
+		}
+		if pred.Update(e) {
+			t.Error("should NOT fire when both old and new are terminal")
+		}
+	})
+
+	t.Run("does not fire on Create", func(t *testing.T) {
+		e := event.CreateEvent{
+			Object: &velerov2alpha1.DataUpload{
+				Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseCompleted},
+			},
+		}
+		if pred.Create(e) {
+			t.Error("should NOT fire on Create events")
+		}
+	})
+
+	t.Run("does not fire on Delete", func(t *testing.T) {
+		e := event.DeleteEvent{
+			Object: &velerov2alpha1.DataUpload{
+				Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseCompleted},
+			},
+		}
+		if pred.Delete(e) {
+			t.Error("should NOT fire on Delete events")
+		}
+	})
+
+	t.Run("does not fire on Generic", func(t *testing.T) {
+		e := event.GenericEvent{
+			Object: &velerov2alpha1.DataUpload{
+				Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseCompleted},
+			},
+		}
+		if pred.Generic(e) {
+			t.Error("should NOT fire on Generic events")
+		}
+	})
+}
+
+// TestRequeueAfterGated_DataUpload verifies that the RequeueAfterGated
+// constant is used for gated requeues, is larger than RequeueAfterLong,
+// and has the expected value.
+func TestRequeueAfterGated_DataUpload(t *testing.T) {
+	if RequeueAfterGated != 2*time.Minute {
+		t.Errorf("RequeueAfterGated = %v, want 2m", RequeueAfterGated)
+	}
+	if RequeueAfterGated <= RequeueAfterLong {
+		t.Errorf("RequeueAfterGated (%v) should be greater than RequeueAfterLong (%v)",
+			RequeueAfterGated, RequeueAfterLong)
+	}
+
+	// Verify the gated path uses RequeueAfterGated by calling
+	// checkConcurrentDataMoverLimit directly when over the limit.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	ns := "openshift-adp"
+	baseTime := time.Now().Add(-5 * time.Minute)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{Name: "du-gated", Namespace: ns, UID: "uid-gated",
+			CreationTimestamp: metav1.NewTime(baseTime.Add(time.Minute))},
+		Spec:   velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+		Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhasePrepared, AcceptedTimestamp: ptrTime(baseTime)},
+	}
+
+	// Create 3 higher-priority (older) active DUs to put du over the limit (MaxConcurrentDataMovers=3)
+	objs := make([]client.Object, 0, 4)
+	objs = append(objs, du)
+	for i := range 3 {
+		other := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("du-active-%d", i), Namespace: ns,
+				UID: types.UID(fmt.Sprintf("uid-active-%d", i)),
+				// Older than du, so they outrank it
+				CreationTimestamp: metav1.NewTime(baseTime.Add(-time.Duration(i+1) * time.Second)),
+			},
+			Spec:   velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseInProgress, AcceptedTimestamp: ptrTime(baseTime)},
+		}
+		objs = append(objs, other)
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	r := &KubeVirtDataUploadReconciler{
+		Client: fakeClient, Scheme: scheme, Log: logr.Discard(),
+		MaxConcurrentDataMovers: 3,
+	}
+
+	gated, result, err := r.checkConcurrentDataMoverLimit(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gated {
+		t.Fatal("expected gated=true when at the limit")
+	}
+	if result.RequeueAfter != RequeueAfterGated {
+		t.Errorf("gated RequeueAfter = %v, want %v (RequeueAfterGated)", result.RequeueAfter, RequeueAfterGated)
+	}
+}
+
+// Verify reconcile.Request is used correctly (compile-time check)
+var _ []reconcile.Request
