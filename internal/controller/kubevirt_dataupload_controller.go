@@ -2332,14 +2332,7 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 // Returns ("", "", nil) when ref is empty (SSE-C not configured).
 // Returns an error for malformed references.
 func parseSSECSecretRef(ref string) (secretName, key string, err error) {
-	if ref == "" {
-		return "", "", nil
-	}
-	parts := strings.SplitN(ref, "/", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", fmt.Errorf("invalid customerKeyEncryptionSecret %q: must be in secretName/key format", ref)
-	}
-	return parts[0], parts[1], nil
+	return uploader.ParseSSECSecretRef(ref)
 }
 
 // lookupCheckpointFromBSL reads the VM's checkpoint index from the BSL and returns

@@ -19,6 +19,7 @@ package uploader
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -379,7 +380,10 @@ func InitObjectStore(cfg *common.ObjectStoreConfig) (velero.ObjectStore, error) 
 	if cfg.BSLChecksumAlgorithm != "" {
 		configMap["checksumAlgorithm"] = cfg.BSLChecksumAlgorithm
 	}
-	if cfg.BSLCustomerKeyEncryptionFile != "" {
+	// SSE-C key: prefer in-memory data (controller path), fall back to file (pod path).
+	if len(cfg.BSLCustomerKeyEncryptionData) > 0 {
+		configMap["customerKeyEncryptionData"] = base64.StdEncoding.EncodeToString(cfg.BSLCustomerKeyEncryptionData)
+	} else if cfg.BSLCustomerKeyEncryptionFile != "" {
 		configMap["customerKeyEncryptionFile"] = cfg.BSLCustomerKeyEncryptionFile
 	}
 	if cfg.BSLProfile != "" {
@@ -585,6 +589,14 @@ func InitObjectStoreFromBSL(
 		return nil, nil, fmt.Errorf("failed to get BSL credentials: %w", err)
 	}
 
+	// SSE-C: the controller has no key file mounted, so read the key from the
+	// BSL's customerKeyEncryptionSecret and pass it in memory. Without it every
+	// HeadObject/GetObject on an SSE-C encrypted object fails with 400 Bad Request.
+	sseKey, err := GetSSECKeyFromBSL(ctx, k8sClient, oadpNamespace, bsl, cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get BSL SSE-C key: %w", err)
+	}
+
 	if factory == nil {
 		factory = InitObjectStore
 	}
@@ -602,9 +614,9 @@ func InitObjectStoreFromBSL(
 		BSLKMSKeyID:              cfg.KMSKeyID,
 		BSLChecksumAlgorithm:     cfg.ChecksumAlgorithm,
 		BSLProfile:               cfg.Profile,
-		// BSLCustomerKeyEncryptionFile is not set here — the controller path
-		// (InitObjectStoreFromBSL) doesn't have the SSE-C key file mounted.
-		// SSE-C is only applied in the datamover pod where the secret is volume-mounted.
+		// The controller path has no SSE-C key file mounted (that only exists in
+		// the datamover pod), so the key is passed in memory instead.
+		BSLCustomerKeyEncryptionData:   sseKey,
 		BSLServiceAccount:              cfg.ServiceAccount,
 		BSLKMSKeyName:                  cfg.KMSKeyName,
 		BSLResourceGroup:               cfg.ResourceGroup,
@@ -621,6 +633,62 @@ func InitObjectStoreFromBSL(
 	}
 
 	return store, cfg, nil
+}
+
+// ParseSSECSecretRef splits a BSL customerKeyEncryptionSecret value of the
+// form "secretName/key" into its two parts. An empty ref returns empty strings.
+func ParseSSECSecretRef(ref string) (secretName, key string, err error) {
+	if ref == "" {
+		return "", "", nil
+	}
+	parts := strings.SplitN(ref, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("invalid customerKeyEncryptionSecret %q: must be in secretName/key format", ref)
+	}
+	return parts[0], parts[1], nil
+}
+
+// GetSSECKeyFromBSL reads the SSE-C key referenced by the BSL's
+// customerKeyEncryptionSecret config ("secretName/key") and returns the raw key
+// bytes. It returns nil if the BSL does not use SSE-C. The key is kept in
+// memory and never written to disk.
+func GetSSECKeyFromBSL(
+	ctx context.Context, k8sClient client.Client, oadpNamespace string, bsl *velerov1.BackupStorageLocation, cfg *BSLConfig,
+) ([]byte, error) {
+	if cfg == nil || cfg.CustomerKeyEncryptionSecret == "" {
+		return nil, nil
+	}
+
+	secretName, secretKey, err := ParseSSECSecretRef(cfg.CustomerKeyEncryptionSecret)
+	if err != nil {
+		return nil, err
+	}
+
+	// The SSE-C secret is in the same namespace as the BSL
+	namespace := bsl.Namespace
+	if namespace == "" {
+		namespace = oadpNamespace
+	}
+
+	secret := &corev1.Secret{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{
+		Name: secretName, Namespace: namespace,
+	}, secret); err != nil {
+		return nil, fmt.Errorf(
+			"failed to get SSE-C key secret %s/%s: %w",
+			namespace, secretName, err,
+		)
+	}
+
+	keyData, ok := secret.Data[secretKey]
+	if !ok {
+		return nil, fmt.Errorf(
+			"SSE-C key secret %s/%s does not contain key %q",
+			namespace, secretName, secretKey,
+		)
+	}
+
+	return keyData, nil
 }
 
 // GetCredentialsFromBSL reads the BSL credential secret and returns the raw

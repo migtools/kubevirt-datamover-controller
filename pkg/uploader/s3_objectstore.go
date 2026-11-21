@@ -200,15 +200,25 @@ func (s *S3ObjectStore) Init(configMap map[string]string) error {
 		}
 	}
 
-	// Configure SSE-C (customer-provided encryption key)
-	if customerKeyFile := configMap["customerKeyEncryptionFile"]; customerKeyFile != "" {
+	// Configure SSE-C (customer-provided encryption key). The key comes either
+	// in memory (controller path, base64 in customerKeyEncryptionData) or from a
+	// mounted file (datamover pod path, customerKeyEncryptionFile).
+	customerKeyData := configMap["customerKeyEncryptionData"]
+	customerKeyFile := configMap["customerKeyEncryptionFile"]
+	if customerKeyData != "" || customerKeyFile != "" {
 		if s.kmsKeyId != "" {
 			return fmt.Errorf("customerKeyEncryptionFile cannot be used with kmsKeyId")
 		}
 		if s.serverSideEncryption != "" {
 			return fmt.Errorf("customerKeyEncryptionFile cannot be used with serverSideEncryption")
 		}
-		sseKey, err := loadSSECKey(customerKeyFile)
+		var sseKey []byte
+		var err error
+		if customerKeyData != "" {
+			sseKey, err = decodeSSECKey(customerKeyData)
+		} else {
+			sseKey, err = loadSSECKey(customerKeyFile)
+		}
 		if err != nil {
 			return fmt.Errorf("failed to load SSE-C key: %w", err)
 		}
@@ -453,6 +463,21 @@ func loadSSECKey(path string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read SSE-C key file %q: %w", path, err)
 	}
+	return normalizeSSECKey(data)
+}
+
+// decodeSSECKey decodes a base64-encoded SSE-C key passed in memory.
+func decodeSSECKey(encoded string) ([]byte, error) {
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode SSE-C key data: %w", err)
+	}
+	return normalizeSSECKey(data)
+}
+
+// normalizeSSECKey strips a trailing newline from a key that is not already
+// exactly 32 bytes and verifies the resulting length.
+func normalizeSSECKey(data []byte) ([]byte, error) {
 	if len(data) != 32 {
 		data = bytes.TrimRight(data, "\r\n")
 	}
