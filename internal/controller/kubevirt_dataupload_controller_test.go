@@ -2868,6 +2868,88 @@ func TestHandleInProgress_PodSucceeded(t *testing.T) {
 	}
 }
 
+// TestHandleInProgress_PodSucceeded_CleansUpVMBButPreservesVMBT verifies that
+// when a DataUpload completes successfully, the controller deletes the VMB
+// but preserves the VMBT on-cluster (issue #32 regression test).
+func TestHandleInProgress_PodSucceeded_CleansUpVMBButPreservesVMBT(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+
+	vmNamespace := "test-ns"
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du",
+			Namespace: "openshift-adp",
+			UID:       types.UID("test-uid-succeeded"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      "test-vm",
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseInProgress,
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.DatamoverPodNamePrefix + du.Name,
+			Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataUploadUID: string(du.UID),
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodSucceeded,
+		},
+	}
+
+	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmb-test-du",
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadUID: string(du.UID),
+			},
+		},
+	}
+
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-test-vm",
+			Namespace: vmNamespace,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pod, vmb, vmbt).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: "openshift-adp",
+	}
+
+	if _, err := r.handleInProgress(context.Background(), logr.Discard(), du); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: vmb.Name, Namespace: vmNamespace}, &kubevirtbackupv1alpha1.VirtualMachineBackup{}); !errors.IsNotFound(err) {
+		t.Errorf("expected VMB to be deleted on successful completion, got err=%v", err)
+	}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: vmbt.Name, Namespace: vmNamespace}, &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}); err != nil {
+		t.Errorf("expected VMBT to be preserved on successful completion, got err=%v", err)
+	}
+}
+
 // TestHandleInProgress_PodSucceeded_DefersCleanupWhileTerminating verifies the
 // fix for https://github.com/migtools/kubevirt-datamover-controller/issues/171:
 // PVC/PV cleanup (and the Completed transition) must be deferred to a later
