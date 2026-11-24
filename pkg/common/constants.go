@@ -86,6 +86,15 @@ const (
 	// AnnotationDataDownloadName is the annotation key for the DataDownload name.
 	// Used on PVC and pod resources to track ownership during restore.
 	AnnotationDataDownloadName = "velero.io/datadownload-name"
+
+	// AnnotationProgressTotalBytes is the annotation key for the total bytes to transfer.
+	AnnotationProgressTotalBytes = "kubevirt-datamover.io/total-bytes"
+
+	// AnnotationProgressIncrementalBytes is the annotation key for the incremental bytes to transfer.
+	AnnotationProgressIncrementalBytes = "kubevirt-datamover.io/incremental-bytes"
+
+	// AnnotationProgressBytesDone is the annotation key for the bytes transferred so far.
+	AnnotationProgressBytesDone = "kubevirt-datamover.io/bytes-done"
 )
 
 // Annotation keys for VirtualMachine resources

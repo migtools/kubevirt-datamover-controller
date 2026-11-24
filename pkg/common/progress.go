@@ -68,10 +68,12 @@ func PatchPodProgress(
 	}
 	patch := client.RawPatch(types.MergePatchType, fmt.Appendf(nil,
 		`{"metadata":{"annotations":{`+
-			`"kubevirt-datamover.io/total-bytes":"%d",`+
-			`"kubevirt-datamover.io/incremental-bytes":"%d",`+
-			`"kubevirt-datamover.io/bytes-done":"%d"}}}`,
-		total, inc, done))
+			`"%s":"%d",`+
+			`"%s":"%d",`+
+			`"%s":"%d"}}}`,
+		AnnotationProgressTotalBytes, total,
+		AnnotationProgressIncrementalBytes, inc,
+		AnnotationProgressBytesDone, done))
 	if err := k8sClient.Patch(ctx, pod, patch); err != nil {
 		logger.Error(err, "Failed to patch pod progress annotations")
 	}
