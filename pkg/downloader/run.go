@@ -65,7 +65,10 @@ func Run(ctx context.Context, logger logr.Logger) error {
 	// Create K8s client early for progress reporting
 	k8sClient, err := common.NewKubeClient()
 	if err != nil {
-		logger.Info("Warning: failed to create K8s client for progress reporting, continuing without progress updates", "error", err)
+		logger.Info(
+			"Warning: failed to create K8s client for progress reporting, continuing without progress updates",
+			"error",
+			err)
 	}
 
 	manifest, found, err := uploader.GetVMBackupManifest(
