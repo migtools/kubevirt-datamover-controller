@@ -48,9 +48,9 @@ For full design details, see the [OADP KubeVirt Datamover Design Document](https
 The controller reports real-time progress on `DataUpload` and `DataDownload` CRs. Because the KubeVirt datamover transfers `.qcow2` files rather than scanning filesystems like Velero's built-in Kopia datamover, the progress fields represent slightly different metrics:
 
 **DataUpload (Backup)**
-- `Status.Progress.TotalBytes`: The raw capacity of the source PVCs being backed up.
+- `Status.Progress.TotalBytes`: For incremental backups, this is the raw capacity of the source PVCs. For full backups, it is the size of the `.qcow2` payload.
 - `Status.IncrementalBytes`: The actual size of the `.qcow2` payload being transferred to S3. For incremental backups, this will be significantly smaller than `TotalBytes`, reflecting the efficiency of CBT.
-- `Status.Progress.BytesDone`: The number of `.qcow2` bytes successfully uploaded to S3 so far.
+- `Status.Progress.BytesDone`: The number of `.qcow2` bytes successfully uploaded to S3 so far. *Note: For incremental backups, the upload is complete when `BytesDone` equals `IncrementalBytes` (not `TotalBytes`).*
 
 **DataDownload (Restore)**
 - `Status.Progress.TotalBytes`: The total size of all `.qcow2` files in the checkpoint chain that need to be downloaded from S3.
