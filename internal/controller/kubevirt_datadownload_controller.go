@@ -1572,6 +1572,34 @@ func (r *KubeVirtDataDownloadReconciler) buildDownloaderPodConfig(
 	}, nil
 }
 
+func (r *KubeVirtDataDownloadReconciler) syncProgressFromPod(ctx context.Context, logger logr.Logger, dd *velerov2alpha1.DataDownload, pod *corev1.Pod) {
+	if pod.Annotations == nil {
+		return
+	}
+	totalStr := pod.Annotations[common.AnnotationProgressTotalBytes]
+	doneStr := pod.Annotations[common.AnnotationProgressBytesDone]
+
+	if totalStr != "" && doneStr != "" {
+		total, err := strconv.ParseInt(totalStr, 10, 64)
+		if err != nil {
+			logger.V(1).Info("Failed to parse total bytes", "value", totalStr, "error", err)
+		}
+		done, err := strconv.ParseInt(doneStr, 10, 64)
+		if err != nil {
+			logger.V(1).Info("Failed to parse bytes done", "value", doneStr, "error", err)
+		}
+
+		if dd.Status.Progress.TotalBytes != total || dd.Status.Progress.BytesDone != done {
+			patch := client.MergeFrom(dd.DeepCopy())
+			dd.Status.Progress.TotalBytes = total
+			dd.Status.Progress.BytesDone = done
+			if err := r.Patch(ctx, dd, patch); err != nil {
+				logger.Error(err, "Failed to patch DataDownload progress")
+			}
+		}
+	}
+}
+
 // handleInProgress processes DataDownloads in InProgress phase.
 // Monitors the downloader pod; on success, rebinds the scratch PV into the restore
 // target namespace under the exact PVC name Velero created, then transitions to
@@ -1581,7 +1609,7 @@ func (r *KubeVirtDataDownloadReconciler) handleInProgress(ctx context.Context, l
 
 	// Idempotent resume: if a prior reconcile already completed the rebind (scratch
 	// PVC deleted, target PVC bound to the rebound PV) but failed to persist the
-	// Completed phase afterward -- e.g. a transient API error on updatePhase -- the
+	// Completed phase update afterward -- e.g. a transient API error on updatePhase -- the
 	// scratch PVC and possibly the pod are already gone, and re-attempting the
 	// rebind would fail. Detect this by checking whether the target PVC is already
 	// bound to a PV carrying this DataDownload's UID label, and finish idempotently
@@ -1635,6 +1663,8 @@ func (r *KubeVirtDataDownloadReconciler) handleInProgress(ctx context.Context, l
 	case corev1.PodSucceeded:
 		logger.Info("Downloader pod completed successfully", "pod", pod.Name)
 
+		r.syncProgressFromPod(ctx, logger, dd, pod)
+
 		// Record the success on the DataDownload BEFORE deleting the pod (see
 		// AnnotationDownloaderPodSucceeded's doc comment): the strict cleanup
 		// below routinely errors while the pod is still terminating, and the
@@ -1670,6 +1700,8 @@ func (r *KubeVirtDataDownloadReconciler) handleInProgress(ctx context.Context, l
 		failureMessage := extractPodFailureMessage(pod)
 		logger.Error(nil, "Downloader pod failed", "pod", pod.Name, "message", failureMessage)
 
+		r.syncProgressFromPod(ctx, logger, dd, pod)
+
 		r.emitPodLogs(ctx, logger, pod)
 
 		// Skip cleanup on failure to preserve resources (pod, scratch PVC) for debugging.
@@ -1681,6 +1713,8 @@ func (r *KubeVirtDataDownloadReconciler) handleInProgress(ctx context.Context, l
 		return ctrl.Result{}, nil
 
 	case corev1.PodPending, corev1.PodRunning:
+		r.syncProgressFromPod(ctx, logger, dd, pod)
+
 		logger.V(1).Info("Downloader pod still running", "pod", pod.Name, "phase", pod.Status.Phase)
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 

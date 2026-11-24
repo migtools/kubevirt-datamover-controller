@@ -2868,6 +2868,123 @@ func TestHandleInProgress_PodSucceeded(t *testing.T) {
 	}
 }
 
+func TestHandleInProgressDataUpload_SyncsProgress(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-du", Namespace: "openshift-adp", UID: types.UID("test-uid")},
+		Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+		Status:     velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseInProgress},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: common.DatamoverPodNamePrefix + du.Name, Namespace: "openshift-adp",
+			Labels: map[string]string{common.LabelDataUploadUID: string(du.UID)},
+			Annotations: map[string]string{
+				common.AnnotationProgressTotalBytes:       "2048",
+				common.AnnotationProgressIncrementalBytes: "512",
+				common.AnnotationProgressBytesDone:        "1024",
+			},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du, pod).Build()
+	r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+	if _, err := r.handleInProgress(context.Background(), logr.Discard(), du); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var updated velerov2alpha1.DataUpload
+	_ = fakeClient.Get(context.Background(), types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, &updated)
+	if updated.Status.Progress.TotalBytes != 2048 || updated.Status.IncrementalBytes != 512 || updated.Status.Progress.BytesDone != 1024 {
+		t.Errorf("progress mismatch: got total=%d inc=%d done=%d", updated.Status.Progress.TotalBytes, updated.Status.IncrementalBytes, updated.Status.Progress.BytesDone)
+	}
+}
+
+// TestHandleInProgress_PodSucceeded_CleansUpVMBButPreservesVMBT verifies that
+// when a DataUpload completes successfully, the controller deletes the VMB
+// but preserves the VMBT on-cluster (issue #32 regression test).
+func TestHandleInProgress_PodSucceeded_CleansUpVMBButPreservesVMBT(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+
+	vmNamespace := "test-ns"
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du",
+			Namespace: "openshift-adp",
+			UID:       types.UID("test-uid-succeeded"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      "test-vm",
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseInProgress,
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.DatamoverPodNamePrefix + du.Name,
+			Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataUploadUID: string(du.UID),
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodSucceeded,
+		},
+	}
+
+	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmb-test-du",
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadUID: string(du.UID),
+			},
+		},
+	}
+
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-test-vm",
+			Namespace: vmNamespace,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pod, vmb, vmbt).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: "openshift-adp",
+	}
+
+	if _, err := r.handleInProgress(context.Background(), logr.Discard(), du); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: vmb.Name, Namespace: vmNamespace}, &kubevirtbackupv1alpha1.VirtualMachineBackup{}); !errors.IsNotFound(err) {
+		t.Errorf("expected VMB to be deleted on successful completion, got err=%v", err)
+	}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: vmbt.Name, Namespace: vmNamespace}, &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}); err != nil {
+		t.Errorf("expected VMBT to be preserved on successful completion, got err=%v", err)
+	}
+}
+
 // TestHandleInProgress_PodSucceeded_DefersCleanupWhileTerminating verifies the
 // fix for https://github.com/migtools/kubevirt-datamover-controller/issues/171:
 // PVC/PV cleanup (and the Completed transition) must be deferred to a later
@@ -3797,6 +3914,7 @@ func TestBuildDatamoverPodConfig(t *testing.T) {
 				DatamoverImage: tt.datamoverImage,
 			}
 
+			qty := resource.MustParse("10Gi")
 			config, err := r.buildDatamoverPodConfig(
 				tt.du,
 				tt.bsl,
@@ -3806,6 +3924,7 @@ func TestBuildDatamoverPodConfig(t *testing.T) {
 				tt.expectedBackupType,
 				tt.checkpointName,
 				tt.vmbtName,
+				qty.Value(),
 			)
 
 			if tt.expectError {
@@ -9970,4 +10089,140 @@ func (v *vmbIncludedVolumesReader) Get(ctx context.Context, key client.ObjectKey
 		return unstructured.SetNestedSlice(u.Object, volumes, "status", "includedVolumes")
 	}
 	return v.Reader.Get(ctx, key, obj, opts...)
+}
+
+func TestGetRawBackupSize(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = kubevirtcorev1.AddToScheme(scheme)
+
+	tests := []struct {
+		name      string
+		du        *velerov2alpha1.DataUpload
+		objects   []client.Object
+		wantBytes int64
+	}{
+		{
+			name: "multi-PVC sum",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					Annotations: map[string]string{
+						common.AnnotationVMName:      "test-vm",
+						common.AnnotationVMNamespace: "test-ns",
+					},
+				},
+			},
+			objects: []client.Object{
+				&kubevirtcorev1.VirtualMachine{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-vm", Namespace: "test-ns"},
+					Spec: kubevirtcorev1.VirtualMachineSpec{
+						Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+							Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+								Volumes: []kubevirtcorev1.Volume{
+									{
+										Name: "vol1",
+										VolumeSource: kubevirtcorev1.VolumeSource{
+											PersistentVolumeClaim: &kubevirtcorev1.PersistentVolumeClaimVolumeSource{
+												PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+													ClaimName: "pvc1",
+												},
+											},
+										},
+									},
+									{
+										Name: "vol2",
+										VolumeSource: kubevirtcorev1.VolumeSource{
+											PersistentVolumeClaim: &kubevirtcorev1.PersistentVolumeClaimVolumeSource{
+												PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+													ClaimName: "pvc2",
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "pvc1", Namespace: "test-ns"},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("10Gi"),
+						},
+					},
+				},
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "pvc2", Namespace: "test-ns"},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("20Gi"),
+						},
+					},
+				},
+			},
+			wantBytes: 30 * 1024 * 1024 * 1024,
+		},
+		{
+			name: "not-found path falls back to source PVC",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					Annotations: map[string]string{
+						common.AnnotationVMName:      "test-vm",
+						common.AnnotationVMNamespace: "test-ns",
+					},
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					SourcePVC:       "source-pvc",
+					SourceNamespace: "test-ns",
+				},
+			},
+			objects: []client.Object{
+				&kubevirtcorev1.VirtualMachine{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-vm", Namespace: "test-ns"},
+					Spec: kubevirtcorev1.VirtualMachineSpec{
+						Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+							Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+								Volumes: []kubevirtcorev1.Volume{
+									{
+										Name: "vol1",
+										VolumeSource: kubevirtcorev1.VolumeSource{
+											PersistentVolumeClaim: &kubevirtcorev1.PersistentVolumeClaimVolumeSource{
+												PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+													ClaimName: "missing-pvc",
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "source-pvc", Namespace: "test-ns"},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("15Gi"),
+						},
+					},
+				},
+			},
+			wantBytes: 15 * 1024 * 1024 * 1024,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.objects...).Build()
+			r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+			if got := r.getRawBackupSize(context.Background(), logr.Discard(), tt.du, "test-ns"); got != tt.wantBytes {
+				t.Errorf("getRawBackupSize() = %d, want %d", got, tt.wantBytes)
+			}
+		})
+	}
 }

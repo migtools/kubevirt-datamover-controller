@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -2403,182 +2404,6 @@ func TestArchiveKubeResources(t *testing.T) {
 	}
 }
 
-func TestCleanupKubeResources(t *testing.T) {
-	scheme := getTestScheme()
-
-	apiGroup := "kubevirt.io"
-	backupAPIGroup := "backup.kubevirt.io"
-
-	tests := []struct {
-		name    string
-		config  *UploaderConfig
-		objects []client.Object
-	}{
-		{
-			name: "deletes VMB but preserves VMBT on cluster",
-			config: &UploaderConfig{
-				VMName:      "test-vm",
-				VMNamespace: "test-ns",
-				VMBName:     "vmb-test",
-				VMBTName:    "vmbt-test-vm",
-			},
-			objects: []client.Object{
-				&kubevirtbackupv1alpha1.VirtualMachineBackup{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "vmb-test",
-						Namespace: "test-ns",
-					},
-					Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
-						Source: corev1.TypedLocalObjectReference{
-							APIGroup: &backupAPIGroup,
-							Kind:     "VirtualMachineBackupTracker",
-							Name:     "vmbt-test-vm",
-						},
-					},
-				},
-				&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "vmbt-test-vm",
-						Namespace: "test-ns",
-					},
-					Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
-						Source: corev1.TypedLocalObjectReference{
-							APIGroup: &apiGroup,
-							Kind:     "VirtualMachine",
-							Name:     "test-vm",
-						},
-					},
-				},
-			},
-		},
-		{
-			name: "handles already deleted VMB/VMBT gracefully",
-			config: &UploaderConfig{
-				VMName:      "test-vm",
-				VMNamespace: "test-ns",
-				VMBName:     "vmb-nonexistent",
-				VMBTName:    "vmbt-nonexistent",
-			},
-			objects: []client.Object{},
-		},
-		{
-			name: "handles empty names gracefully",
-			config: &UploaderConfig{
-				VMName:      "test-vm",
-				VMNamespace: "test-ns",
-				VMBName:     "",
-				VMBTName:    "",
-			},
-			objects: []client.Object{},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			fakeClient := fake.NewClientBuilder().
-				WithScheme(scheme).
-				WithObjects(tt.objects...).
-				Build()
-
-			// cleanupKubeResources is non-fatal (no error return)
-			cleanupKubeResources(context.Background(), fakeClient, tt.config, logr.Discard())
-
-			// Verify objects were deleted (for the first test case)
-			if tt.config.VMBName != "" && len(tt.objects) > 0 {
-				vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
-				getErr := fakeClient.Get(context.Background(), client.ObjectKey{
-					Name: tt.config.VMBName, Namespace: tt.config.VMNamespace,
-				}, vmb)
-				if getErr == nil {
-					t.Error("VMB should have been deleted from cluster")
-				}
-			}
-			// VMBT should be preserved (issue #32: stop deleting VMBT between backups)
-			if tt.config.VMBTName != "" && len(tt.objects) > 0 {
-				vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
-				getErr := fakeClient.Get(context.Background(), client.ObjectKey{
-					Name: tt.config.VMBTName, Namespace: tt.config.VMNamespace,
-				}, vmbt)
-				if getErr != nil {
-					t.Errorf("VMBT should have been preserved on cluster, but was deleted: %v", getErr)
-				}
-			}
-		})
-	}
-}
-
-// =============================================================================
-// Issue #32 TDD tests: Stop deleting VMBT between backups
-// =============================================================================
-
-// TestCleanupKubeResources_PreservesVMBT verifies that cleanupKubeResources
-// deletes the VMB but preserves the VMBT on-cluster (issue #32).
-func TestCleanupKubeResources_PreservesVMBT(t *testing.T) {
-	scheme := getTestScheme()
-
-	apiGroup := "kubevirt.io"
-	backupAPIGroup := "backup.kubevirt.io"
-
-	config := &UploaderConfig{
-		VMName:      "test-vm",
-		VMNamespace: "test-ns",
-		VMBName:     "vmb-test",
-		VMBTName:    "vmbt-test-vm",
-	}
-
-	objects := []client.Object{
-		&kubevirtbackupv1alpha1.VirtualMachineBackup{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "vmb-test",
-				Namespace: "test-ns",
-			},
-			Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
-				Source: corev1.TypedLocalObjectReference{
-					APIGroup: &backupAPIGroup,
-					Kind:     "VirtualMachineBackupTracker",
-					Name:     "vmbt-test-vm",
-				},
-			},
-		},
-		&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "vmbt-test-vm",
-				Namespace: "test-ns",
-			},
-			Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
-				Source: corev1.TypedLocalObjectReference{
-					APIGroup: &apiGroup,
-					Kind:     "VirtualMachine",
-					Name:     "test-vm",
-				},
-			},
-		},
-	}
-
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(objects...).
-		Build()
-
-	cleanupKubeResources(context.Background(), fakeClient, config, logr.Discard())
-
-	// VMB should be deleted
-	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
-	if err := fakeClient.Get(context.Background(), client.ObjectKey{
-		Name: config.VMBName, Namespace: config.VMNamespace,
-	}, vmb); err == nil {
-		t.Error("VMB should have been deleted from cluster")
-	}
-
-	// VMBT should be PRESERVED (not deleted)
-	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
-	if err := fakeClient.Get(context.Background(), client.ObjectKey{
-		Name: config.VMBTName, Namespace: config.VMNamespace,
-	}, vmbt); err != nil {
-		t.Errorf("VMBT should have been preserved during cleanup, but it was deleted: %v", err)
-	}
-}
-
 func TestBuildCheckpointChain(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -2686,6 +2511,58 @@ func TestBuildCheckpointChain(t *testing.T) {
 				if chain[len(chain)-1].ID != tt.expectLast {
 					t.Errorf("last checkpoint = %q, want %q", chain[len(chain)-1].ID, tt.expectLast)
 				}
+			}
+		})
+	}
+}
+
+func TestUploadQcow2Files_TotalBytes(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "test.qcow2")
+	if err := os.WriteFile(filePath, []byte("dummy data"), 0644); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+
+	store := NewMockObjectStore("test-bucket", "")
+
+	tests := []struct {
+		name       string
+		backupType string
+		totalBytes int64
+		wantTotal  int64
+	}{
+		{
+			name:       "full backup overrides TotalBytes with qcow2 size",
+			backupType: BackupTypeFull,
+			totalBytes: 1000000, // Some large PVC capacity
+			wantTotal:  10,      // Size of "dummy data"
+		},
+		{
+			name:       "incremental backup preserves TotalBytes",
+			backupType: BackupTypeIncremental,
+			totalBytes: 1000000,
+			wantTotal:  1000000,
+		},
+		{
+			name:       "incremental backup falls back to qcow2 size if TotalBytes is 0",
+			backupType: BackupTypeIncremental,
+			totalBytes: 0,
+			wantTotal:  10,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &UploaderConfig{
+				SourcePVCPath: tmpDir, BackupType: tt.backupType, TotalBytes: tt.totalBytes,
+				ObjectStoreConfig: common.ObjectStoreConfig{BSLBucket: "test-bucket"},
+				VMNamespace:       "ns", VMName: "vm", CheckpointName: "cp",
+			}
+			if _, err := uploadQcow2Files(context.Background(), store, config, nil, logr.Discard()); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if config.TotalBytes != tt.wantTotal {
+				t.Errorf("TotalBytes = %d, want %d", config.TotalBytes, tt.wantTotal)
 			}
 		})
 	}
