@@ -33,13 +33,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	restcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
 const apiGroupKubeVirt = "kubevirt.io"
@@ -71,7 +68,7 @@ func Run(ctx context.Context, logger logr.Logger) error {
 	logger.Info("Object store initialized", "bucket", config.BSLBucket, "prefix", config.BSLPrefix)
 
 	// Create K8s client early for progress reporting
-	k8sClient, err := newKubeClient()
+	k8sClient, err := common.NewKubeClient()
 	if err != nil {
 		return fmt.Errorf("failed to create K8s client: %w", err)
 	}
@@ -706,33 +703,6 @@ func reconstructVMBT(cfg *UploaderConfig) *kubevirtbackupv1alpha1.VirtualMachine
 			},
 		},
 	}
-}
-
-// newKubeClient creates an in-cluster Kubernetes client with KubeVirt backup types registered.
-// Extracted as a variable to allow overriding in tests.
-var newKubeClient = func() (client.Client, error) {
-	scheme := runtime.NewScheme()
-	if err := clientgoscheme.AddToScheme(scheme); err != nil {
-		return nil, err
-	}
-	if err := kubevirtbackupv1alpha1.AddToScheme(scheme); err != nil {
-		return nil, fmt.Errorf("failed to register KubeVirt backup scheme: %w", err)
-	}
-	if err := kubevirtcorev1.AddToScheme(scheme); err != nil {
-		return nil, fmt.Errorf("failed to register KubeVirt scheme: %w", err)
-	}
-
-	restConfig, err := restcfg.GetConfig()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get in-cluster config: %w", err)
-	}
-
-	k8sClient, err := client.New(restConfig, client.Options{Scheme: scheme})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create K8s client: %w", err)
-	}
-
-	return k8sClient, nil
 }
 
 // propagateReferencedBy walks the parent chain of the given checkpoint and
