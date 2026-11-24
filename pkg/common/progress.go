@@ -41,6 +41,20 @@ func (pr *ProgressReader) report(force bool) {
 	}
 }
 
+// Seek implements io.Seeker so AWS transfermanager can determine the file size
+// to calculate part sizes for large uploads (>78GiB).
+func (pr *ProgressReader) Seek(offset int64, whence int) (int64, error) {
+	seeker, ok := pr.Reader.(io.Seeker)
+	if !ok {
+		return 0, fmt.Errorf("underlying reader does not implement io.Seeker")
+	}
+	newOffset, err := seeker.Seek(offset, whence)
+	if err == nil {
+		pr.BytesRead = newOffset
+	}
+	return newOffset, err
+}
+
 // PatchPodProgress updates the datamover pod with progress annotations.
 func PatchPodProgress(
 	ctx context.Context, k8sClient client.Client, name, namespace string,
