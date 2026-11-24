@@ -1376,17 +1376,26 @@ func (r *KubeVirtDataUploadReconciler) syncProgressFromPod(ctx context.Context, 
 	if pod.Annotations == nil {
 		return
 	}
-	totalStr := pod.Annotations["kubevirt-datamover.io/total-bytes"]
-	incStr := pod.Annotations["kubevirt-datamover.io/incremental-bytes"]
-	doneStr := pod.Annotations["kubevirt-datamover.io/bytes-done"]
+	totalStr := pod.Annotations[common.AnnotationProgressTotalBytes]
+	incStr := pod.Annotations[common.AnnotationProgressIncrementalBytes]
+	doneStr := pod.Annotations[common.AnnotationProgressBytesDone]
 
 	if totalStr != "" && doneStr != "" {
-		total, _ := strconv.ParseInt(totalStr, 10, 64)
-		done, _ := strconv.ParseInt(doneStr, 10, 64)
+		total, err := strconv.ParseInt(totalStr, 10, 64)
+		if err != nil {
+			logger.V(1).Info("Failed to parse total bytes", "value", totalStr, "error", err)
+		}
+		done, err := strconv.ParseInt(doneStr, 10, 64)
+		if err != nil {
+			logger.V(1).Info("Failed to parse bytes done", "value", doneStr, "error", err)
+		}
 
 		var inc int64
 		if incStr != "" {
-			inc, _ = strconv.ParseInt(incStr, 10, 64)
+			inc, err = strconv.ParseInt(incStr, 10, 64)
+			if err != nil {
+				logger.V(1).Info("Failed to parse incremental bytes", "value", incStr, "error", err)
+			}
 		} else {
 			inc = total
 		}

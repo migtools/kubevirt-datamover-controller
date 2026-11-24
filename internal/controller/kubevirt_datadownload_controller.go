@@ -1576,12 +1576,18 @@ func (r *KubeVirtDataDownloadReconciler) syncProgressFromPod(ctx context.Context
 	if pod.Annotations == nil {
 		return
 	}
-	totalStr := pod.Annotations["kubevirt-datamover.io/total-bytes"]
-	doneStr := pod.Annotations["kubevirt-datamover.io/bytes-done"]
+	totalStr := pod.Annotations[common.AnnotationProgressTotalBytes]
+	doneStr := pod.Annotations[common.AnnotationProgressBytesDone]
 
 	if totalStr != "" && doneStr != "" {
-		total, _ := strconv.ParseInt(totalStr, 10, 64)
-		done, _ := strconv.ParseInt(doneStr, 10, 64)
+		total, err := strconv.ParseInt(totalStr, 10, 64)
+		if err != nil {
+			logger.V(1).Info("Failed to parse total bytes", "value", totalStr, "error", err)
+		}
+		done, err := strconv.ParseInt(doneStr, 10, 64)
+		if err != nil {
+			logger.V(1).Info("Failed to parse bytes done", "value", doneStr, "error", err)
+		}
 
 		if dd.Status.Progress.TotalBytes != total || dd.Status.Progress.BytesDone != done {
 			patch := client.MergeFrom(dd.DeepCopy())
@@ -1603,7 +1609,7 @@ func (r *KubeVirtDataDownloadReconciler) handleInProgress(ctx context.Context, l
 
 	// Idempotent resume: if a prior reconcile already completed the rebind (scratch
 	// PVC deleted, target PVC bound to the rebound PV) but failed to persist the
-	// Completed phase afterward -- e.g. a transient API error on updatePhase -- the
+	// Completed phase update afterward -- e.g. a transient API error on updatePhase -- the
 	// scratch PVC and possibly the pod are already gone, and re-attempting the
 	// rebind would fail. Detect this by checking whether the target PVC is already
 	// bound to a PV carrying this DataDownload's UID label, and finish idempotently
