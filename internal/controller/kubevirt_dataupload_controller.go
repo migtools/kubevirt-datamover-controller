@@ -1224,16 +1224,6 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 		return ctrl.Result{}, nil
 	}
 
-	// Ensure the rebound PVC exists before proceeding
-	if err := r.Get(ctx, types.NamespacedName{Name: reboundPVCName, Namespace: podNamespace}, reboundPVC); err != nil {
-		err := fmt.Errorf("failed to get rebound PVC %s: %w", reboundPVCName, err)
-		logger.Error(err, "Rebound PVC not found")
-		if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, err.Error()); updateErr != nil {
-			return ctrl.Result{}, updateErr
-		}
-		return ctrl.Result{}, nil
-	}
-
 	rawSize := r.getRawBackupSize(ctx, logger, du, vmRef.Namespace)
 
 	// Build datamover pod config - now using OADP namespace and rebound PVC
