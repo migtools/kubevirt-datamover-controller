@@ -2556,7 +2556,7 @@ func TestUploadQcow2Files_TotalBytes(t *testing.T) {
 			config := &UploaderConfig{
 				SourcePVCPath: tmpDir, BackupType: tt.backupType, TotalBytes: tt.totalBytes,
 				ObjectStoreConfig: common.ObjectStoreConfig{BSLBucket: "test-bucket"},
-				VMNamespace: "ns", VMName: "vm", CheckpointName: "cp",
+				VMNamespace:       "ns", VMName: "vm", CheckpointName: "cp",
 			}
 			if _, err := uploadQcow2Files(context.Background(), store, config, nil, logr.Discard()); err != nil {
 				t.Fatalf("unexpected error: %v", err)

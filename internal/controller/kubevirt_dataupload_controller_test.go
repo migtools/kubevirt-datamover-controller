@@ -2868,6 +2868,41 @@ func TestHandleInProgress_PodSucceeded(t *testing.T) {
 	}
 }
 
+func TestHandleInProgressDataUpload_SyncsProgress(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-du", Namespace: "openshift-adp", UID: types.UID("test-uid")},
+		Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+		Status:     velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseInProgress},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: common.DatamoverPodNamePrefix + du.Name, Namespace: "openshift-adp",
+			Labels: map[string]string{common.LabelDataUploadUID: string(du.UID)},
+			Annotations: map[string]string{
+				common.AnnotationProgressTotalBytes:       "2048",
+				common.AnnotationProgressIncrementalBytes: "512",
+				common.AnnotationProgressBytesDone:        "1024",
+			},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du, pod).Build()
+	r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+	if _, err := r.handleInProgress(context.Background(), logr.Discard(), du); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var updated velerov2alpha1.DataUpload
+	_ = fakeClient.Get(context.Background(), types.NamespacedName{Name: du.Name, Namespace: du.Namespace}, &updated)
+	if updated.Status.Progress.TotalBytes != 2048 || updated.Status.IncrementalBytes != 512 || updated.Status.Progress.BytesDone != 1024 {
+		t.Errorf("progress mismatch: got total=%d inc=%d done=%d", updated.Status.Progress.TotalBytes, updated.Status.IncrementalBytes, updated.Status.Progress.BytesDone)
+	}
+}
+
 // TestHandleInProgress_PodSucceeded_CleansUpVMBButPreservesVMBT verifies that
 // when a DataUpload completes successfully, the controller deletes the VMB
 // but preserves the VMBT on-cluster (issue #32 regression test).
@@ -4123,22 +4158,7 @@ func TestHandlePrepared(t *testing.T) {
 					},
 				}
 
-				tempPVC := &corev1.PersistentVolumeClaim{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      tempPVCName,
-						Namespace: "vm-ns",
-						Labels: map[string]string{
-							common.LabelDataUploadUID: "du-uid-123",
-						},
-					},
-					Spec: corev1.PersistentVolumeClaimSpec{
-						Resources: corev1.VolumeResourceRequirements{
-							Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
-						},
-					},
-				}
-
-				return []runtime.Object{bsl, vmb, reboundPVC, tempPVC}
+				return []runtime.Object{bsl, vmb, reboundPVC}
 			},
 			expectError:   false,
 			expectedPhase: velerov2alpha1.DataUploadPhaseInProgress,
@@ -4522,23 +4542,8 @@ func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
 			Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
 		}
 
-		tempPVC := &corev1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      tempPVCName,
-				Namespace: "vm-ns",
-				Labels: map[string]string{
-					common.LabelDataUploadUID: "du-uid-123",
-				},
-			},
-			Spec: corev1.PersistentVolumeClaimSpec{
-				Resources: corev1.VolumeResourceRequirements{
-					Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
-				},
-			},
-		}
-
-		objs := make([]runtime.Object, 0, 4+otherActiveCount)
-		objs = append(objs, bsl, vmb, reboundPVC, tempPVC)
+		objs := make([]runtime.Object, 0, 3+otherActiveCount)
+		objs = append(objs, bsl, vmb, reboundPVC)
 		for i := range otherActiveCount {
 			other := &velerov2alpha1.DataUpload{
 				ObjectMeta: metav1.ObjectMeta{
@@ -4740,22 +4745,8 @@ func TestHandlePreparedDataUpload_ConcurrentDeadlockRegression(t *testing.T) {
 			},
 			Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
 		}
-		tempPVC := &corev1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      tempPVCName,
-				Namespace: "vm-ns",
-				Labels: map[string]string{
-					common.LabelDataUploadUID: string(du.UID),
-				},
-			},
-			Spec: corev1.PersistentVolumeClaimSpec{
-				Resources: corev1.VolumeResourceRequirements{
-					Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
-				},
-			},
-		}
 		dus[i] = du
-		objs = append(objs, du, vmb, reboundPVC, tempPVC)
+		objs = append(objs, du, vmb, reboundPVC)
 	}
 
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
@@ -10098,4 +10089,140 @@ func (v *vmbIncludedVolumesReader) Get(ctx context.Context, key client.ObjectKey
 		return unstructured.SetNestedSlice(u.Object, volumes, "status", "includedVolumes")
 	}
 	return v.Reader.Get(ctx, key, obj, opts...)
+}
+
+func TestGetRawBackupSize(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = kubevirtcorev1.AddToScheme(scheme)
+
+	tests := []struct {
+		name      string
+		du        *velerov2alpha1.DataUpload
+		objects   []client.Object
+		wantBytes int64
+	}{
+		{
+			name: "multi-PVC sum",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					Annotations: map[string]string{
+						common.AnnotationVMName:      "test-vm",
+						common.AnnotationVMNamespace: "test-ns",
+					},
+				},
+			},
+			objects: []client.Object{
+				&kubevirtcorev1.VirtualMachine{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-vm", Namespace: "test-ns"},
+					Spec: kubevirtcorev1.VirtualMachineSpec{
+						Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+							Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+								Volumes: []kubevirtcorev1.Volume{
+									{
+										Name: "vol1",
+										VolumeSource: kubevirtcorev1.VolumeSource{
+											PersistentVolumeClaim: &kubevirtcorev1.PersistentVolumeClaimVolumeSource{
+												PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+													ClaimName: "pvc1",
+												},
+											},
+										},
+									},
+									{
+										Name: "vol2",
+										VolumeSource: kubevirtcorev1.VolumeSource{
+											PersistentVolumeClaim: &kubevirtcorev1.PersistentVolumeClaimVolumeSource{
+												PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+													ClaimName: "pvc2",
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "pvc1", Namespace: "test-ns"},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("10Gi"),
+						},
+					},
+				},
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "pvc2", Namespace: "test-ns"},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("20Gi"),
+						},
+					},
+				},
+			},
+			wantBytes: 30 * 1024 * 1024 * 1024,
+		},
+		{
+			name: "not-found path falls back to source PVC",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					Annotations: map[string]string{
+						common.AnnotationVMName:      "test-vm",
+						common.AnnotationVMNamespace: "test-ns",
+					},
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					SourcePVC:       "source-pvc",
+					SourceNamespace: "test-ns",
+				},
+			},
+			objects: []client.Object{
+				&kubevirtcorev1.VirtualMachine{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-vm", Namespace: "test-ns"},
+					Spec: kubevirtcorev1.VirtualMachineSpec{
+						Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+							Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+								Volumes: []kubevirtcorev1.Volume{
+									{
+										Name: "vol1",
+										VolumeSource: kubevirtcorev1.VolumeSource{
+											PersistentVolumeClaim: &kubevirtcorev1.PersistentVolumeClaimVolumeSource{
+												PersistentVolumeClaimVolumeSource: corev1.PersistentVolumeClaimVolumeSource{
+													ClaimName: "missing-pvc",
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				&corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: "source-pvc", Namespace: "test-ns"},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Capacity: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("15Gi"),
+						},
+					},
+				},
+			},
+			wantBytes: 15 * 1024 * 1024 * 1024,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.objects...).Build()
+			r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
+			if got := r.getRawBackupSize(context.Background(), logr.Discard(), tt.du, "test-ns"); got != tt.wantBytes {
+				t.Errorf("getRawBackupSize() = %d, want %d", got, tt.wantBytes)
+			}
+		})
+	}
 }
