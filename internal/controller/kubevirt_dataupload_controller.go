@@ -640,7 +640,7 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 // conditionComplete is KubeVirt nightly (v1.20.0+) virt-controller's renamed
 // replacement for VirtualMachineBackup's "Done" condition type. Our vendored
 // kubevirt.io/api (v1.8.0-alpha.0) predates the rename and has no
-// ConditionComplete constant of its own, so it's declared here as the raw
+// ConditionComplete constant of its own, so it is declared here as the raw
 // string literal virt-controller actually emits. Without recognizing both
 // names, evaluateVMBackupStatus/isVMBTerminal never see doneCond populated
 // against a nightly cluster and loop "VirtualMachineBackup in progress,
@@ -1224,8 +1224,20 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 		return ctrl.Result{}, nil
 	}
 
+	// Ensure the rebound PVC exists before proceeding
+	if err := r.Get(ctx, types.NamespacedName{Name: reboundPVCName, Namespace: podNamespace}, reboundPVC); err != nil {
+		err := fmt.Errorf("failed to get rebound PVC %s: %w", reboundPVCName, err)
+		logger.Error(err, "Rebound PVC not found")
+		if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, err.Error()); updateErr != nil {
+			return ctrl.Result{}, updateErr
+		}
+		return ctrl.Result{}, nil
+	}
+
+	rawSize := r.getRawBackupSize(ctx, du, vmRef.Namespace)
+
 	// Build datamover pod config - now using OADP namespace and rebound PVC
-	podConfig, err := r.buildDatamoverPodConfig(du, bsl, vmb, vmRef, backupType, expectedBackupType, checkpointName, vmbtName)
+	podConfig, err := r.buildDatamoverPodConfig(du, bsl, vmb, vmRef, backupType, expectedBackupType, checkpointName, vmbtName, rawSize)
 	if err != nil {
 		logger.Error(err, "Failed to build datamover pod config")
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Failed to build pod config: %v", err)); err != nil {
@@ -1291,6 +1303,12 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 			if !r.cleanupDatamoverResources(ctx, logger, du, podNamespace) {
 				return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 			}
+
+			vmRef, _ := common.GetVMReference(du)
+			if vmRef != nil {
+				r.cleanupVMBackupResources(ctx, logger, du, vmRef.Namespace)
+			}
+
 			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseCompleted, "Data upload completed"); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -1309,6 +1327,8 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 	case corev1.PodSucceeded:
 		logger.Info("Datamover pod completed successfully", "pod", pod.Name)
 
+		r.syncProgressFromPod(ctx, logger, du, pod)
+
 		if du.Annotations[common.AnnotationDatamoverPodSucceeded] != bslValidatedValue {
 			r.emitPodLogs(ctx, logger, pod)
 			if err := r.markDatamoverPodSucceeded(ctx, du); err != nil {
@@ -1323,6 +1343,11 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 			return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 		}
 
+		vmRef, _ := common.GetVMReference(du)
+		if vmRef != nil {
+			r.cleanupVMBackupResources(ctx, logger, du, vmRef.Namespace)
+		}
+
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseCompleted, "Data upload completed"); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1331,6 +1356,8 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 	case corev1.PodFailed:
 		failureMessage := extractPodFailureMessage(pod)
 		logger.Error(nil, "Datamover pod failed", "pod", pod.Name, "message", failureMessage)
+
+		r.syncProgressFromPod(ctx, logger, du, pod)
 
 		r.emitPodLogs(ctx, logger, pod)
 
@@ -1343,12 +1370,46 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 		return ctrl.Result{}, nil
 
 	case corev1.PodPending, corev1.PodRunning:
+		r.syncProgressFromPod(ctx, logger, du, pod)
+
 		logger.V(1).Info("Datamover pod still running", "pod", pod.Name, "phase", pod.Status.Phase)
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 
 	default:
 		logger.Info("Datamover pod in unknown phase", "pod", pod.Name, "phase", pod.Status.Phase)
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+	}
+}
+
+// syncProgressFromPod reads progress annotations from the datamover pod and updates the DataUpload CR.
+func (r *KubeVirtDataUploadReconciler) syncProgressFromPod(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, pod *corev1.Pod) {
+	if pod.Annotations == nil {
+		return
+	}
+	totalStr := pod.Annotations["kubevirt-datamover.io/total-bytes"]
+	incStr := pod.Annotations["kubevirt-datamover.io/incremental-bytes"]
+	doneStr := pod.Annotations["kubevirt-datamover.io/bytes-done"]
+
+	if totalStr != "" && doneStr != "" {
+		total, _ := strconv.ParseInt(totalStr, 10, 64)
+		done, _ := strconv.ParseInt(doneStr, 10, 64)
+
+		var inc int64
+		if incStr != "" {
+			inc, _ = strconv.ParseInt(incStr, 10, 64)
+		} else {
+			inc = total
+		}
+
+		if du.Status.Progress.TotalBytes != total || du.Status.Progress.BytesDone != done || du.Status.IncrementalBytes != inc {
+			patch := client.MergeFrom(du.DeepCopy())
+			du.Status.Progress.TotalBytes = total
+			du.Status.Progress.BytesDone = done
+			du.Status.IncrementalBytes = inc
+			if err := r.Patch(ctx, du, patch); err != nil {
+				logger.Error(err, "Failed to patch DataUpload progress")
+			}
+		}
 	}
 }
 
@@ -2254,6 +2315,7 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 	expectedBackupType string,
 	checkpointName string,
 	vmbtName string,
+	rawSize int64,
 ) (*DatamoverPodConfig, error) {
 	cfg, err := uploader.ExtractBSLConfig(bsl)
 	if err != nil {
@@ -2324,6 +2386,7 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		VMBName:                        vmb.Name,
 		VMBTName:                       vmbtName,
 		SourcePVCName:                  "", // overridden by handlePrepared with the rebound PVC name
+		TotalBytes:                     rawSize,
 		Labels:                         make(map[string]string),
 	}, nil
 }
@@ -2362,4 +2425,51 @@ func (r *KubeVirtDataUploadReconciler) lookupCheckpointFromBSL(ctx context.Conte
 // findPodForDataUpload finds the unique datamover pod associated with a DataUpload.
 func (r *KubeVirtDataUploadReconciler) findPodForDataUpload(ctx context.Context, du *velerov2alpha1.DataUpload, namespace string) (*corev1.Pod, error) {
 	return findPodByUID(ctx, r.Client, r.APIReader, common.LabelDataUploadUID, string(du.UID), namespace)
+}
+
+// getRawBackupSize determines the raw capacity of the source PVCs without any overhead.
+func (r *KubeVirtDataUploadReconciler) getRawBackupSize(ctx context.Context, du *velerov2alpha1.DataUpload, namespace string) int64 {
+	sourceNamespace := du.Spec.SourceNamespace
+	if sourceNamespace == "" {
+		sourceNamespace = namespace
+	}
+
+	vmRef, err := common.GetVMReference(du)
+	if err == nil {
+		vm := &kubevirtcorev1.VirtualMachine{}
+		if err := r.Get(ctx, types.NamespacedName{Name: vmRef.Name, Namespace: vmRef.Namespace}, vm); err == nil {
+			pvcNames := common.GetVolumesForVm(vm)
+			if len(pvcNames) > 0 {
+				totalCapacity := resource.Quantity{}
+				for _, pvcName := range pvcNames {
+					pvc := &corev1.PersistentVolumeClaim{}
+					if err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: vmRef.Namespace}, pvc); err == nil {
+						if capacity, ok := pvc.Status.Capacity[corev1.ResourceStorage]; ok {
+							totalCapacity.Add(capacity)
+						} else if req, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; ok {
+							totalCapacity.Add(req)
+						}
+					}
+				}
+				if !totalCapacity.IsZero() {
+					return totalCapacity.Value()
+				}
+			}
+		}
+	}
+
+	sourcePVCName := du.Spec.SourcePVC
+	if sourcePVCName != "" {
+		sourcePVC := &corev1.PersistentVolumeClaim{}
+		if err := r.Get(ctx, types.NamespacedName{Name: sourcePVCName, Namespace: sourceNamespace}, sourcePVC); err == nil {
+			if capacity, ok := sourcePVC.Status.Capacity[corev1.ResourceStorage]; ok {
+				return capacity.Value()
+			} else if req, ok := sourcePVC.Spec.Resources.Requests[corev1.ResourceStorage]; ok {
+				return req.Value()
+			}
+		}
+	}
+
+	defaultSize := resource.MustParse(DefaultTempPVCSize)
+	return defaultSize.Value()
 }

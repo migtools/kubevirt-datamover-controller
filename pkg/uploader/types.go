@@ -101,6 +101,7 @@ const (
 	EnvDataUploadUID      = "KUBEVIRT_DM_DATAUPLOAD_UID"
 	EnvVMBName            = "KUBEVIRT_DM_VMB_NAME"
 	EnvVMBTName           = "KUBEVIRT_DM_VMBT_NAME"
+	EnvTotalBytes         = "KUBEVIRT_DM_TOTAL_BYTES"
 )
 
 // Default paths and values
@@ -120,6 +121,10 @@ type UploaderConfig struct {
 	// with DownloaderConfig so object-store init code isn't duplicated.
 	common.ObjectStoreConfig
 
+	// Pod context (used for progress reporting)
+	PodName      string
+	PodNamespace string
+
 	// VM context
 	VMName      string
 	VMNamespace string
@@ -137,6 +142,9 @@ type UploaderConfig struct {
 	DataUploadUID      string
 	VMBName            string
 	VMBTName           string
+
+	// TotalBytes is the total capacity of the source PVCs
+	TotalBytes int64
 
 	// Source PVC mount path
 	SourcePVCPath string
