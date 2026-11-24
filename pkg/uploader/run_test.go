@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -2510,6 +2511,58 @@ func TestBuildCheckpointChain(t *testing.T) {
 				if chain[len(chain)-1].ID != tt.expectLast {
 					t.Errorf("last checkpoint = %q, want %q", chain[len(chain)-1].ID, tt.expectLast)
 				}
+			}
+		})
+	}
+}
+
+func TestUploadQcow2Files_TotalBytes(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "test.qcow2")
+	if err := os.WriteFile(filePath, []byte("dummy data"), 0644); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+
+	store := NewMockObjectStore("test-bucket", "")
+
+	tests := []struct {
+		name       string
+		backupType string
+		totalBytes int64
+		wantTotal  int64
+	}{
+		{
+			name:       "full backup overrides TotalBytes with qcow2 size",
+			backupType: BackupTypeFull,
+			totalBytes: 1000000, // Some large PVC capacity
+			wantTotal:  10,      // Size of "dummy data"
+		},
+		{
+			name:       "incremental backup preserves TotalBytes",
+			backupType: BackupTypeIncremental,
+			totalBytes: 1000000,
+			wantTotal:  1000000,
+		},
+		{
+			name:       "incremental backup falls back to qcow2 size if TotalBytes is 0",
+			backupType: BackupTypeIncremental,
+			totalBytes: 0,
+			wantTotal:  10,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &UploaderConfig{
+				SourcePVCPath: tmpDir, BackupType: tt.backupType, TotalBytes: tt.totalBytes,
+				ObjectStoreConfig: common.ObjectStoreConfig{BSLBucket: "test-bucket"},
+				VMNamespace: "ns", VMName: "vm", CheckpointName: "cp",
+			}
+			if _, err := uploadQcow2Files(context.Background(), store, config, nil, logr.Discard()); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if config.TotalBytes != tt.wantTotal {
+				t.Errorf("TotalBytes = %d, want %d", config.TotalBytes, tt.wantTotal)
 			}
 		})
 	}
