@@ -449,7 +449,9 @@ func TestReconcile_OperationTimeout(t *testing.T) {
 			Spec:   velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
 			Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseAccepted},
 		}
-		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).Build()
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).
+			WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
+			Build()
 		r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
 
 		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: du.Name, Namespace: du.Namespace}}); err != nil {
@@ -1172,6 +1174,7 @@ func TestHandleAccepted(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(du).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -1269,6 +1272,7 @@ func TestHandleAccepted_RetriesVMBCreationAfterAnnotationPersisted(t *testing.T)
 	baseClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(du, tempPVC, vmbt).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	// Simulates KubeVirt's admission webhook rejecting a second active VMB for
@@ -1448,8 +1452,10 @@ func TestHandleAccepted_RefreshesVMBStatusFromLiveRead(t *testing.T) {
 		},
 	}
 
-	cachedClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du, tempPVC, vmbt, staleVMB).Build()
-	liveClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du, tempPVC, vmbt, liveVMB).Build()
+	cachedClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du, tempPVC, vmbt, staleVMB).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).Build()
+	liveClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du, tempPVC, vmbt, liveVMB).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).Build()
 
 	r := &KubeVirtDataUploadReconciler{
 		Client:        cachedClient,
@@ -1846,6 +1852,7 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 			fakeClient := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithObjects(objects...).
+				WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 				Build()
 
 			r := &KubeVirtDataUploadReconciler{
@@ -2145,6 +2152,7 @@ func TestHasOlderActiveDUForVM(t *testing.T) {
 			fakeClient := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithObjects(objs...).
+				WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 				Build()
 
 			r := &KubeVirtDataUploadReconciler{
@@ -2253,6 +2261,7 @@ func TestHasOlderActiveDUForVM_Staleness(t *testing.T) {
 			fakeClient := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithObjects(objs...).
+				WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 				Build()
 
 			r := &KubeVirtDataUploadReconciler{
@@ -2337,6 +2346,7 @@ func TestHandleAccepted_RequeuesWhenOlderDUActive(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(du1, du2).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -2453,6 +2463,7 @@ func TestHandleAccepted_ProceedsWhenOlderDUCompleted(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(du1, du2, bsl, tempPVC, vmbt1).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -4172,7 +4183,8 @@ func TestHandlePrepared(t *testing.T) {
 				}
 			}
 
-			fakeClient := builder.Build()
+			fakeClient := builder.
+				WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadActivePhase, dataUploadActivePhaseIndexFunc).Build()
 
 			r := &KubeVirtDataUploadReconciler{
 				Client:         fakeClient,
@@ -4322,7 +4334,9 @@ func TestCountHigherPriorityActiveDataUploads(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			objs := append([]client.Object{self}, tt.otherDUs...)
-			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).
+				WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadActivePhase, dataUploadActivePhaseIndexFunc).
+				Build()
 			r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard()}
 
 			count, err := r.countHigherPriorityActiveDataUploads(context.Background(), self)
@@ -4441,7 +4455,8 @@ func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
 
 	t.Run("proceeds when under the limit", func(t *testing.T) {
 		du, objs := newFixtureWithOthers(2)
-		builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du)
+		builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).
+			WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadActivePhase, dataUploadActivePhaseIndexFunc)
 		for _, obj := range objs {
 			builder = builder.WithRuntimeObjects(obj)
 		}
@@ -4465,7 +4480,8 @@ func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
 
 	t.Run("requeues without creating a pod when at the limit", func(t *testing.T) {
 		du, objs := newFixtureWithOthers(3)
-		builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du)
+		builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).
+			WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadActivePhase, dataUploadActivePhaseIndexFunc)
 		for _, obj := range objs {
 			builder = builder.WithRuntimeObjects(obj)
 		}
@@ -4510,7 +4526,8 @@ func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
 
 	t.Run("unlimited (MaxConcurrentDataMovers=0) always proceeds", func(t *testing.T) {
 		du, objs := newFixtureWithOthers(50)
-		builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du)
+		builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).
+			WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadActivePhase, dataUploadActivePhaseIndexFunc)
 		for _, obj := range objs {
 			builder = builder.WithRuntimeObjects(obj)
 		}
@@ -4630,7 +4647,9 @@ func TestHandlePreparedDataUpload_ConcurrentDeadlockRegression(t *testing.T) {
 		objs = append(objs, du, vmb, reboundPVC)
 	}
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadActivePhase, dataUploadActivePhaseIndexFunc).
+		Build()
 	r := &KubeVirtDataUploadReconciler{
 		Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: oadpNS,
 		APIReader:      withVMBIncludedVolumeTypes(fakeClient, "Full"),
@@ -4933,6 +4952,7 @@ func TestHandleAccepted_WithBSLCheckpointLookup(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(du, bsl, pvc, vmbt, vmb).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -5066,6 +5086,7 @@ func TestHandleAccepted_NoBSLConfigured(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(du, pvc, vmbt, vmb).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -5135,6 +5156,7 @@ func TestHandleAccepted_BSLNotFound_FailsDataUpload(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(du).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -5233,6 +5255,7 @@ func TestHandleAccepted_BSLUnavailable_FailsDataUpload(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(du, bsl).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -5318,6 +5341,7 @@ func TestHandleAccepted_BSLNotAccessible_FailsDataUpload(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(du).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -5387,7 +5411,8 @@ func TestHandleAccepted_BSLTransientError_RequeuesWithoutFailing(t *testing.T) {
 		Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseAccepted},
 	}
 
-	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).Build()
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).Build()
 	transientErr := fmt.Errorf("simulated transient API error")
 	interceptedClient := interceptor.NewClient(baseClient, interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
@@ -5622,6 +5647,7 @@ func TestHandleAccepted_HappyPath_IncrementalBackup(t *testing.T) {
 		WithScheme(scheme).
 		WithObjects(du, bsl, credSecret, pvc, vmbt, vmb).
 		WithStatusSubresource(&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	// Create a mock object store with an existing checkpoint index
@@ -5799,6 +5825,7 @@ func TestHandleAccepted_StaleCheckpointForcesFullBackup(t *testing.T) {
 		WithScheme(scheme).
 		WithObjects(du, bsl, credSecret, pvc, vmbt).
 		WithStatusSubresource(&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	// Mock object store with NO index.json (simulates deleted S3 data)
@@ -5964,6 +5991,7 @@ func TestHandleAccepted_ExpectedBackupTypePatchSurvivesConcurrentWrite(t *testin
 		WithScheme(scheme).
 		WithObjects(du, bsl, credSecret, pvc, vmbt).
 		WithStatusSubresource(&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	mockStore := uploader.NewMockObjectStore("test-bucket", "velero-kubevirt-datamover")
@@ -6136,6 +6164,7 @@ func TestHandleAccepted_SkipsBSLValidationWhenAnnotated(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(du, pvc, vmbt, vmb, bsl).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	// ObjectStoreFactory should NOT be called - BSL validation is skipped
@@ -6810,6 +6839,7 @@ func TestHandleAccepted_VMBConflictRequeuesGracefully(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(du, pvc, vmbt, bsl).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -6982,6 +7012,7 @@ func TestHandleAccepted_BSLAnnotationNotSetOnTransientFailure(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(du, bsl, pvc, vmbt, vmb).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -7115,6 +7146,7 @@ func TestHandleAccepted_ForceFullBackupAnnotation(t *testing.T) {
 		WithScheme(scheme).
 		WithObjects(du, pvc, vmbt, bsl).
 		WithStatusSubresource(&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	objectStoreFactoryCalled := false
@@ -7224,6 +7256,7 @@ func TestHandleAccepted_ForceFullBackupWithNoExistingCheckpoint(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(du, pvc, vmbt).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -7321,6 +7354,7 @@ func TestHandleAccepted_NoForceFullBackupByDefault(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(du, pvc, vmbt).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -7510,6 +7544,7 @@ func TestHandleAccepted_QuiesceDecision(t *testing.T) {
 			fakeClient := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithObjects(objs...).
+				WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 				Build()
 
 			r := &KubeVirtDataUploadReconciler{
@@ -7649,6 +7684,7 @@ func TestHandleAccepted_StaleCheckpointSetsForceFullOnVMB(t *testing.T) {
 		WithScheme(scheme).
 		WithObjects(du, bsl, credSecret, pvc, vmbt).
 		WithStatusSubresource(&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}).
+		WithIndex(&velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc).
 		Build()
 
 	// Mock object store with NO index.json (simulates deleted S3 data)

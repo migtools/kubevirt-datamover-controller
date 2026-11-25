@@ -72,6 +72,30 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
 
+		By("installing Velero CRDs from Go module cache")
+		// Download the velero module to ensure it's in the cache
+		cmd = exec.Command("go", "mod", "download", "github.com/vmware-tanzu/velero")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to download velero module")
+
+		// Find the module directory (replace directive handles openshift/velero redirection)
+		cmd = exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/vmware-tanzu/velero")
+		veleroDir, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to locate velero module directory")
+		veleroModDir := strings.TrimSpace(veleroDir)
+
+		// Apply DataUpload and DataDownload CRDs (v2alpha1)
+		cmd = exec.Command("kubectl", "apply", "-f",
+			filepath.Join(veleroModDir, "config", "crd", "v2alpha1", "bases"))
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to install Velero v2alpha1 CRDs")
+
+		// Apply BackupStorageLocation CRD (v1)
+		cmd = exec.Command("kubectl", "apply", "-f",
+			filepath.Join(veleroModDir, "config", "crd", "v1", "bases", "velero.io_backupstoragelocations.yaml"))
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to install Velero BackupStorageLocation CRD")
+
 		By("deploying the controller-manager")
 		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
 		_, err = utils.Run(cmd)

@@ -1541,8 +1541,97 @@ func (r *KubeVirtDataUploadReconciler) getPodNamespace(du *velerov2alpha1.DataUp
 	return du.Namespace
 }
 
-// SetupWithManager sets up the controller with the Manager
+// indexValueTrue is the sentinel value field indexers return to mark a match.
+// Used as both the indexed value and the MatchingFields lookup key so the two
+// can't drift apart. A package-level const rather than a bare "true" literal
+// keeps goconst happy across the several indexer functions that share it.
+const indexValueTrue = "true"
+
+// IndexFieldDataUploadActivePhase is the field index key for DataUploads in
+// an active phase (Accepted, Prepared, InProgress) with DataMover == kubevirt.
+// Used by countHigherPriorityActiveDataUploads to pre-filter List results
+// instead of iterating all DataUploads in the namespace.
+const IndexFieldDataUploadActivePhase = "index.kubevirt.dataupload.activePhase"
+
+// IndexFieldDataUploadNonTerminalPhase is the field index key for DataUploads
+// in a non-terminal phase ("", New, Accepted, Prepared, InProgress) with
+// DataMover == kubevirt. Used by hasOlderActiveDUForVM to pre-filter List
+// results. This broader set intentionally catches DUs that haven't been
+// reconciled yet (empty phase / New).
+const IndexFieldDataUploadNonTerminalPhase = "index.kubevirt.dataupload.nonTerminalPhase"
+
+// dataUploadActivePhaseIndexFunc is the indexer callback for
+// IndexFieldDataUploadActivePhase. Extracted as a named function so
+// SetupWithManager and tests can reference it.
+func dataUploadActivePhaseIndexFunc(obj client.Object) []string {
+	du, ok := obj.(*velerov2alpha1.DataUpload)
+	if !ok {
+		return nil
+	}
+	if du.Spec.DataMover != common.DataMoverKubeVirt {
+		return nil
+	}
+	switch du.Status.Phase {
+	case velerov2alpha1.DataUploadPhaseAccepted,
+		velerov2alpha1.DataUploadPhasePrepared,
+		velerov2alpha1.DataUploadPhaseInProgress:
+		return []string{indexValueTrue}
+	default:
+		return nil
+	}
+}
+
+// registerDataUploadActivePhaseIndex registers a field indexer on DataUpload
+// that returns "true" when Spec.DataMover == kubevirt AND Status.Phase is one
+// of Accepted, Prepared, or InProgress. Called from SetupWithManager.
+func registerDataUploadActivePhaseIndex(ctx context.Context, indexer client.FieldIndexer) error {
+	return indexer.IndexField(ctx, &velerov2alpha1.DataUpload{}, IndexFieldDataUploadActivePhase, dataUploadActivePhaseIndexFunc)
+}
+
+// dataUploadNonTerminalPhaseIndexFunc is the indexer callback for
+// IndexFieldDataUploadNonTerminalPhase. Extracted as a named function so
+// SetupWithManager and tests can reference it.
+func dataUploadNonTerminalPhaseIndexFunc(obj client.Object) []string {
+	du, ok := obj.(*velerov2alpha1.DataUpload)
+	if !ok {
+		return nil
+	}
+	if du.Spec.DataMover != common.DataMoverKubeVirt {
+		return nil
+	}
+	switch du.Status.Phase {
+	case "", velerov2alpha1.DataUploadPhaseNew,
+		velerov2alpha1.DataUploadPhaseAccepted,
+		velerov2alpha1.DataUploadPhasePrepared,
+		velerov2alpha1.DataUploadPhaseInProgress:
+		return []string{indexValueTrue}
+	default:
+		return nil
+	}
+}
+
+// registerDataUploadNonTerminalPhaseIndex registers a field indexer on
+// DataUpload that returns "true" when Spec.DataMover == kubevirt AND
+// Status.Phase is one of "", New, Accepted, Prepared, or InProgress. Called
+// from SetupWithManager.
+func registerDataUploadNonTerminalPhaseIndex(ctx context.Context, indexer client.FieldIndexer) error {
+	return indexer.IndexField(ctx, &velerov2alpha1.DataUpload{}, IndexFieldDataUploadNonTerminalPhase, dataUploadNonTerminalPhaseIndexFunc)
+}
+
+// SetupWithManager sets up the controller with the Manager.
+// IndexField registration is fail-fast: if the Velero CRDs are not installed,
+// the controller manager must not start, because the indexed List calls in
+// countHigherPriorityActiveDataUploads and hasOlderActiveDUForVM would fail.
 func (r *KubeVirtDataUploadReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	ctx := context.Background()
+
+	if err := registerDataUploadActivePhaseIndex(ctx, mgr.GetFieldIndexer()); err != nil {
+		return fmt.Errorf("failed to register DataUpload active-phase index: %w", err)
+	}
+	if err := registerDataUploadNonTerminalPhaseIndex(ctx, mgr.GetFieldIndexer()); err != nil {
+		return fmt.Errorf("failed to register DataUpload non-terminal-phase index: %w", err)
+	}
+
 	maxConcurrent := r.MaxConcurrentReconciles
 	if maxConcurrent <= 0 {
 		maxConcurrent = DefaultMaxConcurrentReconciles
@@ -2065,16 +2154,17 @@ func (r *KubeVirtDataUploadReconciler) hasOlderActiveDUForVM(ctx context.Context
 	}
 
 	duList := &velerov2alpha1.DataUploadList{}
-	if err := r.List(ctx, duList, client.InNamespace(du.Namespace)); err != nil {
+	listOpts := []client.ListOption{
+		client.InNamespace(du.Namespace),
+		client.MatchingFields{IndexFieldDataUploadNonTerminalPhase: indexValueTrue},
+	}
+	if err := r.List(ctx, duList, listOpts...); err != nil {
 		return false, "", fmt.Errorf("failed to list DataUploads: %w", err)
 	}
 
 	for i := range duList.Items {
 		other := &duList.Items[i]
 		if other.UID == du.UID {
-			continue
-		}
-		if other.Spec.DataMover != common.DataMoverKubeVirt {
 			continue
 		}
 
@@ -2088,16 +2178,6 @@ func (r *KubeVirtDataUploadReconciler) hasOlderActiveDUForVM(ctx context.Context
 			otherVMNs = other.Spec.SourceNamespace
 		}
 		if otherVMNs != vmNamespace {
-			continue
-		}
-
-		// Must be in an active (non-terminal) phase
-		switch other.Status.Phase {
-		case "", velerov2alpha1.DataUploadPhaseNew,
-			velerov2alpha1.DataUploadPhaseAccepted,
-			velerov2alpha1.DataUploadPhasePrepared,
-			velerov2alpha1.DataUploadPhaseInProgress:
-		default:
 			continue
 		}
 
@@ -2203,7 +2283,11 @@ func (r *KubeVirtDataUploadReconciler) checkConcurrentDataMoverLimit(ctx context
 // actually covers.
 func (r *KubeVirtDataUploadReconciler) countHigherPriorityActiveDataUploads(ctx context.Context, du *velerov2alpha1.DataUpload) (int, error) {
 	duList := &velerov2alpha1.DataUploadList{}
-	if err := r.List(ctx, duList, client.InNamespace(du.Namespace)); err != nil {
+	listOpts := []client.ListOption{
+		client.InNamespace(du.Namespace),
+		client.MatchingFields{IndexFieldDataUploadActivePhase: indexValueTrue},
+	}
+	if err := r.List(ctx, duList, listOpts...); err != nil {
 		return 0, fmt.Errorf("failed to list DataUploads: %w", err)
 	}
 
@@ -2211,16 +2295,6 @@ func (r *KubeVirtDataUploadReconciler) countHigherPriorityActiveDataUploads(ctx 
 	for i := range duList.Items {
 		other := &duList.Items[i]
 		if other.UID == du.UID {
-			continue
-		}
-		if other.Spec.DataMover != common.DataMoverKubeVirt {
-			continue
-		}
-		switch other.Status.Phase {
-		case velerov2alpha1.DataUploadPhaseAccepted,
-			velerov2alpha1.DataUploadPhasePrepared,
-			velerov2alpha1.DataUploadPhaseInProgress:
-		default:
 			continue
 		}
 		if outranksDataUpload(other, du) {
