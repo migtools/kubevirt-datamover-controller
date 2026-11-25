@@ -48,6 +48,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // ddScheme returns a scheme with only the types the DataDownload controller
@@ -2777,8 +2779,8 @@ func TestHandlePreparedDataDownload_ConcurrencyLimit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if result.RequeueAfter != RequeueAfterLong {
-			t.Errorf("RequeueAfter = %v, want %v", result.RequeueAfter, RequeueAfterLong)
+		if result.RequeueAfter != RequeueAfterGated {
+			t.Errorf("RequeueAfter = %v, want %v", result.RequeueAfter, RequeueAfterGated)
 		}
 
 		var updated velerov2alpha1.DataDownload
@@ -2795,13 +2797,16 @@ func TestHandlePreparedDataDownload_ConcurrencyLimit(t *testing.T) {
 			t.Error("expected no downloader pod to be created while gated")
 		}
 
-		// Deferring due to the concurrency limit is intentional throttling, not a
-		// stalled operation -- AcceptedTimestamp must advance by exactly the
-		// requeue interval so this wait doesn't consume Spec.OperationTimeout's
-		// budget (see the gate's defer branch in handlePrepared).
-		wantAdvanced := baseTime.Add(RequeueAfterLong)
-		if updated.Status.AcceptedTimestamp == nil || !updated.Status.AcceptedTimestamp.Time.Equal(wantAdvanced) {
-			t.Errorf("AcceptedTimestamp = %v, want %v (baseTime + RequeueAfterLong)", updated.Status.AcceptedTimestamp, wantAdvanced)
+		// First gated pass: AcceptedTimestamp should NOT advance yet -- the
+		// gated-since annotation is set to record when gating started, and the
+		// first interval's elapsed time will be credited on the next gated
+		// reconcile. This preserves pre-gate time (Accepted→Prepared phase
+		// duration) rather than resetting AcceptedTimestamp to now.
+		if updated.Status.AcceptedTimestamp == nil {
+			t.Fatal("AcceptedTimestamp is nil after gated reconcile")
+		}
+		if updated.Annotations[AnnotationGatedSince] == "" {
+			t.Error("expected gated-since annotation to be set on first gated pass")
 		}
 	})
 
@@ -3434,9 +3439,9 @@ func TestCompleteSuccessfulDownload_EmitsRetainedPVEvent(t *testing.T) {
 	}
 
 	select {
-	case event := <-recorder.Events:
-		if !strings.Contains(event, "PVLeftInRetainPolicy") {
-			t.Errorf("event = %q, want it to reference PVLeftInRetainPolicy", event)
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "PVLeftInRetainPolicy") {
+			t.Errorf("event = %q, want it to reference PVLeftInRetainPolicy", ev)
 		}
 	default:
 		t.Error("expected an Event to be recorded for the retained PV, got none")
@@ -4799,3 +4804,532 @@ func TestRestoreVMRunStateIfAllSiblingsCompleted(t *testing.T) {
 		}
 	})
 }
+
+// TestEnqueueWaitingOnSlotOpen_DataDownload verifies the handler.MapFunc that
+// fires when a DataDownload reaches a terminal phase. It must return
+// reconcile.Requests for all Prepared kubevirt DDs in the same namespace,
+// excluding the terminal DD itself and non-kubevirt DDs.
+func TestEnqueueWaitingOnSlotOpen_DataDownload(t *testing.T) {
+	scheme := ddScheme()
+
+	ns := "openshift-adp"
+
+	// The DD that just completed (triggering the handler)
+	completedDD := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{Name: "dd-completed", Namespace: ns, UID: "uid-completed"},
+		Spec:       velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+		Status:     velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCompleted},
+	}
+
+	// A Prepared kubevirt DD — should be enqueued
+	preparedDD := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{Name: "dd-prepared", Namespace: ns, UID: "uid-prepared"},
+		Spec:       velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+		Status:     velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhasePrepared},
+	}
+
+	// An InProgress kubevirt DD — should NOT be enqueued (not Prepared)
+	inProgressDD := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{Name: "dd-inprogress", Namespace: ns, UID: "uid-inprogress"},
+		Spec:       velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+		Status:     velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseInProgress},
+	}
+
+	// A Prepared non-kubevirt DD — should NOT be enqueued
+	nonKVPrepared := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{Name: "dd-velero-prepared", Namespace: ns, UID: "uid-velero"},
+		Spec:       velerov2alpha1.DataDownloadSpec{DataMover: "velero"},
+		Status:     velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhasePrepared},
+	}
+
+	// A Completed kubevirt DD — should NOT be enqueued (terminal, not Prepared)
+	otherCompleted := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{Name: "dd-other-completed", Namespace: ns, UID: "uid-other-completed"},
+		Spec:       velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+		Status:     velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCompleted},
+	}
+
+	// A second Prepared kubevirt DD — should also be enqueued
+	preparedDD2 := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{Name: "dd-prepared-2", Namespace: ns, UID: "uid-prepared-2"},
+		Spec:       velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+		Status:     velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhasePrepared},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(completedDD, preparedDD, inProgressDD, nonKVPrepared, otherCompleted, preparedDD2).
+		WithIndex(&velerov2alpha1.DataDownload{}, IndexFieldDataDownloadPreparedPhase, func(obj client.Object) []string {
+			dd, ok := obj.(*velerov2alpha1.DataDownload)
+			if !ok {
+				return nil
+			}
+			if dd.Spec.DataMover == common.DataMoverKubeVirt && dd.Status.Phase == velerov2alpha1.DataDownloadPhasePrepared {
+				return []string{"true"}
+			}
+			return nil
+		}).
+		Build()
+
+	r := &KubeVirtDataDownloadReconciler{
+		Client:                  fakeClient,
+		Scheme:                  scheme,
+		Log:                     logr.Discard(),
+		MaxConcurrentDataMovers: 3,
+	}
+
+	requests := r.enqueueWaitingOnSlotOpen(context.Background(), completedDD)
+
+	// Should return exactly 2 requests: dd-prepared and dd-prepared-2
+	if len(requests) != 2 {
+		t.Fatalf("expected 2 requests, got %d: %v", len(requests), requests)
+	}
+
+	names := map[string]bool{}
+	for _, req := range requests {
+		names[req.Name] = true
+	}
+
+	if !names["dd-prepared"] {
+		t.Error("expected dd-prepared to be enqueued")
+	}
+	if !names["dd-prepared-2"] {
+		t.Error("expected dd-prepared-2 to be enqueued")
+	}
+	if names["dd-inprogress"] {
+		t.Error("dd-inprogress should NOT be enqueued (not Prepared)")
+	}
+	if names["dd-velero-prepared"] {
+		t.Error("dd-velero-prepared should NOT be enqueued (non-kubevirt)")
+	}
+	if names["dd-completed"] {
+		t.Error("dd-completed should NOT be enqueued (it's the triggering DD)")
+	}
+
+	t.Run("returns nil when limit is disabled", func(t *testing.T) {
+		rUnlimited := &KubeVirtDataDownloadReconciler{
+			Client:                  fakeClient,
+			Scheme:                  scheme,
+			Log:                     logr.Discard(),
+			MaxConcurrentDataMovers: 0,
+		}
+		reqs := rUnlimited.enqueueWaitingOnSlotOpen(context.Background(), completedDD)
+		if reqs != nil {
+			t.Errorf("expected nil when limit disabled, got %v", reqs)
+		}
+	})
+
+	t.Run("returns nil for non-kubevirt datamover", func(t *testing.T) {
+		nonKVDD := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "dd-velero", Namespace: ns, UID: "uid-v"},
+			Spec:       velerov2alpha1.DataDownloadSpec{DataMover: "velero"},
+			Status:     velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCompleted},
+		}
+		reqs := r.enqueueWaitingOnSlotOpen(context.Background(), nonKVDD)
+		if reqs != nil {
+			t.Errorf("expected nil for non-kubevirt DD, got %v", reqs)
+		}
+	})
+
+	t.Run("returns nil for live active-phase DD (early return)", func(t *testing.T) {
+		// A live kubevirt DD in Prepared phase (active, not deleted) should
+		// return nil — it still occupies a slot.
+		preparedTrigger := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "dd-prepared-trigger", Namespace: ns, UID: "uid-pt"},
+			Spec:       velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+			Status:     velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhasePrepared},
+		}
+		reqs := r.enqueueWaitingOnSlotOpen(context.Background(), preparedTrigger)
+		if reqs != nil {
+			t.Errorf("expected nil for live active-phase DD, got %v", reqs)
+		}
+
+		// InProgress is also active
+		inProgressTrigger := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "dd-inprogress-trigger", Namespace: ns, UID: "uid-ipt"},
+			Spec:       velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+			Status:     velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseInProgress},
+		}
+		reqs = r.enqueueWaitingOnSlotOpen(context.Background(), inProgressTrigger)
+		if reqs != nil {
+			t.Errorf("expected nil for live active-phase DD, got %v", reqs)
+		}
+	})
+
+	t.Run("enqueues waiters on delete of active-phase DD", func(t *testing.T) {
+		// A deleted InProgress DD (DeletionTimestamp set) should wake waiters
+		// because the deletion frees a slot.
+		now := metav1.Now()
+		deletedInProgress := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "dd-deleted-inprogress", Namespace: ns, UID: "uid-del",
+				DeletionTimestamp: &now,
+				Finalizers:        []string{"test-finalizer"},
+			},
+			Spec:   velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseInProgress},
+		}
+		reqs := r.enqueueWaitingOnSlotOpen(context.Background(), deletedInProgress)
+		if len(reqs) != 2 {
+			t.Errorf("expected 2 requests for deleted InProgress DD, got %d: %v", len(reqs), reqs)
+		}
+	})
+
+	t.Run("enqueues waiters on Canceling transition", func(t *testing.T) {
+		// A DD that reached Canceling (non-active, slot freed) should wake waiters.
+		cancelingDD := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "dd-canceling-trigger", Namespace: ns, UID: "uid-cancel"},
+			Spec:       velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+			Status:     velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCanceling},
+		}
+		reqs := r.enqueueWaitingOnSlotOpen(context.Background(), cancelingDD)
+		if len(reqs) != 2 {
+			t.Errorf("expected 2 requests for Canceling DD, got %d: %v", len(reqs), reqs)
+		}
+	})
+}
+
+// TestSlotFreedPredicate_DataDownload verifies the broadened predicate that
+// gates the secondary Watch. It must pass Update events where old phase was
+// active and new is not active, and Delete events where deleted phase was active.
+func TestSlotFreedPredicate_DataDownload(t *testing.T) {
+	r := &KubeVirtDataDownloadReconciler{}
+	pred := r.slotFreedPredicate()
+
+	t.Run("fires on transition to Completed", func(t *testing.T) {
+		e := event.UpdateEvent{
+			ObjectOld: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseInProgress},
+			},
+			ObjectNew: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCompleted},
+			},
+		}
+		if !pred.Update(e) {
+			t.Error("should fire on InProgress → Completed transition")
+		}
+	})
+
+	t.Run("fires on transition to Failed", func(t *testing.T) {
+		e := event.UpdateEvent{
+			ObjectOld: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhasePrepared},
+			},
+			ObjectNew: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseFailed},
+			},
+		}
+		if !pred.Update(e) {
+			t.Error("should fire on Prepared → Failed transition")
+		}
+	})
+
+	t.Run("fires on transition to Canceled", func(t *testing.T) {
+		e := event.UpdateEvent{
+			ObjectOld: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseAccepted},
+			},
+			ObjectNew: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCanceled},
+			},
+		}
+		if !pred.Update(e) {
+			t.Error("should fire on Accepted → Canceled transition")
+		}
+	})
+
+	t.Run("fires on InProgress to Canceling", func(t *testing.T) {
+		e := event.UpdateEvent{
+			ObjectOld: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseInProgress},
+			},
+			ObjectNew: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCanceling},
+			},
+		}
+		if !pred.Update(e) {
+			t.Error("should fire on InProgress → Canceling transition (slot freed at Canceling)")
+		}
+	})
+
+	t.Run("does not fire on non-terminal transition between active phases", func(t *testing.T) {
+		e := event.UpdateEvent{
+			ObjectOld: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseAccepted},
+			},
+			ObjectNew: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhasePrepared},
+			},
+		}
+		if pred.Update(e) {
+			t.Error("should NOT fire on Accepted → Prepared (both active) transition")
+		}
+	})
+
+	t.Run("does not fire when already terminal", func(t *testing.T) {
+		e := event.UpdateEvent{
+			ObjectOld: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCompleted},
+			},
+			ObjectNew: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCompleted},
+			},
+		}
+		if pred.Update(e) {
+			t.Error("should NOT fire when both old and new are terminal (non-active→non-active)")
+		}
+	})
+
+	t.Run("does not fire on Canceling to Canceled", func(t *testing.T) {
+		e := event.UpdateEvent{
+			ObjectOld: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCanceling},
+			},
+			ObjectNew: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCanceled},
+			},
+		}
+		if pred.Update(e) {
+			t.Error("should NOT fire on Canceling → Canceled (Canceling is not active, no new slot freed)")
+		}
+	})
+
+	t.Run("does not fire on Create", func(t *testing.T) {
+		e := event.CreateEvent{
+			Object: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCompleted},
+			},
+		}
+		if pred.Create(e) {
+			t.Error("should NOT fire on Create events")
+		}
+	})
+
+	t.Run("fires on Delete of active-phase DD", func(t *testing.T) {
+		e := event.DeleteEvent{
+			Object: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseInProgress},
+			},
+		}
+		if !pred.Delete(e) {
+			t.Error("should fire on Delete of InProgress DD (active phase)")
+		}
+	})
+
+	t.Run("does not fire on Delete of terminal-phase DD", func(t *testing.T) {
+		e := event.DeleteEvent{
+			Object: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCompleted},
+			},
+		}
+		if pred.Delete(e) {
+			t.Error("should NOT fire on Delete of Completed DD (terminal phase, no slot freed)")
+		}
+	})
+
+	t.Run("fires on Delete of Prepared-phase DD", func(t *testing.T) {
+		e := event.DeleteEvent{
+			Object: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhasePrepared},
+			},
+		}
+		if !pred.Delete(e) {
+			t.Error("should fire on Delete of Prepared DD (active phase)")
+		}
+	})
+
+	t.Run("does not fire on Generic", func(t *testing.T) {
+		e := event.GenericEvent{
+			Object: &velerov2alpha1.DataDownload{
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseCompleted},
+			},
+		}
+		if pred.Generic(e) {
+			t.Error("should NOT fire on Generic events")
+		}
+	})
+}
+
+// TestRequeueAfterGated_DataDownload verifies that the gated path in
+// checkConcurrentDataMoverLimit uses RequeueAfterGated (2m).
+func TestRequeueAfterGated_DataDownload(t *testing.T) {
+	scheme := ddScheme()
+
+	ns := "openshift-adp"
+	baseTime := time.Now().Add(-5 * time.Minute)
+
+	dd := &velerov2alpha1.DataDownload{
+		ObjectMeta: metav1.ObjectMeta{Name: "dd-gated", Namespace: ns, UID: "uid-gated",
+			CreationTimestamp: metav1.NewTime(baseTime.Add(time.Minute))},
+		Spec:   velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+		Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhasePrepared, AcceptedTimestamp: ptrTime(baseTime)},
+	}
+
+	// Create 3 higher-priority (older) active DDs to put dd over the limit (MaxConcurrentDataMovers=3)
+	objs := make([]client.Object, 0, 4)
+	objs = append(objs, dd)
+	for i := range 3 {
+		other := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("dd-active-%d", i), Namespace: ns,
+				UID: types.UID(fmt.Sprintf("uid-active-%d", i)),
+				// Older than dd, so they outrank it
+				CreationTimestamp: metav1.NewTime(baseTime.Add(-time.Duration(i+1) * time.Second)),
+			},
+			Spec:   velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseInProgress, AcceptedTimestamp: ptrTime(baseTime)},
+		}
+		objs = append(objs, other)
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	r := &KubeVirtDataDownloadReconciler{
+		Client: fakeClient, Scheme: scheme, Log: logr.Discard(),
+		MaxConcurrentDataMovers: 3,
+	}
+
+	gated, result, err := r.checkConcurrentDataMoverLimit(context.Background(), logr.Discard(), dd)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gated {
+		t.Fatal("expected gated=true when at the limit")
+	}
+	if result.RequeueAfter != RequeueAfterGated {
+		t.Errorf("gated RequeueAfter = %v, want %v (RequeueAfterGated)", result.RequeueAfter, RequeueAfterGated)
+	}
+}
+
+// TestGatedSinceAnnotation_DataDownload verifies the gated-since annotation
+// behavior: set on first gate, advances AcceptedTimestamp on subsequent gates,
+// and cleared on gate open.
+func TestGatedSinceAnnotation_DataDownload(t *testing.T) {
+	scheme := ddScheme()
+
+	ns := "openshift-adp"
+	baseTime := time.Now().Add(-10 * time.Minute)
+	acceptedTime := baseTime.Add(2 * time.Minute)
+
+	// Helper: create a gated scenario with N higher-priority active DDs
+	newGatedScenario := func(t *testing.T, dd *velerov2alpha1.DataDownload, limit int, olderCount int) *KubeVirtDataDownloadReconciler {
+		t.Helper()
+		objs := make([]client.Object, 0, 1+olderCount)
+		objs = append(objs, dd)
+		for i := range olderCount {
+			other := &velerov2alpha1.DataDownload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: fmt.Sprintf("dd-active-%d", i), Namespace: ns,
+					UID:               types.UID(fmt.Sprintf("uid-active-%d", i)),
+					CreationTimestamp: metav1.NewTime(baseTime.Add(-time.Duration(i+1) * time.Second)),
+				},
+				Spec:   velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+				Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseInProgress, AcceptedTimestamp: ptrTime(baseTime)},
+			}
+			objs = append(objs, other)
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+		return &KubeVirtDataDownloadReconciler{
+			Client: fakeClient, Scheme: scheme, Log: logr.Discard(),
+			MaxConcurrentDataMovers: limit,
+		}
+	}
+
+	t.Run("first gated pass sets gated-since annotation without advancing AcceptedTimestamp", func(t *testing.T) {
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "dd-gated", Namespace: ns, UID: "uid-gated",
+				CreationTimestamp: metav1.NewTime(baseTime.Add(time.Minute))},
+			Spec:   velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhasePrepared, AcceptedTimestamp: ptrTime(acceptedTime)},
+		}
+		r := newGatedScenario(t, dd, 3, 3)
+
+		gated, _, err := r.checkConcurrentDataMoverLimit(context.Background(), logr.Discard(), dd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !gated {
+			t.Fatal("expected gated=true")
+		}
+
+		// Annotation should be set
+		if dd.Annotations[AnnotationGatedSince] == "" {
+			t.Fatal("expected gated-since annotation to be set on first gated pass")
+		}
+
+		// AcceptedTimestamp should NOT have been advanced (first pass only records
+		// the timestamp). Compare truncated to seconds since the fake client's
+		// JSON roundtrip strips sub-second precision.
+		if dd.Status.AcceptedTimestamp.Truncate(time.Second) != acceptedTime.Truncate(time.Second) {
+			t.Errorf("AcceptedTimestamp should not change on first gated pass, got %v, want %v",
+				dd.Status.AcceptedTimestamp.Time, acceptedTime)
+		}
+	})
+
+	t.Run("subsequent gated pass advances AcceptedTimestamp by elapsed gated time", func(t *testing.T) {
+		gatedSinceTime := time.Now().Add(-30 * time.Second)
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "dd-gated", Namespace: ns, UID: "uid-gated",
+				CreationTimestamp: metav1.NewTime(baseTime.Add(time.Minute)),
+				Annotations: map[string]string{
+					AnnotationGatedSince: gatedSinceTime.UTC().Format(time.RFC3339),
+				},
+			},
+			Spec:   velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhasePrepared, AcceptedTimestamp: ptrTime(acceptedTime)},
+		}
+		r := newGatedScenario(t, dd, 3, 3)
+
+		gated, _, err := r.checkConcurrentDataMoverLimit(context.Background(), logr.Discard(), dd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !gated {
+			t.Fatal("expected gated=true")
+		}
+
+		// AcceptedTimestamp should have advanced by roughly 30s (the elapsed gated time)
+		expectedAdvance := time.Since(gatedSinceTime)
+		actualAdvance := dd.Status.AcceptedTimestamp.Sub(acceptedTime)
+		// Allow ±2s tolerance for test execution time
+		if actualAdvance < expectedAdvance-2*time.Second || actualAdvance > expectedAdvance+2*time.Second {
+			t.Errorf("AcceptedTimestamp advance = %v, expected roughly %v (within 2s)",
+				actualAdvance.Round(time.Millisecond), expectedAdvance.Round(time.Millisecond))
+		}
+
+		// gated-since annotation should be updated to now
+		if dd.Annotations[AnnotationGatedSince] == "" {
+			t.Fatal("gated-since annotation should still be set")
+		}
+	})
+
+	t.Run("gate opening clears gated-since annotation", func(t *testing.T) {
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "dd-gated", Namespace: ns, UID: "uid-gated",
+				CreationTimestamp: metav1.NewTime(baseTime.Add(time.Minute)),
+				Annotations: map[string]string{
+					AnnotationGatedSince: time.Now().UTC().Format(time.RFC3339),
+				},
+			},
+			Spec:   velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhasePrepared, AcceptedTimestamp: ptrTime(acceptedTime)},
+		}
+		// No higher-priority DDs — gate should open
+		r := newGatedScenario(t, dd, 3, 0)
+
+		gated, _, err := r.checkConcurrentDataMoverLimit(context.Background(), logr.Discard(), dd)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if gated {
+			t.Fatal("expected gated=false when no higher-priority DDs exist")
+		}
+
+		// Annotation should be cleared
+		if _, has := dd.Annotations[AnnotationGatedSince]; has {
+			t.Error("gated-since annotation should be cleared when gate opens")
+		}
+	})
+}
+
+// Verify reconcile.Request is used correctly (compile-time check)
+var _ []reconcile.Request
